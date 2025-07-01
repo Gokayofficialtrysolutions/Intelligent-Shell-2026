@@ -13,14 +13,14 @@ mkdir -p models
 # Using smaller versions for some to manage disk space and memory for merging
 # Llama 3 is gated, you must request access on its Hugging Face page first.
 declare -A models_to_download=(
-  ["llama3"]="meta-llama/Meta-Llama-3-8B-Instruct"
-  ["mistral7b"]="mistralai/Mistral-7B-Instruct-v0.1"
-  ["deepseek_coder"]="deepseek-ai/deepseek-coder-6.7b-instruct"
-  ["bloom"]="bigscience/bloom-1b7" # Using a smaller Bloom model
-  ["gpt_neox"]="EleutherAI/gpt-neox-20b" # This is very large (around 40GB)
-  ["gpt4all_j"]="nomic-ai/gpt4all-j" # Base model, not instruct. Apache 2.0
-  ["starcoder"]="bigcode/starcoder2-3b" # Using Starcoder2 3B
-  ["phi2"]="microsoft/phi-2"
+  ["llama3"]="meta-llama/Meta-Llama-3-8B-Instruct" # Retaining Llama 3 as it wasn't in the user's update list
+  ["mistral7b_v03"]="mistralai/Mistral-7B-Instruct-v0.3" # Updated from v0.1
+  ["deepseek_coder_v2_lite"]="deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct" # Updated from 6.7b-instruct, this is 16B
+  ["bloom"]="bigscience/bloom-1b7" # Using a smaller Bloom model, retained
+  ["gpt_neox"]="EleutherAI/gpt-neox-20b" # This is very large (around 40GB), retained
+  ["gpt4all_j"]="nomic-ai/gpt4all-j" # Base model, not instruct. Apache 2.0, retained
+  ["starcoder2_7b"]="bigcode/starcoder2-7b" # Updated from Starcoder2 3B
+  ["phi4_mini_instruct"]="microsoft/Phi-4-mini-instruct" # Updated from microsoft/phi-2, this is 4B
 )
 
 # Check if huggingface-cli is installed
