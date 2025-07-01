@@ -1,0 +1,24 @@
+# merge_config.yml
+# Configuration for mergekit: https://github.com/cg123/mergekit
+# This configuration performs a linear merge of the specified models.
+# Ensure the paths to the models are correct based on where download_models.sh places them (./models/<model_key>/)
+
+slices:
+  - sources:
+      - model: ./models/mistral7b # Mistral-7B-Instruct-v0.1
+      - model: ./models/deepseek_coder # deepseek-coder-6.7b-instruct
+      - model: ./models/starcoder # bigcode/starcoder2-3b
+      - model: ./models/phi2 # microsoft/phi-2
+merge_method: linear
+base_model: ./models/mistral7b # Using Mistral as a base for its architecture and tokenizer
+parameters: {} # For simple linear average, parameters are often not needed here with multiple sources in one slice.
+               # Mergekit averages the tensors from the models listed in sources.
+
+dtype: float16 # Using float16 for a balance of precision and memory
+# To include other downloaded models like llama3 (./models/llama3) or smaller ones like bloom (./models/bloom),
+# add them to the `sources` list above. Example:
+#      - model: ./models/llama3
+#      - model: ./models/bloom
+# The GPT-NeoX 20B model (./models/gpt_neox) is very large and might be challenging to merge
+# without significant RAM (64GB+ might be needed during merge).
+# Consider excluding it if resources are limited.
