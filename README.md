@@ -136,8 +136,93 @@ This phase requires user action to download and merge models.
         *   Format data for supervised fine-tuning.
         *   Implement a fine-tuning loop (e.g., using `transformers.Trainer` with PEFT/LoRA).
         *   Save the updated model (e.g., overwriting `./merged_model` or versioning).
+    *   The `adaptive_train.py` script has been created by Jules. See "Fine-tuning with `adaptive_train.py`" below for usage.
 3.  ***Integrate Training Trigger (Future Enhancement)***:
     *   A mechanism to call `adaptive_train.py` (e.g., special command or periodic trigger) may be added to `interactive_agi.py`. Initially, manual execution by the user (guided by AI) will be assumed.
+
+**Phase 3.1: Fine-tuning with `adaptive_train.py` (User Task)**
+
+After you have interacted with `interactive_agi.py` for some time, logs will accumulate in the `./interaction_logs/` directory. You can use these logs to fine-tune your merged model using the `adaptive_train.py` script.
+
+1.  **Prerequisites for `adaptive_train.py`**:
+    *   Ensure you have a PyTorch environment with GPU support (recommended for reasonable training times).
+    *   Install necessary Python libraries:
+        ```bash
+        pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118 # Adjust for your CUDA version
+        pip install transformers accelerate peft bitsandbytes sentencepiece datasets scipy
+        ```
+        *   `accelerate` helps with training on different hardware setups.
+        *   `peft` is for Parameter-Efficient Fine-Tuning (LoRA, QLoRA).
+        *   `bitsandbytes` is needed for 8-bit optimizers and QLoRA (4-bit quantization).
+        *   `datasets` might be used by `Trainer` or for more advanced data handling.
+        *   `scipy` is often a dependency for PEFT or training metrics.
+
+2.  **Understanding `adaptive_train.py`**:
+    *   The script loads your base model from `./merged_model`.
+    *   It parses all `*.log` files in `./interaction_logs/`.
+    *   It formats these interactions into a dataset suitable for instruction fine-tuning.
+    *   It uses LoRA (or QLoRA if you specify `--use_qlora`) to efficiently fine-tune the model.
+    *   The fine-tuned LoRA adapters (not the entire model) are saved to `./merged_model_adapters/` by default.
+
+3.  **Running `adaptive_train.py`**:
+    *   Open your terminal in the project root.
+    *   Basic usage:
+        ```bash
+        python adaptive_train.py
+        ```
+    *   This will use default parameters (1 epoch, small batch size, default LoRA settings).
+    *   **Important**: The script attempts to find suitable `target_modules` for LoRA (e.g., "q_proj", "v_proj"). These are common in Llama-like architectures. **If your merged model has a different architecture, you may need to modify the `target_modules` list within `adaptive_train.py`**. The script will print the modules it tries to target. Inspect your model structure if PEFT configuration fails.
+    *   To see all available options:
+        ```bash
+        python adaptive_train.py --help
+        ```
+    *   Example with QLoRA (4-bit training, potentially slower but uses less VRAM):
+        ```bash
+        python adaptive_train.py --use_qlora --learning_rate 1e-4 --num_train_epochs 1
+        ```
+    *   Adjust parameters like `--num_train_epochs`, `--per_device_train_batch_size`, `--learning_rate`, `--lora_r`, `--lora_alpha`, and `--max_seq_length` based on your dataset size, available VRAM, and desired training intensity.
+    *   Training can be time-consuming and resource-intensive. Monitor your system resources.
+
+4.  **Using the Fine-tuned Adapters**:
+    *   The `adaptive_train.py` script saves LoRA adapters. To use them with `interactive_agi.py`, you would typically:
+        1.  Load the original base model (`./merged_model`).
+        2.  Merge the LoRA adapters into the base model and save it as a new model, or load the base model and then apply the adapters dynamically at runtime.
+    *   Currently, `interactive_agi.py` loads directly from `./merged_model`. To use the fine-tuned adapters, you would need to either:
+        *   **Option A (Recommended for simplicity now):** Manually merge the adapters into your `./merged_model` weights. You can do this with a separate script using `peft.PeftModel.merge_and_unload()`.
+        *   **Option B (Future Enhancement):** Modify `interactive_agi.py` to load the base model and then dynamically apply adapters from `./merged_model_adapters/`.
+    *   A script for merging adapters would look something like this (save as `merge_adapters.py`):
+        ```python
+        # merge_adapters.py
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from peft import PeftModel
+        import argparse
+
+        def main():
+            parser = argparse.ArgumentParser(description="Merge PEFT adapters into a base model and save.")
+            parser.add_argument("--base_model_path", type=str, default="./merged_model", help="Path to the base model.")
+            parser.add_argument("--adapter_path", type=str, default="./merged_model_adapters", help="Path to the PEFT adapters.")
+            parser.add_argument("--output_path", type=str, default="./merged_model_finetuned", help="Path to save the merged model.")
+            args = parser.parse_args()
+
+            print(f"Loading base model from {args.base_model_path}...")
+            base_model = AutoModelForCausalLM.from_pretrained(args.base_model_path, torch_dtype=torch.float16, device_map="auto", trust_remote_code=True)
+            tokenizer = AutoTokenizer.from_pretrained(args.base_model_path, trust_remote_code=True)
+
+            print(f"Loading PEFT adapter from {args.adapter_path}...")
+            model_to_merge = PeftModel.from_pretrained(base_model, args.adapter_path)
+
+            print("Merging adapters...")
+            merged_model = model_to_merge.merge_and_unload()
+            print(f"Saving merged model to {args.output_path}...")
+            merged_model.save_pretrained(args.output_path)
+            tokenizer.save_pretrained(args.output_path)
+            print("Done.")
+
+        if __name__ == "__main__":
+            main()
+        ```
+        To run this: `python merge_adapters.py --output_path ./merged_model` (to overwrite the existing one, use with caution) or a new path. Then `interactive_agi.py` would use this updated model.
 
 **Phase 4: Expanding Capabilities (AGI Terminal Vision - AI Task, Exploratory)**
 1.  ***Command Interpretation Module***: Develop the model's ability to understand natural language commands for actions (file ops, code tasks).
@@ -154,6 +239,10 @@ This phase requires user action to download and merge models.
     python interactive_agi.py
     ```
     Interact with the AGI. Your interactions will be logged.
-4.  Periodically, or when guided, the `adaptive_train.py` script (once created in Phase 3) can be run to fine-tune the model on these interactions. Instructions will be updated here.
+4.  **Fine-tune the Model (Optional but Recommended)**:
+    *   After accumulating interaction logs in `./interaction_logs/`, you can fine-tune the model using `adaptive_train.py`.
+    *   See **Phase 3.1: Fine-tuning with `adaptive_train.py` (User Task)** above for detailed instructions on prerequisites and execution.
+    *   Example: `python adaptive_train.py`
+    *   After fine-tuning and saving adapters, you may need to merge these adapters back into the main model for `interactive_agi.py` to use them (see notes in Phase 3.1).
 
 This README.md will be updated by the AI agent (Jules) as the project progresses.
