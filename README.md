@@ -12,115 +12,61 @@ To create a master AI within the terminal by merging several powerful open-sourc
 ## Current Status
 Initializing in a new, stable sandbox environment. Core scripts (`download_models.sh`, `interactive_agi.py`, `train_on_interaction.sh`) are in place. The next steps involve user-led model acquisition and merging, followed by AI-driven development to activate and enhance the merged model.
 
-## Autonomous Development Plan (Executed by AI Agent Jules)
+## Automated Setup
 
-This plan will be executed autonomously by Jules. User intervention will primarily be for initial setup (model download and merge) as guided by this README.
+The recommended way to set up the AGI Terminal environment is by using the `setup_agi_terminal.py` script. This script automates dependency installation, model downloading, and model merging.
 
-**Phase 0: Project Setup and README Creation (Complete)**
-1.  ***Delete Existing Stub `README.md`***: (Completed)
-2.  ***Create Comprehensive `README.md`***: (This document - Completed)
-3.  ***Verify Core Scripts and Make Executable***: (Completed, scripts verified, execution permissions will be set explicitly)
+**Prerequisites before running the setup script:**
+*   **Python 3.8 or newer:** Ensure Python 3.8+ and Pip are installed and accessible in your PATH. The script will check this but will not install Python/Pip itself.
+*   **Git:** Ensure Git is installed and accessible in your PATH. The script will check this.
+*   **Internet Connection:** Required for downloading dependencies and models.
+*   **Sufficient Disk Space:** Models can take up 100GB+ of disk space.
+*   **Sufficient RAM:** Model merging is RAM-intensive (32GB+ recommended).
+*   **Hugging Face Account & API Token:** You will need a Hugging Face account and an API token with read access to download models. Get your token from [https://huggingface.co/settings/tokens](https://huggingface.co/settings/tokens).
 
-**Phase 1: Foundational Setup & Model Acquisition (User-Executed Steps, Guided by README)**
-
-This phase requires user action to download and merge models.
-
-1.  **Prerequisites**:
-    *   Python 3.8 or newer.
-    *   `pip` (Python package installer).
-    *   `git` (for cloning repositories if any models require it, though `huggingface-cli` handles most).
-    *   Sufficient disk space (100GB+ recommended for models) and RAM (32GB+ recommended for merging and running larger models).
-
-2.  **Install Hugging Face CLI**:
-    Open your terminal and run:
+**Running the Automated Setup:**
+1.  Download the `setup_agi_terminal.py` script (or clone this repository).
+2.  Open your terminal in the directory where `setup_agi_terminal.py` is located.
+3.  It is **highly recommended** to create and activate a Python virtual environment first:
     ```bash
-    pip install huggingface_hub
+    python3 -m venv .venv
+    source .venv/bin/activate  # On Linux/macOS
+    # .venv\Scripts\activate   # On Windows
     ```
-
-3.  **Login to Hugging Face**:
-    You will need a Hugging Face account. If you don't have one, create it at [huggingface.co](https://huggingface.co/). Then, run:
+4.  Run the setup script:
     ```bash
-    huggingface-cli login
+    python setup_agi_terminal.py
     ```
-    This will prompt you for your Hugging Face API token.
+5.  The script will guide you through the process, including:
+    *   Checking prerequisites.
+    *   Installing required Python packages.
+    *   Prompting for your Hugging Face API token to log in.
+    *   Confirming before downloading models (large downloads).
+    *   Confirming before merging models (CPU/RAM intensive).
+    *   Creating necessary configuration files (`merge_config.yml`) and helper scripts (`download_models.sh`, `train_on_interaction.sh`).
 
-4.  **Make Scripts Executable**:
-    Before running the download script, ensure it's executable:
-    ```bash
-    chmod +x download_models.sh
-    chmod +x train_on_interaction.sh
-    ```
-    (The AI will also attempt to set these permissions).
+Upon successful completion, the `./merged_model` directory will contain your merged AGI model, and you'll be ready to run `interactive_agi.py`.
 
-5.  **Download Models**:
-    Run the script to download the selected open-source models:
-    ```bash
-    ./download_models.sh
-    ```
-    *   This script will ask for confirmation before downloading.
-    *   **Important**:
-        *   Downloading models will take a significant amount of time and disk space.
-        *   The `meta-llama/Meta-Llama-3-8B-Instruct` model requires you to request access on its Hugging Face model card. Ensure you have been granted access before the script attempts to download it. If not, the script will report an error for this model, but may continue with others.
-        *   The script downloads models to a `./models` directory.
+## Project Phases & Manual Overview (Post Automated Setup)
 
-6.  **Install Mergekit and Dependencies**:
-    Mergekit is used to combine the downloaded models.
-    ```bash
-    pip install mergekit
-    # Optional but recommended dependencies for some models & potential quantization:
-    pip install sentencepiece protobuf accelerate bitsandbytes
-    ```
+The automated setup handles the initial phases. Here's an overview of the components and how they fit together, particularly for understanding what the setup script accomplishes and for subsequent interaction and development:
 
-7.  **Prepare `merge_config.yml`**:
-    The AI will create a `merge_config.yml` file in the repository root with the following content. Verify its presence and content:
-    ```yaml
-    # merge_config.yml
-    # Configuration for mergekit: https://github.com/cg123/mergekit
-    # This configuration performs a linear merge of the specified models.
-    # Ensure the paths to the models are correct based on where download_models.sh places them (./models/<model_key>/)
+**Phase 0: Project Setup and Core Scripts (Handled by `setup_agi_terminal.py`)**
+*   Core scripts like `interactive_agi.py`, `adaptive_train.py`, `download_models.sh`, `train_on_interaction.sh`, and `merge_config.yml` are either part of the repository or created by the setup script.
+*   The setup script ensures necessary Python packages are installed.
 
-    slices:
-      - sources:
-          - model: ./models/mistral7b_v03 # mistralai/Mistral-7B-Instruct-v0.3
-          - model: ./models/deepseek_coder_v2_lite # deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct (16B)
-          - model: ./models/starcoder2_7b # bigcode/starcoder2-7b
-          - model: ./models/phi4_mini_instruct # microsoft/Phi-4-mini-instruct (4B)
-    merge_method: linear
-    base_model: ./models/mistral7b_v03 # Using Mistral-7B-Instruct-v0.3 as the base
-    parameters: {} # For simple linear average, parameters are often not needed here with multiple sources in one slice.
-                   # Mergekit averages the tensors from the models listed in sources.
+**Phase 1: Model Acquisition & Merging (Automated by `setup_agi_terminal.py`)**
+*   The `setup_agi_terminal.py` script invokes `download_models.sh` to download models into `./models/`.
+*   It then uses `mergekit-yaml` with `merge_config.yml` to combine these models into `./merged_model/`.
+    *   The default `merge_config.yml` (created by the setup script) uses:
+        *   `mistralai/Mistral-7B-Instruct-v0.3` (Base Model)
+        *   `deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct` (16B)
+        *   `bigcode/starcoder2-7b`
+        *   `microsoft/Phi-4-mini-instruct` (4B)
 
-    dtype: float16 # Using float16 for a balance of precision and memory
-    # To include other downloaded models like llama3 (./models/llama3) or smaller ones like bloom (./models/bloom),
-    # or the very large gpt_neox (./models/gpt_neox), add them to the `sources` list above. Example:
-    #      - model: ./models/llama3
-    #      - model: ./models/bloom
-    #      - model: ./models/gpt_neox
-    # The GPT-NeoX 20B model (./models/gpt_neox) is very large and might be challenging to merge
-    # without significant RAM (64GB+ might be needed during merge).
-    # Consider excluding it if resources are limited.
-    ```
-
-8.  **Run Model Merging**:
-    Execute `mergekit` using the `merge_config.yml` file. This will create the `./merged_model` directory containing the merged model.
-    ```bash
-    mergekit-yaml merge_config.yml ./merged_model --out-shard-size 2B --allow-crimes --lazy-unpickle
-    ```
-    *   `--out-shard-size 2B`: Adjust if necessary (e.g., `1B` for smaller shards, `5B` for larger).
-    *   `--allow-crimes`: Sometimes needed for merging diverse architectures or configs.
-    *   `--lazy-unpickle`: Can help with memory usage during merge.
-    *   This process is computationally intensive (CPU and RAM) and can take a long time.
-
-9.  **Initial Test with Mock AGI**:
-    After the merge, you can run the Python script. It will initially be in mock mode but should recognize the `./merged_model` directory.
-    ```bash
-    python interactive_agi.py
-    ```
-    Look for messages indicating whether it found the `./merged_model` directory.
-
-**Phase 2: Activating the Merged Model (AI Task)**
-1.  ***Modify `interactive_agi.py` for Actual Model Loading***:
-    *   The AI will uncomment/complete sections in `interactive_agi.py` to load the tokenizer and model from `./merged_model` using `transformers.AutoTokenizer` and `transformers.AutoModelForCausalLM`.
+**Phase 2: Activating the Merged Model (AI Task, post-setup)**
+1.  ***`interactive_agi.py` for Actual Model Loading***:
+    *   The `interactive_agi.py` script is designed to load the tokenizer and model from `./merged_model`.
     *   Error handling for model loading will be implemented.
     *   Basic inference capabilities will be added to generate responses.
     *   Device placement (`.to('cuda')` if GPU available, else CPU) will be handled.
@@ -233,17 +179,23 @@ After you have interacted with `interactive_agi.py` for some time, logs will acc
 5.  ***State Management***: Enhance contextual awareness for longer, complex tasks.
 
 ## How to Run
-1.  Follow all steps in **Phase 1** to download and merge models.
-2.  Once `./merged_model` is successfully created, the AI will proceed with **Phase 2** to enable it.
-3.  After Phase 2, run:
-    ```bash
-    python interactive_agi.py
-    ```
-    Interact with the AGI. Your interactions will be logged.
-4.  **Fine-tune the Model (Optional but Recommended)**:
-    *   After accumulating interaction logs in `./interaction_logs/`, you can fine-tune the model using `adaptive_train.py`.
-    *   See **Phase 3.1: Fine-tuning with `adaptive_train.py` (User Task)** above for detailed instructions on prerequisites and execution.
+
+1.  **Automated Setup (Recommended)**:
+    *   Follow the instructions under the "Automated Setup" section above to run `python setup_agi_terminal.py`.
+    *   This script handles prerequisites, dependency installation, model downloads, and merging.
+    *   Upon successful completion, your `./merged_model` will be ready.
+
+2.  **Start the AGI Terminal**:
+    *   After the setup script finishes (or if you have manually completed Phase 0 and 1), run:
+        ```bash
+        python interactive_agi.py
+        ```
+    *   Interact with the AGI. Your interactions will be logged to `./interaction_logs/`.
+
+3.  **Fine-tune the Model (Optional but Recommended)**:
+    *   After accumulating interaction logs, you can fine-tune the model using `adaptive_train.py`.
+    *   See **Phase 3.1: Fine-tuning with `adaptive_train.py` (User Task)** above for detailed instructions.
     *   Example: `python adaptive_train.py`
-    *   After fine-tuning and saving adapters, you may need to merge these adapters back into the main model for `interactive_agi.py` to use them (see notes in Phase 3.1).
+    *   Remember to merge the trained LoRA adapters back into the main model if you want `interactive_agi.py` to use the fine-tuned version (see notes in Phase 3.1).
 
 This README.md will be updated by the AI agent (Jules) as the project progresses.
