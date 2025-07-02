@@ -119,6 +119,7 @@ context_analyzer = ContextAnalyzer()
 
 from collections import deque # For conversation history
 from rich.table import Table # For /ls command and sysinfo
+from rich.tree import Tree # For /analyze_dir command
 from datetime import datetime # For history timestamps
 import json # For saving/loading history
 import platform # Already used, but good to note for sysinfo
@@ -134,20 +135,63 @@ except ImportError:
     # console.print("Install with: pip install psutil", style="info")
     # Quieten this for now as it's printed by setup script if needed.
 
+# TOML import for config file
+try:
+    import toml
+    TOML_AVAILABLE = True
+except ImportError:
+    TOML_AVAILABLE = False
+    console.print("WARNING: `toml` library not found. Configuration file (`config.toml`) cannot be used.", style="warning")
+    console.print("Install with: pip install toml", style="info")
+
 
 # --- Configuration & Globals ---
-HISTORY_FILE_PATH = Path("./.agi_terminal_cache/history.json")
-HISTORY_MAX_LEN = 100 # Store last 100 exchanges (user + assistant = 1 exchange)
+CACHE_DIR = Path("./.agi_terminal_cache")
+HISTORY_FILE_PATH = CACHE_DIR / "history.json"
+CONFIG_FILE_PATH = CACHE_DIR / "config.toml"
+
+DEFAULT_CONFIG = {
+    "generation": {
+        "default_temperature": 0.4,
+        "default_max_tokens": 1024,
+        "default_top_p": 0.9,
+        "default_repetition_penalty": 1.15,
+    },
+    "history": {
+        "max_len": 100, # Max internal history deque length
+    },
+    "display": {
+        "syntax_theme": "monokai",
+    },
+    "logging": {
+        "desktop_logging_enabled": True,
+        "desktop_log_path_override": "", # Empty means use default desktop path
+    }
+}
+APP_CONFIG = {} # Will be loaded from file or defaults
 
 # Global context analyzer instance
 context_analyzer = ContextAnalyzer()
 
-# Global conversation history
-conversation_history = deque(maxlen=HISTORY_MAX_LEN)
+# Global conversation history - maxlen will be set from config
+conversation_history = deque()
 
 # --- Desktop Path for Session Logs ---
 def get_desktop_path() -> Path:
-    """Determines the user's desktop path."""
+    """
+    Determines the user's desktop path.
+    Uses APP_CONFIG['logging']['desktop_log_path_override'] if set.
+    """
+    override_path_str = APP_CONFIG.get("logging", {}).get("desktop_log_path_override", "")
+    if override_path_str:
+        override_path = Path(override_path_str).expanduser()
+        if override_path.is_dir(): # Check if user provided path is a valid directory
+            console.print(f"INFO: Using custom desktop log path from config: {override_path}", style="info")
+            return override_path
+        else:
+            console.print(f"WARNING: Custom desktop log path '{override_path_str}' is not a valid directory. Using default.", style="warning")
+            # Fall through to default detection if override is invalid
+
     home = Path.home()
     # Common desktop paths; order can matter if multiple exist (e.g. via symlinks)
     desktop_paths = [
@@ -547,11 +591,23 @@ def detect_code_blocks(text: str) -> list:
     return parts
 
 def main():
-    global session_logger # Allow modification of the global instance
-    desktop_path = get_desktop_path()
-    session_logger = SessionLogger(desktop_path)
+    global session_logger, APP_CONFIG, conversation_history, DEFAULT_GENERATION_PARAMS
 
-    display_startup_banner()
+    # Load config first, as it affects other initializations
+    load_config()
+
+    # Now that APP_CONFIG is loaded, initialize things that depend on it
+    # (conversation_history deque maxlen is handled in load_config)
+    # (DEFAULT_GENERATION_PARAMS is updated in load_config)
+
+    desktop_path = get_desktop_path() # Uses APP_CONFIG for override
+    session_logger = SessionLogger(desktop_path)
+    if APP_CONFIG.get("logging", {}).get("desktop_logging_enabled", True) == False:
+        session_logger.enabled = False # Ensure logger respects config if disabled
+        console.print("[info]Desktop session logging is disabled via config.[/info]")
+
+
+    display_startup_banner() # Uses APP_CONFIG for syntax_theme implicitly via console
     console.print("Initializing AGI System (Interactive Mode)...", style="info")
 
     agi_interface = MergedAGI(model_path_str="./merged_model")
@@ -683,6 +739,9 @@ def main():
                     edit_file_command(file_path_to_edit)
                 else:
                     console.print("[red]Usage: /edit <file_path>[/red]")
+            elif user_input.lower().startswith("/config"):
+                config_args = user_input.strip()[len("/config"):].strip() # Get args after /config
+                config_command_handler(config_args)
             elif user_input.lower().startswith("/git "):
                 git_command_parts = user_input.strip().split(maxsplit=2) # /git <subcommand> [args]
                 git_subcommand = git_command_parts[1].lower() if len(git_command_parts) > 1 else None
@@ -716,23 +775,25 @@ def main():
                     elif part["type"] == "code":
                         lang_for_syntax = part["lang"] if part["lang"] else "plaintext"
                         try:
-                            code_syntax = Syntax(part["content"], lang_for_syntax, theme="monokai", line_numbers=True, word_wrap=True)
+                            current_theme = APP_CONFIG.get("display", {}).get("syntax_theme", "monokai")
+                            code_syntax = Syntax(part["content"], lang_for_syntax, theme=current_theme, line_numbers=True, word_wrap=True)
                             console.print(code_syntax)
-                        except Exception:
-                            code_syntax = Syntax(part["content"], "plaintext", theme="monokai", line_numbers=True, word_wrap=True)
+                        except Exception as e_rich_syntax:
+                            console.print(f"[dim warning]Rich Syntax Error for lang '{lang_for_syntax}': {e_rich_syntax}. Falling back to plaintext.[/dim warning]")
+                            current_theme = APP_CONFIG.get("display", {}).get("syntax_theme", "monokai") # Ensure theme is fetched again for fallback
+                            code_syntax = Syntax(part["content"], "plaintext", theme=current_theme, line_numbers=True, word_wrap=True)
                             console.print(code_syntax)
-                            console.print(f"(Note: language '{part['lang']}' not recognized for syntax highlighting, shown as plaintext)", style="dim italic")
 
                 if agi_interface.is_model_loaded or isinstance(agi_interface, AGIPPlaceholder):
+                    # call_training_script is for the specific ./interaction_logs for adaptive_train.py
+                    # Desktop logging of this exchange is handled by session_logger.log_entry() above.
                     call_training_script(user_input, agi_response_text)
 
             console.print("-" * console.width)
 
     except KeyboardInterrupt:
         console.print("\nExiting due to KeyboardInterrupt...", style="info")
-    finally:
-        console.print("AGI session terminated.", style="info")
-
+    # The main __main__ block's finally clause handles saving history and the final "AGI session terminated" message.
 
 # --- Command Implementations ---
 def create_directory_command(path_str: str):
@@ -979,6 +1040,334 @@ def display_system_info():
             table.add_row("Total Memory (approx)", "N/A (psutil not installed for details)")
 
     console.print(table)
+
+# --- Config Management ---
+def load_config() -> dict:
+    global APP_CONFIG # Allow modification of global APP_CONFIG
+    config = DEFAULT_CONFIG.copy() # Start with defaults
+
+    if TOML_AVAILABLE and CONFIG_FILE_PATH.exists():
+        try:
+            loaded_toml = toml.load(CONFIG_FILE_PATH)
+            # Simple deep merge for one level of nesting (like 'generation', 'history')
+            for main_key, sub_dict in DEFAULT_CONFIG.items():
+                if main_key in loaded_toml and isinstance(loaded_toml[main_key], dict):
+                    # If the key exists in loaded_toml and is a dictionary, merge its sub-keys
+                    if main_key not in config: config[main_key] = {} # Ensure section exists
+                    for sub_key, default_val in sub_dict.items():
+                        config[main_key][sub_key] = loaded_toml[main_key].get(sub_key, default_val)
+                elif main_key in loaded_toml: # For top-level keys if any added later (not in DEFAULT_CONFIG structure)
+                    config[main_key] = loaded_toml[main_key]
+                # If main_key from DEFAULT_CONFIG is not in loaded_toml, its default sub_dict remains.
+
+            console.print(f"INFO: Configuration loaded from {CONFIG_FILE_PATH}", style="info")
+        except toml.TomlDecodeError as e:
+            console.print(f"ERROR: Invalid TOML in {CONFIG_FILE_PATH}: {e}. Using default configuration and attempting to save a valid one.", style="error")
+            config = DEFAULT_CONFIG.copy() # Reset to pure defaults on decode error
+            save_config(config) # Save a fresh default config
+        except IOError as e:
+            console.print(f"ERROR: Could not read {CONFIG_FILE_PATH}: {e}. Using default configuration.", style="error")
+    else:
+        if TOML_AVAILABLE:
+            console.print(f"INFO: No config file found at {CONFIG_FILE_PATH}. Creating with default values.", style="info")
+            save_config(config) # Create default config file
+        else:
+            console.print("INFO: TOML library not available. Using default internal configuration.", style="info")
+
+    APP_CONFIG = config # Update global APP_CONFIG
+
+    # Apply loaded config to relevant globals
+    global conversation_history, DEFAULT_GENERATION_PARAMS, session_logger
+
+    # Re-initialize deque with new maxlen if it changed
+    current_history_list = list(conversation_history) # Preserve current items if any
+    new_maxlen = APP_CONFIG.get("history", {}).get("max_len", DEFAULT_CONFIG["history"]["max_len"])
+    conversation_history = deque(maxlen=new_maxlen) # Set new max_len from config
+    conversation_history.extend(current_history_list) # Add back items, deque handles overflow
+
+    # Update DEFAULT_GENERATION_PARAMS based on loaded config
+    # MergedAGI instances copy this at their __init__. If an instance exists, it won't get this update
+    # unless we explicitly update it or it re-reads from APP_CONFIG.
+    # For now, new MergedAGI instances will pick this up.
+    gen_config = APP_CONFIG.get("generation", {})
+    DEFAULT_GENERATION_PARAMS["temperature"] = gen_config.get("default_temperature", DEFAULT_GENERATION_PARAMS["temperature"])
+    DEFAULT_GENERATION_PARAMS["max_new_tokens"] = gen_config.get("default_max_tokens", DEFAULT_GENERATION_PARAMS["max_new_tokens"])
+    DEFAULT_GENERATION_PARAMS["top_p"] = gen_config.get("default_top_p", DEFAULT_GENERATION_PARAMS["top_p"])
+    DEFAULT_GENERATION_PARAMS["repetition_penalty"] = gen_config.get("default_repetition_penalty", DEFAULT_GENERATION_PARAMS["repetition_penalty"])
+
+    # Update syntax theme for Rich (used in /cat and AGI code block display)
+    # This requires a mechanism to pass the theme to Syntax objects or re-initialize console if theme affects it globally.
+    # For Syntax objects, they take `theme` as an arg. We can pass APP_CONFIG['display']['syntax_theme']
+
+    # Update desktop logging settings
+    # This needs to happen *before* SessionLogger is initialized if path override is to take effect.
+    # The enabled flag can be set after initialization.
+    # get_desktop_path() now reads APP_CONFIG, so it's fine.
+    # session_logger.enabled is set after its init based on config.
+
+    return config
+
+def save_config(config_to_save: dict):
+    if not TOML_AVAILABLE:
+        console.print("WARNING: TOML library not available. Cannot save configuration.", style="warning")
+        return
+    try:
+        CONFIG_FILE_PATH.parent.mkdir(parents=True, exist_ok=True) # Ensure .agi_terminal_cache exists
+        with open(CONFIG_FILE_PATH, 'w', encoding='utf-8') as f:
+            toml.dump(config_to_save, f)
+    except IOError as e:
+        console.print(f"ERROR: Could not save configuration to {CONFIG_FILE_PATH}: {e}", style="error")
+    except Exception as e: # Catch other toml errors
+        console.print(f"ERROR: Failed to serialize configuration for saving: {e}", style="error")
+
+def config_command_handler(args_str: Optional[str]):
+    global APP_CONFIG
+    parts = args_str.split(maxsplit=2) if args_str else []
+    subcommand = parts[0].lower() if parts else "show"
+
+    if subcommand == "show":
+        table = Table(title="Current Application Configuration", show_header=True, header_style="bold magenta", box=None, padding=(0,1))
+        table.add_column("Section", style="cyan", overflow="fold")
+        table.add_column("Setting", style="yellow", overflow="fold")
+        table.add_column("Value", style="green", overflow="fold")
+
+        sorted_app_config = dict(sorted(APP_CONFIG.items()))
+        for section, settings in sorted_app_config.items():
+            if isinstance(settings, dict):
+                sorted_settings = dict(sorted(settings.items()))
+                for i, (key, value) in enumerate(sorted_settings.items()):
+                    table.add_row(section if i == 0 else "", key, str(value))
+            else:
+                table.add_row("general", section, str(settings))
+        console.print(table)
+
+    elif subcommand == "get" and len(parts) > 1:
+        key_path = parts[1]
+        keys = key_path.split('.')
+        value_ptr = APP_CONFIG
+        try:
+            for k in keys:
+                value_ptr = value_ptr[k]
+            console.print(Panel(Text(str(value_ptr)), title=key_path))
+        except KeyError:
+            console.print(f"[red]Error: Config key '{key_path}' not found.[/red]")
+        except TypeError:
+            console.print(f"[red]Error: Invalid key path '{key_path}'. Part of it is not a section.[/red]")
+
+    elif subcommand == "set" and len(parts) > 2:
+        key_path = parts[1]
+        new_value_str = parts[2]
+
+        keys = key_path.split('.')
+        config_section = APP_CONFIG # This is a reference to the global dict
+        temp_ptr = config_section
+
+        try:
+            for k_idx, k_name in enumerate(keys[:-1]):
+                temp_ptr = temp_ptr[k_name]
+
+            final_key = keys[-1]
+            if final_key not in temp_ptr:
+                console.print(f"[red]Error: Config key '{key_path}' not found for setting.[/red]")
+                return
+
+            current_value = temp_ptr[final_key]
+            typed_value = None
+
+            # Attempt type conversion based on default or existing value type
+            # This ensures we try to keep the type consistent.
+            # More robust type handling might be needed for arbitrary new keys.
+            default_val_type = type(DEFAULT_CONFIG)
+            for k in keys: default_val_type = type(default_val_type.get(k, {})) if isinstance(default_val_type, dict) else type(None)
+
+            if isinstance(current_value, bool) or default_val_type == bool:
+                if new_value_str.lower() in ['true', 'yes', '1', 'on']: typed_value = True
+                elif new_value_str.lower() in ['false', 'no', '0', 'off']: typed_value = False
+                else: raise ValueError("Boolean value must be true/false/yes/no/1/0/on/off")
+            elif isinstance(current_value, int) or default_val_type == int:
+                typed_value = int(new_value_str)
+            elif isinstance(current_value, float) or default_val_type == float:
+                typed_value = float(new_value_str)
+            else:
+                typed_value = new_value_str # Default to string
+
+            temp_ptr[final_key] = typed_value
+            save_config(APP_CONFIG)
+            console.print(f"[green]Config '{key_path}' set to '{typed_value}'.[/green]")
+
+            # Apply immediate changes if possible
+            if key_path == "history.max_len":
+                global conversation_history
+                current_history_list = list(conversation_history)
+                conversation_history = deque(maxlen=typed_value)
+                conversation_history.extend(current_history_list)
+                console.print("[info]Conversation history max length updated. Change will apply fully on next restart for history loading if new max is smaller.[/info]")
+            elif key_path.startswith("generation."):
+                 # Update DEFAULT_GENERATION_PARAMS for new MergedAGI instances
+                gen_key = final_key # e.g. "default_temperature"
+                param_key_in_gen_params = gen_key.replace("default_", "") # e.g. "temperature"
+                if param_key_in_gen_params in DEFAULT_GENERATION_PARAMS:
+                    DEFAULT_GENERATION_PARAMS[param_key_in_gen_params] = typed_value
+                console.print(f"[info]Default generation parameter '{param_key_in_gen_params}' updated. Active AGI instances may need parameter reset or restart to see change.[/info]")
+            elif key_path == "logging.desktop_logging_enabled" and session_logger:
+                session_logger.enabled = typed_value
+            elif key_path == "logging.desktop_log_path_override" and session_logger:
+                 console.print("[info]Desktop log path override changed. This will take effect on next restart.[/info]")
+
+
+        except KeyError:
+            console.print(f"[red]Error: Config key '{key_path}' not found for setting.[/red]")
+        except (ValueError, TypeError) as e:
+            console.print(f"[red]Error setting value for '{key_path}': Invalid value or type. {e}[/red]")
+        except Exception as e:
+            console.print(f"[red]Unexpected error setting config: {e}[/red]")
+
+    else:
+        console.print("[red]Invalid /config command. Usage:\n  /config show\n  /config get <section.key>\n  /config set <section.key> <value>[/red]")
+
+
+# --- Structured Output Command (Experimental) ---
+def analyze_dir_command(path_str: Optional[str], agi_interface: MergedAGI):
+    target_path_str = path_str if path_str else "."
+    resolved_path = Path(target_path_str).resolve()
+
+    console.print(f"[info]Analyzing directory structure for: {resolved_path}[/info]")
+
+    dir_listing = []
+    max_items = 30 # Limit number of items to keep context manageable
+    item_count = 0
+
+    try:
+        if not resolved_path.is_dir():
+            console.print(f"[red]Error: Not a directory or path does not exist: {resolved_path}[/red]")
+            return
+
+        for item in resolved_path.iterdir():
+            if item_count >= max_items:
+                dir_listing.append({"name": "...", "type": "truncated"})
+                break
+            item_type = "directory" if item.is_dir() else "file"
+            entry = {"name": item.name, "type": item_type}
+            if item.is_file():
+                try:
+                    entry["size"] = item.stat().st_size
+                except OSError:
+                    entry["size"] = -1 # Indicate error or inaccessible
+            dir_listing.append(entry)
+            item_count += 1
+
+    except PermissionError:
+        console.print(f"[red]Error: Permission denied for directory: {resolved_path}[/red]")
+        return
+    except Exception as e:
+        console.print(f"[red]Error listing directory for analysis '{resolved_path}': {type(e).__name__} - {e}[/red]")
+        return
+
+    if not dir_listing:
+        console.print(f"[yellow]Directory is empty or no accessible items found: {resolved_path}[/yellow]")
+        # Still, we can ask the AGI about an empty directory if the user wishes
+        # For now, let's proceed to ask anyway, or one could return here.
+
+    # Construct prompt for AGI
+    # Convert basic listing to a string format for the prompt
+    listing_str_parts = []
+    for item in dir_listing:
+        if item["type"] == "directory":
+            listing_str_parts.append(f"- {item['name']}/ (directory)")
+        elif item["type"] == "file":
+            size_str = f" ({item['size']} bytes)" if item['size'] != -1 else ""
+            listing_str_parts.append(f"- {item['name']}{size_str} (file)")
+        else: # Truncated message
+            listing_str_parts.append(f"- {item['name']}")
+
+    listing_for_prompt = "\n".join(listing_str_parts)
+
+    prompt_text = (
+        f"Analyze the following directory listing for '{resolved_path}'. "
+        "Provide your analysis as a JSON object. The JSON object should have a root key 'directory_analysis'. "
+        "Under this key, include 'path', 'item_count', and a 'summary' (a brief textual description of the directory content or purpose, if inferable). "
+        "Also include a 'structure' key, which should be a list of items. Each item in the 'structure' list should be an object with 'name', 'type' ('file' or 'directory'), "
+        "and optionally 'size' for files, and for directories, optionally a 'children' list if you want to represent nesting (though the provided listing is flat). "
+        "Focus on interpreting the provided flat list. If the listing was truncated, mention it in the summary.\n\n"
+        f"Directory Listing:\n{listing_for_prompt}\n\n"
+        "JSON Response:"
+    )
+
+    console.print("[info]Requesting directory analysis from AGI...[/info]")
+    with console.status("[yellow]AGI is analyzing directory structure...[/yellow]", spinner="dots"):
+        raw_response = agi_interface.generate_response(prompt_text)
+
+    if session_logger:
+        session_logger.log_entry("User", f"/analyze_dir {target_path_str}")
+        session_logger.log_entry("AGI", raw_response)
+    conversation_history.append({"role": "user", "content": f"/analyze_dir {target_path_str}", "timestamp": datetime.now().isoformat()})
+    conversation_history.append({"role": "assistant", "content": raw_response, "timestamp": datetime.now().isoformat()})
+
+    console.print(f"[agiprompt]AGI Analysis (Raw):[/agiprompt]")
+    # Display raw response first, then try to parse and display structured
+    # This helps debugging if JSON is malformed
+    console.print(Panel(raw_response, title="Raw AGI Response", border_style="dim yellow", expand=False))
+
+    try:
+        # Attempt to extract JSON part if the model includes explanatory text before/after
+        json_match = re.search(r"```json\n(.*?)\n```", raw_response, re.DOTALL)
+        if json_match:
+            json_str = json_match.group(1)
+        else:
+            # If no markdown block, assume the whole response might be JSON (or fail parsing)
+            # A more robust way would be to find first '{' and last '}'
+            first_brace = raw_response.find('{')
+            last_brace = raw_response.rfind('}')
+            if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+                json_str = raw_response[first_brace : last_brace+1]
+            else:
+                json_str = raw_response
+
+
+        parsed_json = json.loads(json_str)
+
+        if isinstance(parsed_json, dict) and "directory_analysis" in parsed_json:
+            analysis = parsed_json["directory_analysis"]
+            console.print("\n[bold green]Structured Directory Analysis:[/bold green]")
+
+            analysis_table = Table(show_header=False, box=None)
+            analysis_table.add_column("Key", style="bold cyan")
+            analysis_table.add_column("Value")
+            analysis_table.add_row("Path", Text(analysis.get("path", str(resolved_path))))
+            analysis_table.add_row("Item Count (in provided list)", str(analysis.get("item_count", len(dir_listing))))
+            analysis_table.add_row("AGI Summary", Text(analysis.get("summary", "N/A")))
+            console.print(analysis_table)
+
+            if "structure" in analysis and isinstance(analysis["structure"], list):
+                tree = Tree(f"[bold blue]Directory Tree (from AGI JSON):[/bold blue] {analysis.get('path', str(resolved_path))}")
+
+                def add_nodes_to_tree(branch, items):
+                    for item_data in items:
+                        name = item_data.get("name", "Unknown Item")
+                        item_type = item_data.get("type", "unknown")
+                        display_name = f"[green]{name}[/green]" if item_type == "file" else f"[bold yellow]{name}/[/bold yellow]"
+                        if item_type == "file" and "size" in item_data:
+                            display_name += f" [dim]({item_data['size']} bytes)[/dim]"
+
+                        sub_branch = branch.add(display_name)
+                        if "children" in item_data and isinstance(item_data["children"], list):
+                            add_nodes_to_tree(sub_branch, item_data["children"])
+
+                add_nodes_to_tree(tree, analysis["structure"])
+                console.print(tree)
+            else:
+                console.print("[yellow]No 'structure' list found in AGI's JSON analysis or it's not a list.[/yellow]")
+        else:
+            console.print("[yellow]AGI response was valid JSON, but not in the expected 'directory_analysis' format. Displaying raw.[/yellow]")
+            # Already displayed raw above, or could display json_str prettily
+            # console.print(json.dumps(parsed_json, indent=2))
+
+
+    except json.JSONDecodeError:
+        console.print("[yellow]AGI did not return valid JSON for directory analysis. Raw output displayed above.[/yellow]")
+    except Exception as e:
+        console.print(f"[red]Error processing AGI's structured response: {type(e).__name__} - {e}[/red]")
+
 
 # --- Git Command Implementations ---
 def git_status_command():

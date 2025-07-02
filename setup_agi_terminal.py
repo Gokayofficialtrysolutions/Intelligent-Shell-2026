@@ -18,7 +18,8 @@ REQUIRED_PYTHON_PACKAGES = [
     "sentencepiece",
     "scipy",
     "rich",
-    "psutil"
+    "psutil",
+    "toml"
 ]
 
 # --- Utility Functions ---
