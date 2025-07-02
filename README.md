@@ -134,7 +134,13 @@ After you have interacted with `interactive_agi.py` for some time, logs will acc
         ```bash
         python adaptive_train.py --use_qlora --learning_rate 1e-4 --num_train_epochs 1
         ```
+    *   **New**: Filter logs using `--log_count N` (use last N logs) or `--log_days D` (logs from last D days).
+        ```bash
+        python adaptive_train.py --log_count 50
+        python adaptive_train.py --log_days 7 --num_train_epochs 2
+        ```
     *   Adjust parameters like `--num_train_epochs`, `--per_device_train_batch_size`, `--learning_rate`, `--lora_r`, `--lora_alpha`, and `--max_seq_length` based on your dataset size, available VRAM, and desired training intensity.
+    *   The script now uses `rich` for better progress display during data processing and training (if `rich` is installed).
     *   Training can be time-consuming and resource-intensive. Monitor your system resources.
 
 4.  **Using the Fine-tuned Adapters**:
@@ -208,10 +214,15 @@ After you have interacted with `interactive_agi.py` for some time, logs will acc
         *   `/history`: Display recent conversation history.
         *   `/sysinfo`: Show detailed system information (uses `psutil` if available).
         *   `/search <query>`: Perform an internet search using DuckDuckGo and display results.
+        *   `/cat <file_path>`: Display file content with syntax highlighting. For large files, it shows a preview and asks if you want to send a portion to the AGI for summary/query.
+        *   `/edit <file_path>`: Open the specified file in your default system editor (or common fallbacks like nano/vim/notepad).
         *   `/mkdir <dirname>`: Create a directory.
-        *   `/rm <path>`: Remove a file or directory (with confirmation).
+        *   `/rm <path>`: Remove a file or directory (with confirmation, especially for directories).
         *   `/cp <source> <destination>`: Copy a file or directory.
         *   `/mv <source> <destination>`: Move/rename a file or directory.
+        *   `/git status`: Show parsed Git status for the current directory.
+        *   `/git diff [file_path]`: Show Git diff (staged if no file, else for that file).
+        *   `/git log [-n <count>]`: Show Git log with formatting (default last 10).
         *   `exit` or `quit`: Terminate the AGI session.
 
 3.  **Fine-tune the Model (Optional but Recommended)**:

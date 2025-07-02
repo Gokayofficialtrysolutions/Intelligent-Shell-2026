@@ -7,6 +7,23 @@ import glob
 import random
 from pathlib import Path
 import json # For potential future structured logging
+from datetime import datetime, timedelta # For log_days filtering
+
+# Rich imports
+try:
+    from rich.console import Console
+    from rich.progress import Progress, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
+    from rich.text import Text
+    RICH_AVAILABLE = True
+    console = Console()
+except ImportError:
+    RICH_AVAILABLE = False
+    # Fallback print if rich is not available
+    class Console:
+        def print(self, *args, **kwargs): print(*args)
+    console = Console()
+    console.print("[yellow]WARNING: Rich library not found. Output will be basic. Install with `pip install rich`[/yellow]")
+
 
 import torch
 from transformers import (
@@ -78,11 +95,17 @@ def parse_arguments():
     parser.add_argument(
         "--use_qlora", action="store_true", help="Enable QLoRA (4-bit quantization) for training."
     )
+    parser.add_argument(
+        "--log_count", type=int, default=None, help="Process only the last N interaction log files."
+    )
+    parser.add_argument(
+        "--log_days", type=int, default=None, help="Process logs from the last D days."
+    )
     # Add more training arguments as needed (e.g., weight_decay, lr_scheduler_type)
     return parser.parse_args()
 
 # --- Log Parsing ---
-def load_interaction_logs(log_dir: str, tokenizer: AutoTokenizer, max_seq_length: int):
+def load_interaction_logs(log_dir: str, tokenizer: AutoTokenizer, max_seq_length: int, log_count: Optional[int] = None, log_days: Optional[int] = None):
     """
     Loads interaction logs, formats them, and tokenizes them.
     Current log format:
@@ -95,12 +118,58 @@ def load_interaction_logs(log_dir: str, tokenizer: AutoTokenizer, max_seq_length
     log_files = glob.glob(os.path.join(log_dir, "interaction_*.log"))
 
     if not log_files:
-        print(f"No log files found in {log_dir}. Nothing to train on.")
+        console.print(f"[yellow]No log files found in {log_dir}. Nothing to train on.[/yellow]")
         return []
 
-    print(f"Found {len(log_files)} log files. Parsing...")
+    # Sort files by name (timestamp) to get recent ones if --log_count or --log_days is used
+    log_files.sort(reverse=True) # Newest first
+
+    # Filter by --log_days
+    if log_days is not None:
+        filtered_by_date = []
+        cutoff_date = datetime.now() - timedelta(days=log_days)
+        for log_file in log_files:
+            try:
+                # Extract timestamp from filename: interaction_YYYYMMDD_HHMMSS.log
+                filename = Path(log_file).name
+                ts_str = filename.split('_')[1] # YYYYMMDD
+                file_date = datetime.strptime(ts_str, "%Y%m%d") # Just compare date part for simplicity
+                if file_date >= cutoff_date.replace(hour=0, minute=0, second=0, microsecond=0): # Compare date part only
+                    filtered_by_date.append(log_file)
+            except (IndexError, ValueError) as e:
+                console.print(f"[yellow]Could not parse date from log file {filename}: {e}. Skipping for date filter.[/yellow]")
+                continue
+        log_files = filtered_by_date
+        console.print(f"[info]Filtered logs by date: {len(log_files)} files from the last {log_days} days remaining.[/info]")
+
+
+    # Filter by --log_count (applied after date filter if both are present)
+    if log_count is not None and len(log_files) > log_count:
+        log_files = log_files[:log_count] # Already sorted newest first
+        console.print(f"[info]Filtered logs by count: Using the latest {len(log_files)} files.[/info]")
+
+    if not log_files:
+        console.print(f"[yellow]No log files remaining after filters. Nothing to train on.[/yellow]")
+        return []
+
+    console.print(f"[info]Processing {len(log_files)} log files...[/info]")
+
+    # Use Rich Progress for parsing
+    if RICH_AVAILABLE:
+        progress_bar = Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TimeRemainingColumn(),
+            TimeElapsedColumn(),
+            console=console
+        )
+        task_id = progress_bar.add_task("Parsing logs", total=len(log_files))
+        progress_bar.start()
 
     for log_file in log_files:
+        if RICH_AVAILABLE:
+            progress_bar.update(task_id, advance=1, description=f"Parsing {Path(log_file).name}")
         try:
             with open(log_file, 'r', encoding='utf-8') as f:
                 content = f.read()
@@ -125,20 +194,35 @@ def load_interaction_logs(log_dir: str, tokenizer: AutoTokenizer, max_seq_length
                 text = f"USER: {user_input}\nASSISTANT: {model_output}{tokenizer.eos_token}"
                 formatted_texts.append(text)
         except Exception as e:
-            print(f"Error parsing log file {log_file}: {e}")
+            console.print(f"[yellow]Error parsing log file {Path(log_file).name}: {e}. Skipping.[/yellow]")
             continue
 
+    if RICH_AVAILABLE:
+        progress_bar.stop()
+
     if not formatted_texts:
-        print("No valid interactions parsed from logs.")
+        console.print("[yellow]No valid interactions parsed from logs after processing.[/yellow]")
         return []
 
-    print(f"Successfully parsed {len(formatted_texts)} interactions.")
+    min_dataset_size = 10 # Arbitrary minimum, can be adjusted
+    if len(formatted_texts) < min_dataset_size:
+        console.print(f"[warning]Warning: The number of parsed interactions ({len(formatted_texts)}) is very small (less than {min_dataset_size}). Fine-tuning may not be effective or could lead to overfitting.[/warning]")
+        if input(f"Continue with {len(formatted_texts)} interactions? (yes/NO): ").lower() != "yes":
+            console.print("[info]Training aborted by user due to small dataset size.[/info]")
+            return []
+
+
+    console.print(f"[success]Successfully parsed {len(formatted_texts)} interactions.[/success]")
 
     # Tokenize the formatted texts
-    # This is a simplified tokenization. For more advanced scenarios,
-    # one might create a Hugging Face Dataset object and use .map() for tokenization.
     tokenized_dataset = []
+    if RICH_AVAILABLE:
+        task_id_tokenize = progress_bar.add_task("Tokenizing data", total=len(formatted_texts))
+        progress_bar.start()
+
     for text in formatted_texts:
+        if RICH_AVAILABLE:
+            progress_bar.update(task_id_tokenize, advance=1)
         tokenized_input = tokenizer(
             text,
             truncation=True,
@@ -155,7 +239,9 @@ def load_interaction_logs(log_dir: str, tokenizer: AutoTokenizer, max_seq_length
             "labels": tokenized_input["input_ids"].copy() # Common practice for Causal LM fine-tuning
         })
 
-    print(f"Tokenized {len(tokenized_dataset)} interactions.")
+    if RICH_AVAILABLE:
+        progress_bar.stop()
+    console.print(f"[success]Tokenized {len(tokenized_dataset)} interactions.[/success]")
     return tokenized_dataset
 
 
@@ -163,16 +249,16 @@ def load_interaction_logs(log_dir: str, tokenizer: AutoTokenizer, max_seq_length
 def main():
     args = parse_arguments()
 
-    print("Starting adaptive training script...")
-    print(f"Configuration: {args}")
+    console.print("[bold blue]Starting Adaptive Training Script...[/bold blue]")
+    console.print(f"[info]Configuration: {args}[/info]")
 
     # --- 1. Load Tokenizer and Model ---
-    print(f"Loading base model from: {args.model_path}")
+    console.print(f"[info]Loading base model from: {args.model_path}[/info]")
 
     # Quantization config for QLoRA
     bnb_config = None
     if args.use_qlora:
-        print("QLoRA enabled. Using 4-bit quantization.")
+        console.print("[info]QLoRA enabled. Using 4-bit quantization.[/info]")
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_use_double_quant=True,
@@ -185,7 +271,7 @@ def main():
         # Set pad token if not present. Common practice: use eos_token.
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
-            print(f"Set tokenizer.pad_token to tokenizer.eos_token ({tokenizer.eos_token})")
+            console.print(f"[info]Set tokenizer.pad_token to tokenizer.eos_token ({tokenizer.eos_token})[/info]")
 
         model = AutoModelForCausalLM.from_pretrained(
             args.model_path,
@@ -195,28 +281,23 @@ def main():
             trust_remote_code=True,
             # torch_dtype=torch.bfloat16 # if not using bnb_config and want bfloat16
         )
-        print("Tokenizer and model loaded successfully.")
+        console.print("[success]Tokenizer and model loaded successfully.[/success]")
 
         if args.use_qlora:
-            print("Preparing model for k-bit training (QLoRA)...")
+            console.print("[info]Preparing model for k-bit training (QLoRA)...[/info]")
             model = prepare_model_for_kbit_training(model)
 
     except Exception as e:
-        print(f"Error loading model or tokenizer: {e}")
-        print("Ensure './merged_model' exists and is a valid Hugging Face model directory.")
-        print("This script should be run AFTER the user has downloaded and merged models.")
+        console.print(f"[error]Error loading model or tokenizer: {e}[/error]")
+        console.print("[warning]Ensure './merged_model' exists and is a valid Hugging Face model directory.[/warning]")
+        console.print("[info]This script should be run AFTER the user has downloaded and merged models via setup_agi_terminal.py.[/info]")
         return
 
     # --- 2. Configure PEFT (LoRA) ---
-    # Target modules can vary by model architecture. Common ones are query, key, value layers.
-    # Need to inspect the model to find appropriate module names (e.g., 'q_proj', 'k_proj', 'v_proj' for Llama-like models)
-    # For now, let's assume common ones for demonstration. This might need adjustment.
-    target_modules = ["q_proj", "v_proj"] # Placeholder - MUST BE CHECKED FOR THE MERGED MODEL
-    # A more robust way would be to inspect model.named_modules()
-    # Or use a utility function to find all linear layers if targeting them broadly.
-
-    print(f"Configuring LoRA with r={args.lora_r}, alpha={args.lora_alpha}, dropout={args.lora_dropout}")
-    print(f"Attempting to target modules: {target_modules}. THIS MAY NEED ADJUSTMENT FOR YOUR SPECIFIC MERGED MODEL.")
+    target_modules = ["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"] # Common for Llama-like
+    console.print(f"[info]Configuring LoRA with r={args.lora_r}, alpha={args.lora_alpha}, dropout={args.lora_dropout}[/info]")
+    console.print(f"[info]Attempting to target modules for LoRA (common Llama-like modules): {target_modules}.[/info]")
+    console.print("[warning]If training fails around PEFT model configuration, these target_modules might need adjustment for your specific merged model architecture.[/warning]")
 
     lora_config = LoraConfig(
         r=args.lora_r,
@@ -229,34 +310,68 @@ def main():
 
     try:
         model = get_peft_model(model, lora_config)
-        print("PEFT model (LoRA) configured successfully.")
-        model.print_trainable_parameters()
+        console.print("[success]PEFT model (LoRA) configured successfully.[/success]")
+        # model.print_trainable_parameters() # This can be verbose, make it optional or log to file
+        trainable_params, all_param = model.get_nb_trainable_parameters()
+        console.print(f"[info]Trainable LoRA parameters: {trainable_params} || All parameters: {all_param} || Trainable %: {100 * trainable_params / all_param:.2f}[/info]")
     except Exception as e:
-        print(f"Error configuring PEFT model: {e}")
-        print("This might be due to incorrect target_modules for the loaded model architecture.")
-        # Example inspection:
-        # print("Model architecture inspection (first few layers):")
-        # for name, module in model.named_modules():
-        #     if 'proj' in name or 'attention' in name or 'mlp' in name: # Common keywords
-        #         print(name)
-        #     # Or print all to find suitable Linear layers
+        console.print(f"[error]Error configuring PEFT model: {e}[/error]")
+        console.print("[warning]This might be due to incorrect target_modules for the loaded model architecture.[/warning]")
+        console.print("[info]You can try to inspect `model.named_modules()` to find suitable Linear layers for LoRA.[/info]")
         return
 
     # --- 3. Load and Prepare Data ---
-    print("Loading and preparing dataset from interaction logs...")
-    train_dataset = load_interaction_logs(args.log_dir, tokenizer, args.max_seq_length)
+    console.print("[info]Loading and preparing dataset from interaction logs...[/info]")
+    train_dataset = load_interaction_logs(
+        args.log_dir,
+        tokenizer,
+        args.max_seq_length,
+        args.log_count,
+        args.log_days
+    )
 
-    if not train_dataset:
-        print("No training data available. Exiting.")
+    if not train_dataset: # load_interaction_logs now handles printing "no data" messages
         return
 
-    # Data collator for language modeling. It will handle creating labels from input_ids if not already present.
-    # If labels are input_ids (as done in load_interaction_logs), MLM=False ensures labels are not further masked.
     data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
     # --- 4. Training Arguments ---
-    print(f"Preparing training arguments. Output will be saved to: {args.output_dir}")
+    console.print(f"[info]Preparing training arguments. Output will be saved to: {args.output_dir}[/info]")
     os.makedirs(args.output_dir, exist_ok=True)
+
+    # Define a custom progress bar callback for Rich if RICH_AVAILABLE
+    class RichProgressCallback(transformers.TrainerCallback):
+        def __init__(self):
+            super().__init__()
+            self.progress = None
+            self.train_task_id = None
+
+        def on_train_begin(self, args, state, control, **kwargs):
+            if RICH_AVAILABLE and state.is_world_process_zero:
+                self.progress = Progress(
+                    TextColumn("[progress.description]{task.description}"),
+                    BarColumn(),
+                    TextColumn("[progress.percentage]{task.percentage:>3.1f}%"),
+                    TextColumn("Steps: {task.completed}/{task.total}"),
+                    TimeRemainingColumn(),
+                    TimeElapsedColumn(),
+                    console=console,
+                    transient=True # Remove progress bar when done
+                )
+                self.progress.start()
+                self.train_task_id = self.progress.add_task("Training", total=state.max_steps)
+
+        def on_step_end(self, args, state, control, **kwargs):
+            if RICH_AVAILABLE and state.is_world_process_zero and self.progress and self.train_task_id is not None:
+                self.progress.update(self.train_task_id, advance=1)
+
+        def on_train_end(self, args, state, control, **kwargs):
+            if RICH_AVAILABLE and state.is_world_process_zero and self.progress:
+                self.progress.stop()
+                self.progress = None
+                self.train_task_id = None
+
+    callbacks = [RichProgressCallback()] if RICH_AVAILABLE else []
 
     training_args = TrainingArguments(
         output_dir=args.output_dir,
@@ -271,50 +386,49 @@ def main():
         bf16=args.use_qlora, # QLoRA often paired with bf16 compute_dtype
         # Add other arguments like weight_decay, lr_scheduler_type, warmup_steps etc.
         # optim="paged_adamw_8bit" if args.use_qlora else "adamw_hf", # QLoRA often uses paged optimizers
+        disable_tqdm=RICH_AVAILABLE, # Disable default tqdm if Rich progress is used
+        logging_dir=f"{args.output_dir}/logs", # Store training logs
     )
 
     # --- 5. Initialize Trainer ---
-    print("Initializing Trainer...")
+    console.print("[info]Initializing Trainer...[/info]")
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         # eval_dataset=None, # Add validation set if available
         data_collator=data_collator,
+        callbacks=callbacks
     )
 
     # --- 6. Train ---
-    print("Starting training...")
-    print("NOTE: Actual model training is computationally intensive and requires a suitable GPU environment.")
-    print("This script provides the structure. Ensure your environment is set up for Hugging Face model training.")
+    console.print("[bold green]Starting training...[/bold green]")
+    console.print("[warning]NOTE: Actual model training is computationally intensive and requires a suitable GPU environment.[/warning]")
+    console.print("[info]This script provides the structure. Ensure your environment is set up for Hugging Face model training.[/info]")
 
-    # This is where the actual training happens.
-    # In a sandboxed environment without a GPU or sufficient resources, this will be slow or fail.
-    # For the purpose of this agent's task, we are setting up the script.
-    # The user will run this script in their own environment.
     try:
-        trainer.train()
-        print("Training completed.")
+        train_result = trainer.train()
+        console.print(f"[success]Training completed. Metrics: {train_result.metrics}[/success]")
     except Exception as e:
-        print(f"An error occurred during trainer.train(): {e}")
-        print("This could be due to resource limitations (CUDA OOM), configuration issues, or data problems.")
-        print("Consider reducing batch size, sequence length, or using QLoRA if not already.")
+        console.print(f"[error]An error occurred during trainer.train(): {e}[/error]")
+        console.print("[warning]This could be due to resource limitations (CUDA OOM), configuration issues, or data problems.[/warning]")
+        console.print("[info]Consider reducing batch size, sequence length, or using QLoRA if not already.[/info]")
         # No return here, proceed to attempt saving if any progress was made or if it's just a dry run.
 
     # --- 7. Save Model (PEFT Adapters) ---
-    print(f"Saving PEFT adapters to {args.output_dir}...")
+    console.print(f"[info]Saving PEFT adapters to {args.output_dir}...[/info]")
     try:
-        # Trainer might save checkpoints already. This explicitly saves the final adapter.
-        model.save_pretrained(args.output_dir)
+        trainer.save_model(args.output_dir) # This saves the PEFT adapters correctly
+        # model.save_pretrained(args.output_dir) # Trainer.save_model is preferred for adapters
         tokenizer.save_pretrained(args.output_dir) # Save tokenizer for completeness
-        print(f"Adapters and tokenizer saved successfully to {args.output_dir}.")
-        print("To load the fine-tuned model later:")
-        print("1. Load the base model: model = AutoModelForCausalLM.from_pretrained(base_model_path)")
-        print("2. Load PEFT adapters: model = PeftModel.from_pretrained(model, adapter_path)")
+        console.print(f"[success]Adapters and tokenizer saved successfully to {args.output_dir}.[/success]")
+        console.print("[info]To load the fine-tuned model later:[/info]")
+        console.print("[info]1. Load the base model: `model = AutoModelForCausalLM.from_pretrained(base_model_path)`[/info]")
+        console.print("[info]2. Load PEFT adapters: `model = PeftModel.from_pretrained(model, adapter_path)`[/info]")
     except Exception as e:
-        print(f"Error saving model/adapters: {e}")
+        console.print(f"[error]Error saving model/adapters: {e}[/error]")
 
-    print("Adaptive training script finished.")
+    console.print("[bold blue]Adaptive training script finished.[/bold blue]")
 
 if __name__ == "__main__":
     # This is a placeholder for how the script would be run.

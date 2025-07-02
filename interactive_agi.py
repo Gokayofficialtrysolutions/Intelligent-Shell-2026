@@ -671,6 +671,34 @@ def main():
                     move_path_command(source, destination)
                 else:
                     console.print("[red]Usage: /mv <source> <destination>[/red]")
+            elif user_input.lower().startswith("/cat "):
+                file_path_to_cat = user_input[len("/cat "):].strip()
+                if file_path_to_cat:
+                    cat_file_command(file_path_to_cat, agi_interface) # Pass agi_interface for summarization
+                else:
+                    console.print("[red]Usage: /cat <file_path>[/red]")
+            elif user_input.lower().startswith("/edit "):
+                file_path_to_edit = user_input[len("/edit "):].strip()
+                if file_path_to_edit:
+                    edit_file_command(file_path_to_edit)
+                else:
+                    console.print("[red]Usage: /edit <file_path>[/red]")
+            elif user_input.lower().startswith("/git "):
+                git_command_parts = user_input.strip().split(maxsplit=2) # /git <subcommand> [args]
+                git_subcommand = git_command_parts[1].lower() if len(git_command_parts) > 1 else None
+                git_args = git_command_parts[2] if len(git_command_parts) > 2 else None
+
+                if git_subcommand == "status":
+                    git_status_command()
+                elif git_subcommand == "diff":
+                    git_diff_command(git_args) # git_args might be None or a file path
+                elif git_subcommand == "log":
+                    # Args for log could be -n <count> or other git log options.
+                    # For simplicity, we'll just pass them along or parse -n.
+                    git_log_command(git_args) # git_args might be like "-n 5" or None
+                else:
+                    console.print(f"[red]Unknown git subcommand: {git_subcommand}[/red]")
+                    console.print("[info]Available git commands: status, diff [file], log [-n count][/info]")
             else:
                 with console.status("[yellow]AGI is thinking...[/yellow]", spinner="dots"):
                     agi_response_text = agi_interface.generate_response(user_input)
@@ -950,7 +978,310 @@ def display_system_info():
         except Exception: # Broad except as os.sysconf might not be available/applicable
             table.add_row("Total Memory (approx)", "N/A (psutil not installed for details)")
 
-    console.print(table) # Display the table within a Panel
+    console.print(table)
+
+# --- Git Command Implementations ---
+def git_status_command():
+    try:
+        # Check if in a git repo first (otherwise `git status` prints an error to stderr)
+        check_repo_process = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], capture_output=True, text=True, check=False)
+        if check_repo_process.returncode != 0 or check_repo_process.stdout.strip() != "true":
+            console.print("[yellow]Not inside a Git repository.[/yellow]")
+            return
+
+        process = subprocess.run(["git", "status", "--porcelain", "-b"], capture_output=True, text=True, check=True)
+        output = process.stdout.strip()
+        lines = output.splitlines()
+
+        if not lines:
+            console.print("[green]Git status: Clean working directory.[/green]")
+            return
+
+        branch_line = ""
+        staged_files = []
+        unstaged_files = []
+        untracked_files = []
+
+        if lines[0].startswith("##"):
+            branch_line = lines[0]
+            lines = lines[1:] # Rest are file statuses
+
+        # Parse branch info (e.g., "## main...origin/main [ahead 1]")
+        branch_name = branch_line.split("...")[0][3:].strip() # Remove "## "
+        remote_info = branch_line.split("...")[-1].strip() if "..." in branch_line else ""
+
+        for line in lines:
+            status_code = line[:2]
+            filepath = line[3:]
+            if status_code.startswith("??"):
+                untracked_files.append(filepath)
+            elif status_code[0] in "MADRCU": # Staged changes (first char)
+                staged_files.append(f"({status_code[0].strip()}) {filepath}")
+            elif status_code[1] in "MD": # Unstaged changes (second char)
+                 unstaged_files.append(f"({status_code[1].strip()}) {filepath}")
+            # This parsing is simplified; porcelain can be complex.
+
+        table = Table(title=f"Git Status: [cyan]{branch_name}[/cyan] [dim]({remote_info})[/dim]", show_lines=False, box=None)
+        table.add_column("Category", style="bold yellow")
+        table.add_column("Files")
+
+        if staged_files:
+            table.add_row("Staged", "\n".join(staged_files))
+        if unstaged_files:
+            table.add_row("Unstaged", "\n".join(unstaged_files))
+        if untracked_files:
+            table.add_row("Untracked", "\n".join(untracked_files))
+
+        if not staged_files and not unstaged_files and not untracked_files:
+             table.add_row("Status", "[green]Clean working directory.[/green]")
+
+        console.print(table)
+
+    except FileNotFoundError:
+        console.print("[red]Error: git command not found. Is Git installed and in PATH?[/red]")
+    except subprocess.CalledProcessError as e:
+        console.print(f"[red]Error running git status: {e.stderr}[/red]")
+    except Exception as e:
+        console.print(f"[red]An unexpected error occurred with /git status: {type(e).__name__} - {e}[/red]")
+
+def git_diff_command(file_path_str: Optional[str] = None):
+    try:
+        # Check if in a git repo
+        check_repo_process = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], capture_output=True, text=True, check=False)
+        if check_repo_process.returncode != 0 or check_repo_process.stdout.strip() != "true":
+            console.print("[yellow]Not inside a Git repository.[/yellow]")
+            return
+
+        git_command = ["git", "diff"]
+        title = "Git Diff (Staged Changes)"
+        if file_path_str:
+            git_command.extend(["--", file_path_str])
+            title = f"Git Diff for [cyan]{file_path_str}[/cyan] (Working Directory vs Index)"
+        else: # If no file, diff staged
+            git_command.append("HEAD")
+
+
+        process = subprocess.run(git_command, capture_output=True, text=True, check=False) # check=False as diff returns 1 if there are changes
+
+        if process.returncode != 0 and process.stderr and "fatal:" in process.stderr.lower():
+            console.print(f"[red]Git diff error: {process.stderr.strip()}[/red]")
+            return
+
+        if not process.stdout.strip():
+            console.print(f"[green]No differences found for '{file_path_str if file_path_str else 'staged changes'}'[/green]")
+            return
+
+        console.print(Panel(Syntax(process.stdout, "diff", theme="monokai", line_numbers=True, word_wrap=True),
+                            title=f"[bold blue]{title}[/bold blue]", border_style="blue"))
+    except FileNotFoundError:
+        console.print("[red]Error: git command not found. Is Git installed and in PATH?[/red]")
+    except Exception as e:
+        console.print(f"[red]An unexpected error occurred with /git diff: {type(e).__name__} - {e}[/red]")
+
+def git_log_command(args_str: Optional[str] = None):
+    try:
+        # Check if in a git repo
+        check_repo_process = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], capture_output=True, text=True, check=False)
+        if check_repo_process.returncode != 0 or check_repo_process.stdout.strip() != "true":
+            console.print("[yellow]Not inside a Git repository.[/yellow]")
+            return
+
+        git_command = ["git", "log", "--pretty=format:%C(yellow)%h%Creset %C(green)%ad%Creset | %s %C(cyan)%d%Creset %C(bold blue)[%an]%Creset", "--date=short"]
+        count = 10 # Default count
+
+        if args_str:
+            # Basic parsing for -n <count> or just <count>
+            match_n = re.match(r"-n\s*(\d+)", args_str)
+            match_num_only = re.match(r"(\d+)", args_str)
+            if match_n:
+                count = int(match_n.group(1))
+            elif match_num_only:
+                 count = int(match_num_only.group(1))
+            # For more complex arg parsing, argparse would be better if this were a standalone script
+
+        git_command.append(f"-{count}")
+
+        process = subprocess.run(git_command, capture_output=True, text=True, check=True)
+        if not process.stdout.strip():
+            console.print("[yellow]No git history found.[/yellow]")
+            return
+
+        # Rich console will render the ANSI escape codes from git's pretty format
+        console.print(Panel(Text.from_ansi(process.stdout), title=f"[bold blue]Git Log (Last {count} Commits)[/bold blue]", border_style="blue"))
+
+    except FileNotFoundError:
+        console.print("[red]Error: git command not found. Is Git installed and in PATH?[/red]")
+    except subprocess.CalledProcessError as e:
+        console.print(f"[red]Error running git log: {e.stderr}[/red]")
+    except ValueError: # For int conversion of count
+        console.print("[red]Invalid count for /git log. Please provide a number (e.g., /git log -n 15).[/red]")
+    except Exception as e:
+        console.print(f"[red]An unexpected error occurred with /git log: {type(e).__name__} - {e}[/red]")
+
+
+# --- File Content Interaction Commands ---
+MAX_CAT_LINES = 200 # Lines to display for large files before asking to summarize
+MAX_CAT_CHARS_FOR_SUMMARY = 5000 # Max chars to send for summary
+
+def get_lexer_for_filename(filename: str) -> str:
+    """Tries to guess the lexer name for rich.syntax from filename."""
+    ext_to_lexer = {
+        ".py": "python", ".js": "javascript", ".ts": "typescript", ".java": "java",
+        ".c": "c", ".cpp": "cpp", ".h": "c", ".hpp": "cpp", ".cs": "csharp",
+        ".go": "go", ".rs": "rust", ".sh": "bash", ".bash": "bash", ".zsh": "bash",
+        ".html": "html", ".htm": "html", ".css": "css", ".scss": "scss",
+        ".json": "json", ".xml": "xml", ".yaml": "yaml", ".yml": "yaml",
+        ".md": "markdown", ".rst": "rst", ".txt": "text",
+        ".sql": "sql", ".rb": "ruby", ".php": "php", ".swift": "swift",
+        ".kt": "kotlin", ".kts": "kotlin",
+        "dockerfile": "dockerfile", ".dockerfile": "dockerfile",
+        ".conf": "ini", ".ini": "ini", ".cfg":"ini",
+        ".diff": "diff", ".patch": "diff",
+    }
+    suffix = Path(filename).suffix.lower()
+    name = Path(filename).name.lower() # For files like 'Dockerfile'
+    if name in ext_to_lexer: # Check full name first for files like Dockerfile
+        return ext_to_lexer[name]
+    return ext_to_lexer.get(suffix, "text") # Default to text
+
+def cat_file_command(file_path_str: str, agi_interface: MergedAGI):
+    try:
+        target_path = Path(file_path_str).resolve()
+        if not target_path.exists():
+            console.print(f"[red]Error: File not found: {target_path}[/red]")
+            return
+        if not target_path.is_file():
+            console.print(f"[red]Error: Not a file: {target_path}[/red]")
+            return
+
+        file_size = target_path.stat().st_size
+        lexer = get_lexer_for_filename(target_path.name)
+
+        content_to_display = ""
+        is_truncated_display = False
+
+        try:
+            with open(target_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+            content = "".join(lines)
+
+            if len(lines) > MAX_CAT_LINES or file_size > MAX_CAT_CHARS_FOR_SUMMARY * 2: # Heuristic for large files
+                is_truncated_display = True
+                content_to_display = "".join(lines[:MAX_CAT_LINES])
+                if len(lines) > MAX_CAT_LINES * 2: # If significantly larger, show head and tail
+                     content_to_display += f"\n\n[dim]... (file truncated, {len(lines) - MAX_CAT_LINES*2} lines hidden) ...[/dim]\n\n"
+                     content_to_display += "".join(lines[-MAX_CAT_LINES:])
+                elif len(lines) > MAX_CAT_LINES: # Moderately larger, just show head
+                     content_to_display += f"\n\n[dim]... (file truncated, {len(lines) - MAX_CAT_LINES} more lines not shown) ...[/dim]\n"
+                console.print(f"[yellow]File is large ({len(lines)} lines). Displaying a portion.[/yellow]")
+            else:
+                content_to_display = content
+
+        except UnicodeDecodeError:
+            console.print(f"[red]Error: Could not decode file {target_path} as UTF-8. It might be a binary file or use a different encoding.[/red]")
+            # Optionally, try latin-1 or offer to show hex dump for binaries
+            if Confirm.ask(f"Attempt to display as binary/latin-1?", default=False, console=console):
+                try:
+                    with open(target_path, 'r', encoding='latin-1') as f:
+                        lines = f.readlines(MAX_CAT_LINES + 1) # Read a bit more to check size
+                    content = "".join(lines[:MAX_CAT_LINES])
+                    content_to_display = content
+                    if len(lines) > MAX_CAT_LINES:
+                        is_truncated_display = True
+                        content_to_display += "\n\n[dim]... (file truncated, shown with latin-1 encoding) ...[/dim]\n"
+                    lexer = "text" # Force plaintext for non-utf8
+                except Exception as e_latin1:
+                    console.print(f"[red]Error reading as latin-1: {e_latin1}[/red]")
+                    return
+            else:
+                return
+        except Exception as e:
+            console.print(f"[red]Error reading file '{target_path}': {type(e).__name__} - {e}[/red]")
+            return
+
+        console.print(Panel(Syntax(content_to_display, lexer, theme="monokai", line_numbers=True, word_wrap=True),
+                            title=f"[bold blue]Content of {target_path.name}[/bold blue] ({file_size} bytes)",
+                            border_style="blue"))
+
+        if is_truncated_display or file_size > MAX_CAT_CHARS_FOR_SUMMARY:
+            if Confirm.ask("Send a portion of this file to the AGI for summary or query?", default=False, console=console):
+                # Prepare content for AGI (first N chars for simplicity, could be more sophisticated)
+                content_for_agi = content[:MAX_CAT_CHARS_FOR_SUMMARY]
+                if len(content) > MAX_CAT_CHARS_FOR_SUMMARY:
+                    content_for_agi += "\n[...content truncated...]"
+
+                agi_prompt = f"Regarding the following content from file '{target_path.name}':\n\n{content_for_agi}\n\nPlease summarize it or answer questions I might have."
+
+                console.print(f"\n[info]Sending summary request for {target_path.name} to AGI...[/info]")
+                with console.status("[yellow]AGI is processing file content...[/yellow]", spinner="dots"):
+                    agi_response_text = agi_interface.generate_response(agi_prompt)
+
+                # Log interaction
+                if session_logger:
+                    session_logger.log_entry("User", f"/cat {file_path_str} (sent to AGI)")
+                    session_logger.log_entry("AGI", agi_response_text)
+                conversation_history.append({"role": "user", "content": f"/cat {file_path_str} (sent to AGI: {target_path.name})", "timestamp": datetime.now().isoformat()})
+                conversation_history.append({"role": "assistant", "content": agi_response_text, "timestamp": datetime.now().isoformat()})
+
+                # Display AGI response
+                response_parts = detect_code_blocks(agi_response_text)
+                console.print(f"[agiprompt]AGI Analysis of {target_path.name}:[/agiprompt]")
+                for part in response_parts:
+                    if part["type"] == "text":
+                        console.print(Text(part["content"]))
+                    elif part["type"] == "code":
+                        lang_for_syntax = part["lang"] if part["lang"] else "plaintext"
+                        try:
+                            code_syntax = Syntax(part["content"], lang_for_syntax, theme="monokai", line_numbers=True, word_wrap=True)
+                            console.print(code_syntax)
+                        except Exception:
+                            code_syntax = Syntax(part["content"], "plaintext", theme="monokai", line_numbers=True, word_wrap=True)
+                            console.print(code_syntax)
+                            console.print(f"(Note: language '{part['lang']}' not recognized for syntax highlighting, shown as plaintext)", style="dim italic")
+
+    except Exception as e:
+        console.print(f"[red]Error in /cat command for '{file_path_str}': {type(e).__name__} - {e}[/red]")
+
+
+def edit_file_command(file_path_str: str):
+    target_path = Path(file_path_str) # Don't resolve yet, editor might create it
+
+    editor = os.environ.get('EDITOR')
+    if not editor:
+        system = platform.system()
+        if system == "Windows":
+            editor = "notepad"
+        elif system in ["Linux", "Darwin"]: # Darwin is macOS
+            # Prefer nano if available, then vim, then vi
+            if shutil.which("nano"): editor = "nano"
+            elif shutil.which("vim"): editor = "vim"
+            elif shutil.which("vi"): editor = "vi"
+            else: # A very basic fallback, though most systems will have one of the above
+                console.print("[yellow]No default editor found (EDITOR variable not set, nano/vim/vi not found). Please set EDITOR environment variable.[/yellow]")
+                return
+        else: # Unknown system
+            console.print(f"[yellow]Unsupported OS ({system}) for default editor detection. Please set EDITOR environment variable.[/yellow]")
+            return
+
+    console.print(f"Attempting to open '{target_path}' with editor '{editor}'...", style="info")
+    try:
+        # For terminal editors, subprocess.run usually works well.
+        # For GUI editors on some systems, they might detach, or shell=True might be needed
+        # but shell=True is a security risk if file_path_str is not sanitized (though less so here).
+        # For simplicity and security, avoid shell=True if possible.
+        process = subprocess.run([editor, str(target_path)], check=False)
+        if process.returncode != 0:
+            console.print(f"[yellow]Editor '{editor}' exited with code {process.returncode}.[/yellow]")
+        else:
+            console.print(f"Editor '{editor}' closed.", style="info")
+            if not target_path.exists():
+                 console.print(f"[yellow]Note: File '{target_path}' was not created/saved by the editor.[/yellow]")
+
+    except FileNotFoundError:
+        console.print(f"[red]Error: Editor '{editor}' not found. Please ensure it's installed and in your PATH or set the EDITOR environment variable.[/red]")
+    except Exception as e:
+        console.print(f"[red]Error opening editor '{editor}' for '{target_path}': {type(e).__name__} - {e}[/red]")
+
 
 def load_history():
     if HISTORY_FILE_PATH.exists():
