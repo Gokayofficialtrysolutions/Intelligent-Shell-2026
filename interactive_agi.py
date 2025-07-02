@@ -518,13 +518,41 @@ class MergedAGI:
             if prompt_for_tool_use:
                 # Guide the AGI to consider using a shell command
                 tool_instruction = (
-                    "If you can answer this by suggesting a safe, read-only shell command, "
-                    "please respond ONLY with a JSON object in the format: "
-                    "{\"action\": \"run_shell\", \"command\": \"<your_command_here>\", \"reasoning\": \"<why_this_command>\"}. "
-                    "Allowed commands are: ls, pwd, echo, date, uname, df, free. "
-                    "Otherwise, answer directly as a helpful assistant.\n"
+                    "You have access to a 'run_shell' tool. If you can answer the query by suggesting a safe, read-only shell command from the allowed list, "
+                    "please respond ONLY with a JSON object in the following format:\n"
+                    "{\n"
+                    "  \"action\": \"run_shell\",\n"
+                    "  \"command\": \"<command_executable_name>\",\n"
+                    "  \"args\": [\"<argument1>\", \"<argument2>\", ...],\n"
+                    "  \"reasoning\": \"<brief_explanation_for_this_command>\"\n"
+                    "}\n"
+                    "Details:\n"
+                    "- The 'command' field MUST be one of the following whitelisted commands: " + f"{', '.join(SHELL_COMMAND_WHITELIST)}. \n"
+                    "- The 'args' field MUST be a list of strings, where each string is a separate argument to the command. Do not include the command itself in 'args'.\n"
+                    "- Arguments should be simple and not contain shell metacharacters (like pipes |, redirection >, variables $, etc.).\n"
+                    "- Example for listing files: {\"action\": \"run_shell\", \"command\": \"ls\", \"args\": [\"-la\", \"/tmp\"], \"reasoning\": \"List all files with details in /tmp directory.\"}\n"
+                    "- Example for showing first 10 lines of a file: {\"action\": \"run_shell\", \"command\": \"head\", \"args\": [\"-n\", \"10\", \"my_file.txt\"], \"reasoning\": \"Show the first 10 lines of my_file.txt.\"}\n"
+                    "- Example for counting lines in a file: {\"action\": \"run_shell\", \"command\": \"wc\", \"args\": [\"-l\", \"data.csv\"], \"reasoning\": \"Count the number of lines in data.csv.\"}\n"
+                    "- Example for searching text in a file: {\"action\": \"run_shell\", \"command\": \"grep\", \"args\": [\"-i\", \"warning\", \"application.log\"], \"reasoning\": \"Search for 'warning' (case-insensitive) in application.log.\"}\n"
+                    "\n"
+                    "You also have access to a 'read_file' tool. If you need to read the content of a file to answer the user's query, "
+                    "respond ONLY with a JSON object in the following format:\n"
+                    "{\n"
+                    "  \"action\": \"read_file\",\n"
+                    "  \"filepath\": \"<path_to_file_relative_to_CWD>\",\n"
+                    "  \"max_lines\": <optional_integer_max_lines_to_read_for_context_usually_around_100_to_200>,\n"
+                    "  \"reasoning\": \"<brief_explanation_why_you_need_to_read_this_file>\"\n"
+                    "}\n"
+                    "Details for 'read_file':\n"
+                    "- 'filepath' MUST be a relative path to a file. Do not use absolute paths.\n"
+                    "- 'max_lines' is optional. If the file is very large, the system may truncate it or provide a summary. Suggesting max_lines helps focus.\n"
+                    "- After you request a file read, the system will provide its content (or a part of it) in the next turn, along with the original user query. You should then use that information to formulate your final answer.\n"
+                    "- Example: {\"action\": \"read_file\", \"filepath\": \"src/utils.py\", \"max_lines\": 100, \"reasoning\": \"To understand the helper functions available before answering how to implement the feature.\"}\n"
+                    "\n"
+                    "If the query cannot be answered with a whitelisted shell command or by reading a file, or if it requires a command not on the list, answer directly as a helpful assistant without using the JSON format.\n"
+                    "Choose only ONE action ('run_shell' or 'read_file') if you decide to use a tool. Do not combine them in one JSON response.\n"
                 )
-                full_prompt = f"{current_context_str}\n{tool_instruction}\n{task_prefix}{prompt}"
+                full_prompt = f"{current_context_str}\n\nTool Instructions:\n{tool_instruction}\n\nUser Query:\n{task_prefix}{prompt}"
             else:
                 full_prompt = f"{current_context_str}\n{task_prefix}{prompt}"
 
@@ -913,42 +941,107 @@ def main():
                     data = json.loads(json_str_to_parse)
 
                     if isinstance(data, dict) and data.get("action") == "run_shell":
-                        command_to_run = data.get("command")
+                        command_executable = data.get("command")
+                        command_args_list = data.get("args", [])
                         reasoning = data.get("reasoning", "No reasoning provided.")
-                        command_executable = command_to_run.split()[0] if command_to_run else ""
 
-                        if command_to_run and command_executable in SHELL_COMMAND_WHITELIST:
-                            console.print(Panel(Text(f"AGI suggests running command: [bold cyan]{command_to_run}[/bold cyan]\nReason: {reasoning}", style="yellow"), title="[bold blue]Shell Command Suggestion[/bold blue]"))
+                        # Ensure command_args_list is actually a list of strings
+                        if not isinstance(command_args_list, list) or not all(isinstance(arg, str) for arg in command_args_list):
+                            console.print(f"[warning]AGI suggested command with invalid 'args' format. Expected a list of strings. Payload: {data}[/warning]")
+                            action_taken_by_tool_framework = False
+                            agi_response_text = f"AGI's suggested command had malformed arguments. Reasoning: {reasoning}"
+                        elif command_executable and command_executable in SHELL_COMMAND_WHITELIST:
+                            command_to_display = f"{command_executable} {' '.join(command_args_list)}"
+                            console.print(Panel(Text(f"AGI suggests running command: [bold cyan]{command_to_display}[/bold cyan]\nReason: {reasoning}", style="yellow"), title="[bold blue]Shell Command Suggestion[/bold blue]"))
 
                             confirmed = False
                             if RICH_AVAILABLE:
                                 from rich.prompt import Confirm
                                 confirmed = Confirm.ask("Execute this command?", default=False, console=console)
                             else:
-                                confirmed = input("Execute this command? (yes/NO): ").lower() == "yes"
+                                confirmed = input(f"Execute: {command_to_display}? (yes/NO): ").lower() == "yes"
 
                             if confirmed:
-                                execute_shell_command(command_to_run)
+                                execute_shell_command(command_executable, command_args_list)
                             else:
                                 console.print("Command execution cancelled by user.", style="yellow")
-                                if session_logger: session_logger.log_entry("System", f"Cancelled execution of: {command_to_run}")
+                                if session_logger: session_logger.log_entry("System", f"Cancelled execution of: {command_to_display}")
                             action_taken_by_tool_framework = True
-                        elif command_to_run: # Command suggested but not whitelisted
-                            console.print(f"[warning]AGI suggested a non-whitelisted command: '{command_to_run}'. Execution denied for safety.[/warning]")
-                            if session_logger: session_logger.log_entry("AGI_Suggestion (Denied)", f"Command: {command_to_run}, Reason: {reasoning}")
-                            # Fall through to display reasoning/response as text if not executing
+                        elif command_executable: # Command suggested but not whitelisted
+                            command_to_display = f"{command_executable} {' '.join(command_args_list)}"
+                            console.print(f"[warning]AGI suggested a non-whitelisted command: '{command_to_display}'. Execution denied for safety.[/warning]")
+                            if session_logger: session_logger.log_entry("AGI_Suggestion (Denied)", f"Command: {command_to_display}, Reason: {reasoning}")
                             action_taken_by_tool_framework = False
-                            agi_response_text = f"The AGI suggested a command that is not on the whitelist: '{command_to_run}'. Reasoning: {reasoning} (Displaying as text instead)."
+                            agi_response_text = f"The AGI suggested a command that is not on the whitelist: '{command_to_display}'. Reasoning: {reasoning} (Displaying as text instead)."
+                        else: # No command_executable provided
+                            console.print(f"[warning]AGI suggestion for 'run_shell' did not include a 'command'. Payload: {data}[/warning]")
+                            action_taken_by_tool_framework = False
+                            agi_response_text = f"AGI's suggested command was malformed (missing command). Reasoning: {reasoning}"
+
+                    elif isinstance(data, dict) and data.get("action") == "read_file":
+                        filepath_str = data.get("filepath")
+                        max_lines = data.get("max_lines") # Optional
+                        reasoning = data.get("reasoning", "No reasoning provided for file read.")
+
+                        if not filepath_str:
+                            console.print(f"[warning]AGI 'read_file' request missing 'filepath'. Payload: {data}[/warning]")
+                            agi_response_text = "AGI's file read request was malformed (missing filepath)."
+                            action_taken_by_tool_framework = False # Fall through to display error
+                        else:
+                            console.print(Panel(Text(f"AGI requests to read file: [bold cyan]{filepath_str}[/bold cyan]\nReason: {reasoning}", style="yellow"), title="[bold blue]File Read Request[/bold blue]"))
+
+                            # Execute the read_file tool action
+                            file_content_for_agi, read_error = handle_read_file_request(filepath_str, max_lines)
+
+                            if read_error:
+                                # Inform AGI about the error
+                                error_prompt = (
+                                    f"Context:\nAn attempt to read the file '{filepath_str}' failed.\n"
+                                    f"Error: {read_error}\n\n"
+                                    f"Original User Query: {user_input}\n\n"
+                                    "Please inform the user about the error and proceed based on available information or ask for clarification."
+                                )
+                                with console.status("[yellow]AGI is processing file read error...[/yellow]", spinner="dots"):
+                                    agi_response_text = agi_interface.generate_response(error_prompt)
+                                # Let this response be displayed normally by falling through action_taken_by_tool_framework = False
+                                # (or True if we consider this an action completion)
+                                # For now, let it display the AGI's error-handling response.
+                                action_taken_by_tool_framework = False # To display the AGI's response to the error
+                            else:
+                                # Construct new prompt for AGI with file content
+                                subsequent_prompt = (
+                                    f"{context_analyzer.get_full_context_string()}\n\n"
+                                    f"File Content ('{filepath_str}'):\n```text\n{file_content_for_agi}\n```\n\n"
+                                    f"Original User Query that led to reading this file: \"{user_input}\"\n\n"
+                                    "Based on the provided file content and the original query, please formulate your answer to the user."
+                                )
+                                console.print(f"[info]File '{filepath_str}' read. Sending content to AGI for processing against original query...[/info]")
+                                with console.status("[yellow]AGI is processing file content for the original query...[/yellow]", spinner="dots"):
+                                    agi_response_text = agi_interface.generate_response(subsequent_prompt)
+                                # This agi_response_text is the final one for the user for this turn.
+                                # It will be displayed by the standard mechanism below.
+                                action_taken_by_tool_framework = False # Let the normal display path handle this final response.
+                                                                    # The actual "tool action" was reading the file and re-prompting.
+                                                                    # We're essentially transforming the AGI's output here.
+                            # Log the AGI's initial request to read the file
+                            if session_logger:
+                                session_logger.log_entry("AGI_Request_ReadFile", f"File: {filepath_str}, MaxLines: {max_lines}, Reason: {reasoning}, Error: {read_error}")
+                            conversation_history.append({
+                                "role": "assistant_tool_request", # Special role for tool intermediate step
+                                "content": f"Requested to read file: {filepath_str}. Reason: {reasoning}. Error: {read_error}",
+                                "timestamp": datetime.now().isoformat()
+                            })
+                            # The final AGI response (after getting file content or error) will be logged by the generic handler below.
 
 
                 except json.JSONDecodeError:
                     # Not a JSON response for tool use, treat as normal chat
                     action_taken_by_tool_framework = False
-                except Exception as e:
-                    console.print(f"[warning]Could not fully process AGI response for potential tool use: {e}[/warning]")
+                except Exception as e: # Catch-all for other errors during tool processing
+                    console.print(f"[warning]Could not fully process AGI response for potential tool use: {type(e).__name__} - {e}[/warning]")
                     action_taken_by_tool_framework = False
 
-                # If no tool action was taken, display as regular AGI response
+                # If no tool action was taken, or if a tool action resulted in a final text response from AGI (e.g. after file read), display it.
                 if not action_taken_by_tool_framework:
                     conversation_history.append({"role": "assistant", "content": agi_response_text, "timestamp": datetime.now().isoformat()})
                     if session_logger and getattr(session_logger, 'enabled', True): # Check if enabled
@@ -1009,7 +1102,10 @@ def main():
     # The main __main__ block's finally clause handles saving history and the final "AGI session terminated" message.
 
 # --- Shell Command Whitelist & Execution ---
-SHELL_COMMAND_WHITELIST = ["ls", "pwd", "echo", "date", "uname", "df", "free", "whoami", "uptime", "hostname"]
+SHELL_COMMAND_WHITELIST = [
+    "ls", "pwd", "echo", "date", "uname", "df", "free", "whoami", "uptime", "hostname",
+    "head", "tail", "wc", "grep"
+]
 
 # --- Experimental Code Change Suggestion ---
 # Whitelist of files the AGI can suggest changes for (mostly its own project files)
@@ -1108,28 +1204,30 @@ def suggest_code_change_command(file_path_str: str, agi_interface: MergedAGI):
     console.print("\n[bold yellow]IMPORTANT: This is only a suggestion. Review it carefully. You must apply these changes manually if you agree.[/bold yellow]")
 
 
-def execute_shell_command(command_to_run: str):
-    # Basic safety: ensure the command starts with a whitelisted executable
-    # This is not foolproof for complex commands with ;, &&, || etc. but is a first step.
-
-def execute_shell_command(command_to_run: str):
-    # Basic safety: ensure the command starts with a whitelisted executable
-    # This is not foolproof for complex commands with ;, &&, || etc. but is a first step.
-    # `shell=True` is used, so the command string is passed directly.
-    # A more robust solution would involve shlex.split and running with shell=False,
-    # but that makes handling aliases or simple pipes harder without more logic.
-
-    command_executable = command_to_run.split()[0] if command_to_run else ""
+def execute_shell_command(command_executable: str, command_args: list[str]):
+    """
+    Executes a whitelisted shell command with arguments using shell=False.
+    """
     if command_executable not in SHELL_COMMAND_WHITELIST:
         console.print(f"[bold red]Error: Command '{command_executable}' is not in the allowed list of safe commands.[/bold red]")
-        if session_logger: session_logger.log_entry("System", f"Denied execution (not whitelisted): {command_to_run}")
+        if session_logger: session_logger.log_entry("System", f"Denied execution (not whitelisted): {command_executable} {' '.join(command_args)}")
         return
 
-    console.print(f"Executing: [bold cyan]{command_to_run}[/bold cyan]", style="info")
-    try:
-        process = subprocess.run(command_to_run, shell=True, capture_output=True, text=True, timeout=15, check=False)
+    full_command_list = [command_executable] + command_args
+    command_to_display = f"{command_executable} {' '.join(command_args)}" # For display purposes
 
-        output_panel_title = f"[bold green]Output of: {command_to_run}[/bold green]"
+    console.print(f"Executing: [bold cyan]{command_to_display}[/bold cyan]", style="info")
+    try:
+        process = subprocess.run(
+            full_command_list,
+            shell=False,  # Crucial for security when taking args from AGI
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False # We will check returncode manually
+        )
+
+        output_panel_title = f"[bold green]Output of: {command_to_display}[/bold green]"
         output_content = ""
         if process.stdout:
             output_content += f"[bold]Stdout:[/bold]\n{process.stdout.strip()}\n"
@@ -1139,17 +1237,32 @@ def execute_shell_command(command_to_run: str):
         if process.stderr:
             output_content += f"\n[bold red]Stderr:[/bold red]\n{process.stderr.strip()}"
 
+        if process.returncode != 0:
+             output_content += f"\n[bold yellow]Return code:[/bold yellow] {process.returncode}"
+
         console.print(Panel(Text(output_content.strip()), title=output_panel_title))
 
         if session_logger:
-            session_logger.log_entry("System", f"Executed: {command_to_run}\nStdout: {process.stdout.strip()}\nStderr: {process.stderr.strip()}")
+            log_message = (
+                f"Executed: {command_to_display}\n"
+                f"Return Code: {process.returncode}\n"
+                f"Stdout: {process.stdout.strip()}\n"
+                f"Stderr: {process.stderr.strip()}"
+            )
+            session_logger.log_entry("System", log_message)
 
+    except FileNotFoundError: # command_executable not found
+        console.print(f"[red]Error: Command '{command_executable}' not found. Is it installed and in PATH?[/red]")
+        if session_logger: session_logger.log_entry("System", f"Command not found: {command_to_display}")
     except subprocess.TimeoutExpired:
-        console.print(f"[red]Error: Command '{command_to_run}' timed out.[/red]")
-        if session_logger: session_logger.log_entry("System", f"Command timed out: {command_to_run}")
+        console.print(f"[red]Error: Command '{command_to_display}' timed out.[/red]")
+        if session_logger: session_logger.log_entry("System", f"Command timed out: {command_to_display}")
+    except PermissionError: # Should be less common with shell=False for the command itself
+        console.print(f"[red]Error: Permission denied when trying to execute '{command_to_display}'.[/red]")
+        if session_logger: session_logger.log_entry("System", f"Permission error executing: {command_to_display}")
     except Exception as e:
-        console.print(f"[red]Error executing command '{command_to_run}': {e}[/red]")
-        if session_logger: session_logger.log_entry("System", f"Error executing {command_to_run}: {e}")
+        console.print(f"[red]Error executing command '{command_to_display}': {type(e).__name__} - {e}[/red]")
+        if session_logger: session_logger.log_entry("System", f"Error executing {command_to_display}: {e}")
 
 # --- Command Implementations ---
 def create_directory_command(path_str: str):
@@ -1784,6 +1897,114 @@ def git_status_command():
 
     except FileNotFoundError:
         console.print("[red]Error: git command not found. Is Git installed and in PATH?[/red]")
+    except subprocess.CalledProcessError as e:
+        console.print(f"[red]Error running git log: {e.stderr}[/red]")
+    except ValueError: # For int conversion of count
+        console.print("[red]Invalid count for /git log. Please provide a number (e.g., /git log -n 15).[/red]")
+    except Exception as e:
+        console.print(f"[red]An unexpected error occurred with /git log: {type(e).__name__} - {e}[/red]")
+
+
+# --- AGI Tool Helper Functions ---
+AGI_READ_FILE_DEFAULT_MAX_LINES = 200 # Default max lines for AGI file read if not specified by AGI
+AGI_READ_FILE_MAX_CHARS = 10000     # Absolute max characters to return to AGI from a file read
+
+def handle_read_file_request(filepath_str: str, max_lines_from_agi: Optional[int]) -> tuple[Optional[str], Optional[str]]:
+    """
+    Handles an AGI's request to read a file.
+
+    Args:
+        filepath_str: The relative path to the file, as requested by AGI.
+        max_lines_from_agi: Optional maximum lines AGI wants to read.
+
+    Returns:
+        A tuple (file_content_string, None) on success,
+        or (None, error_message_string) on failure.
+    """
+    try:
+        requested_path = Path(filepath_str)
+
+        # Security Validation 1: Ensure it's a relative path
+        if requested_path.is_absolute():
+            return None, f"File path must be relative, but got absolute path: {filepath_str}"
+
+        # Resolve the path based on current working directory
+        # Path.resolve() also handles '..' components safely.
+        abs_path = (Path.cwd() / requested_path).resolve()
+        cwd_resolved = Path.cwd().resolve()
+
+        # Security Validation 2: Check if the resolved path is within CWD or its subdirectories
+        # This is a basic sandboxing attempt.
+        if not str(abs_path).startswith(str(cwd_resolved)):
+             # Check if it's a sibling file/dir that's allowed (e.g. for ../file.txt)
+             # This can happen if CWD is a subdir of a project and AGI wants to access a file in parent.
+             # A more robust check would be against a defined "project_root".
+             # For now, let's allow one level up if it's still within a reasonable scope.
+             # A simple check: if path starts with '..' and after resolving, it's not going "too far up".
+             # This is tricky. `Path.is_relative_to` (Python 3.9+) is better.
+             # For now, the startswith check on resolved paths is a basic measure.
+             # If `abs_path` is not under `cwd_resolved`, it's potentially problematic.
+            return None, f"Access denied: File path '{filepath_str}' resolves outside the current working directory scope."
+
+
+        if not abs_path.exists():
+            return None, f"File not found at resolved path: {abs_path}"
+        if not abs_path.is_file():
+            return None, f"Path is not a file: {abs_path}"
+
+        # Determine max lines to read
+        max_lines_to_read = AGI_READ_FILE_DEFAULT_MAX_LINES
+        if max_lines_from_agi is not None:
+            try:
+                agn_max_l = int(max_lines_from_agi)
+                if agn_max_l > 0:
+                    max_lines_to_read = min(agn_max_l, AGI_READ_FILE_DEFAULT_MAX_LINES * 2) # Allow AGI to ask for more, but cap it reasonably
+            except ValueError:
+                pass # Ignore invalid max_lines from AGI, use default
+
+        file_content_lines = []
+        chars_read = 0
+        lines_actually_read = 0
+        truncated_message = ""
+
+        with open(abs_path, 'r', encoding='utf-8') as f:
+            for i, line in enumerate(f):
+                if i >= max_lines_to_read:
+                    truncated_message = f"\n[...content truncated after {max_lines_to_read} lines...]"
+                    break
+                if chars_read + len(line) > AGI_READ_FILE_MAX_CHARS:
+                    # If adding this line exceeds char limit, take a partial line if possible, then break.
+                    remaining_chars = AGI_READ_FILE_MAX_CHARS - chars_read
+                    if remaining_chars > 0:
+                        file_content_lines.append(line[:remaining_chars])
+                    truncated_message = f"\n[...content truncated due to character limit ({AGI_READ_FILE_MAX_CHARS} chars)...]"
+                    break
+
+                file_content_lines.append(line)
+                chars_read += len(line)
+                lines_actually_read = i + 1
+
+        final_content = "".join(file_content_lines).strip() # Strip trailing newlines from the snippet itself
+        if truncated_message:
+            final_content += truncated_message
+
+        # Log how much was read
+        console.print(f"[dim info]Read {lines_actually_read} lines ({chars_read} chars) from '{filepath_str}'. Max lines requested/default: {max_lines_to_read}. Char limit: {AGI_READ_FILE_MAX_CHARS}.[/dim info]")
+
+        return final_content, None
+
+    except UnicodeDecodeError:
+        return None, f"Could not decode file '{filepath_str}' as UTF-8. It might be binary or use a different encoding."
+    except IOError as e:
+        return None, f"IOError reading file '{filepath_str}': {e}"
+    except Exception as e: # Catch-all for unexpected errors during file handling
+        console.print(f"[bold red]Unexpected error in handle_read_file_request for '{filepath_str}': {type(e).__name__} - {e}[/bold red]")
+        return None, f"An unexpected error occurred while trying to read file: {type(e).__name__}"
+
+
+# --- File Content Interaction Commands ---
+MAX_CAT_LINES = 200 # Lines to display for large files before asking to summarize
+MAX_CAT_CHARS_FOR_SUMMARY = 5000 # Max chars to send for summary
     except subprocess.CalledProcessError as e:
         console.print(f"[red]Error running git status: {e.stderr}[/red]")
     except Exception as e:
