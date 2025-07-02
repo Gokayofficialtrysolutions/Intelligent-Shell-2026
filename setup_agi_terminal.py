@@ -17,7 +17,8 @@ REQUIRED_PYTHON_PACKAGES = [
     "bitsandbytes", # May have OS-specific build issues if not from wheel
     "sentencepiece",
     "scipy",
-    "rich"
+    "rich",
+    "psutil"
 ]
 
 # --- Utility Functions ---
@@ -195,6 +196,14 @@ def main():
 
     # --- Phase C: Final Steps & Verification ---
     print_notice("Starting Phase C: Final Setup Verification")
+
+    # Create cache directory for history etc.
+    cache_dir = Path("./.agi_terminal_cache")
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        print_success(f"Ensured cache directory exists: {cache_dir.resolve()}")
+    except OSError as e:
+        print_warning(f"Could not create cache directory {cache_dir.resolve()}: {e}")
 
     # Ensure interactive_agi.py and adaptive_train.py are present (they should be in the repo)
     # and make adaptive_train.py executable as well if it exists.

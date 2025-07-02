@@ -1,0 +1,59 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+.venv/
+venv/
+ENV/
+env/
+*.env
+
+# IDE and editor specific files
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# AGI Terminal specific cache and logs
+models/
+# Keep merge_config.yml, download_models.sh, train_on_interaction.sh
+# as they are templates/managed by setup_agi_terminal.py or user might want to inspect.
+# merged_model/ # This is user-generated and can be large, user might want to decide.
+# For now, let's explicitly ignore the cache for history and potentially other temp files.
+.agi_terminal_cache/
+interaction_logs/ # User might want to commit these for training, but often can be large/many.
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+nosetests.xml
+coverage.xml
+*.cover
+
+# Secrets - ensure these are not committed
+*.secrets
+secrets.json
+secrets.yaml
+.env.*local
+
+# Large data files (if any, add specific patterns)
+# *.data
+# *.dat
+# *.pkl
+# *.h5

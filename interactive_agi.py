@@ -117,8 +117,29 @@ from datetime import datetime # For history timestamps
 # Global context analyzer instance
 context_analyzer = ContextAnalyzer()
 
+from collections import deque # For conversation history
+from rich.table import Table # For /ls command and sysinfo
+from datetime import datetime # For history timestamps
+import json # For saving/loading history
+import platform # Already used, but good to note for sysinfo
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+    console.print("WARNING: `psutil` library not found. Detailed system info in /sysinfo will be limited.", style="warning")
+    console.print("Install with: pip install psutil", style="info")
+
+
+# --- Configuration & Globals ---
+HISTORY_FILE_PATH = Path("./.agi_terminal_cache/history.json")
+HISTORY_MAX_LEN = 100 # Store last 100 exchanges (user + assistant = 1 exchange)
+
+# Global context analyzer instance
+context_analyzer = ContextAnalyzer()
+
 # Global conversation history
-conversation_history = deque(maxlen=50) # Store last 50 exchanges
+conversation_history = deque(maxlen=HISTORY_MAX_LEN)
 
 # Attempt to import PyTorch and Transformers
 try:
@@ -206,10 +227,15 @@ class MergedAGI:
             console.print("INFO: Merged AGI model initialized successfully.", style="success")
 
         except OSError as e:
-            console.print(f"ERROR: OSError during model loading (e.g. files missing from '{self.model_path}'): {e}", style="error")
+            console.print(f"ERROR: OSError during model loading from '{self.model_path}'. This often indicates missing files or permission issues.", style="error")
+            console.print(f"Details: {e}", style="dim error")
+        except ImportError as e: # More specific for missing optional dependencies for a model
+            console.print(f"ERROR: ImportError during model loading. A required library might be missing for this model type.", style="error")
+            console.print(f"Details: {e}", style="dim error")
         except Exception as e:
-            console.print(f"ERROR: Failed to load model or tokenizer from '{self.model_path}': {e}", style="error")
-            console.print("INFO: Ensure the model directory is correct and contains all necessary files (config, weights, tokenizer).", style="info")
+            console.print(f"ERROR: An unexpected error occurred while loading model or tokenizer from '{self.model_path}'.", style="error")
+            console.print(f"Details: {type(e).__name__}: {e}", style="dim error")
+            console.print("INFO: Ensure the model directory is correct, complete, and not corrupted. Also check console for other related errors (e.g., Transformers/PyTorch).", style="info")
 
         if not self.is_model_loaded:
              console.print("INFO: Falling back to mock responses due to model loading failure.", style="info")
@@ -271,7 +297,7 @@ class MergedAGI:
 
         except Exception as e:
             console.print(f"ERROR: Exception during model generation: {e}", style="error")
-            return "[bold red]Error:[/bold red] Could not generate response from model."
+            return error_message
 
     def set_parameter(self, param_name_str: str, param_value_str: str) -> str:
         param_name_upper = param_name_str.upper()
@@ -406,26 +432,24 @@ def detect_code_blocks(text: str) -> list:
     """Detects code blocks and separates them from plain text."""
     parts = []
     last_end = 0
-    for match in re.finditer(r"```(.*?)```", text, re.DOTALL):
-        lang_match = re.match(r"```(\w+)?\n", match.group(0))
-        lang = lang_match.group(1) if lang_match and lang_match.group(1) else "plaintext"
+    # Regex to find ``` optionally followed by a language name, then content, then ```
+    # It captures the language name (optional) and the code content.
+    # Handles optional spaces around language name.
+    # Language name can be alphanumeric with hyphens or underscores.
+    for match in re.finditer(r"```(?:([\w\-_]+)\s*)?\n(.*?)\n```", text, re.DOTALL):
+        text_before = text[last_end:match.start()]
+        if text_before:
+            parts.append({"type": "text", "content": text_before})
 
-        code_content = match.group(1)
-        if lang_match: # Remove the first line if it's just the language specifier
-            if code_content.startswith(lang + "\n"):
-                 code_content = code_content[len(lang)+1:]
-            elif code_content.startswith("\n"): # handles ```\n code block
-                 code_content = code_content[1:]
+        lang = (match.group(1) or "plaintext").lower().strip()
+        code_content = match.group(2).strip()
 
-
-        if match.start() > last_end:
-            parts.append({"type": "text", "content": text[last_end:match.start()]})
-
-        parts.append({"type": "code", "content": code_content.strip(), "lang": lang})
+        parts.append({"type": "code", "content": code_content, "lang": lang})
         last_end = match.end()
 
-    if last_end < len(text):
-        parts.append({"type": "text", "content": text[last_end:]})
+    text_after = text[last_end:]
+    if text_after:
+        parts.append({"type": "text", "content": text_after})
     return parts
 
 def main():
@@ -575,18 +599,27 @@ def list_directory_contents(path_str: str):
 
 
         console.print(table)
+    except FileNotFoundError:
+        console.print(f"[red]Error: Directory or path component not found: {path_str}[/red]")
+    except PermissionError:
+        console.print(f"[red]Error: Permission denied for directory: {path_str}[/red]")
     except Exception as e:
-        console.print(f"[red]Error listing directory '{path_str}': {e}[/red]")
+        console.print(f"[red]Error listing directory '{path_str}': {type(e).__name__} - {e}[/red]")
 
 def change_directory(path_str: str):
     try:
-        target_path = Path(path_str).resolve()
-        os.chdir(target_path)
+        resolved_path = Path(path_str).resolve()
+        if not resolved_path.is_dir():
+            console.print(f"[red]Error: Not a directory or path does not exist: {resolved_path}[/red]")
+            return
+        os.chdir(resolved_path)
         console.print(f"Changed directory to: [cyan]{os.getcwd()}[/cyan]")
-    except FileNotFoundError:
+    except FileNotFoundError: # Should be caught by resolve() or is_dir() mostly
         console.print(f"[red]Error: Directory not found: {path_str}[/red]")
+    except PermissionError:
+        console.print(f"[red]Error: Permission denied to change directory to: {path_str}[/red]")
     except Exception as e:
-        console.print(f"[red]Error changing directory to '{path_str}': {e}[/red]")
+        console.print(f"[red]Error changing directory to '{path_str}': {type(e).__name__} - {e}[/red]")
 
 def display_conversation_history():
     if not conversation_history:
@@ -607,25 +640,84 @@ def display_system_info():
     info_text = Text()
     info_text.append("OS: ", style="bold")
     info_text.append(f"{platform.system()} {platform.release()} ({platform.machine()})\n")
-    info_text.append("Python Version: ", style="bold")
-    info_text.append(f"{sys.version.split()[0]}\n")
-    info_text.append("CPU Cores: ", style="bold")
-    info_text.append(f"{os.cpu_count()}\n")
+    # This function is now correctly structured to use a Rich Table.
+    # The previous Text object approach was an intermediate step.
+    table = Table(title="System Information", show_header=True, header_style="bold magenta", border_style="blue")
+    table.add_column("Metric", style="dim", width=25)
+    table.add_column("Value")
 
-    # Basic memory info (more detailed would need psutil)
+    table.add_row("OS", f"{platform.system()} {platform.release()} ({platform.machine()})")
+    table.add_row("Python Version", f"{sys.version.split()[0]}")
+    table.add_row("CPU Cores", str(os.cpu_count()))
+
+    if PSUTIL_AVAILABLE:
+        try:
+            # CPU Info
+            cpu_freq = psutil.cpu_freq()
+            freq_current_str = f"{cpu_freq.current:.2f} MHz" if cpu_freq and cpu_freq.current > 0 else "N/A"
+            freq_max_str = f"{cpu_freq.max:.2f} MHz" if cpu_freq and hasattr(cpu_freq, 'max') and cpu_freq.max > 0 else "N/A"
+            table.add_row("CPU Frequency", f"Current: {freq_current_str}, Max: {freq_max_str}")
+            table.add_row("CPU Usage", f"{psutil.cpu_percent(interval=0.1)}%") # Short interval for responsiveness
+
+            # Memory Info
+            mem = psutil.virtual_memory()
+            table.add_row("Total Memory", f"{mem.total / (1024**3):.2f} GiB")
+            table.add_row("Available Memory", f"{mem.available / (1024**3):.2f} GiB")
+            table.add_row("Used Memory", f"{mem.used / (1024**3):.2f} GiB ({mem.percent}%)")
+
+            # Disk Info (root partition)
+            disk = psutil.disk_usage('/')
+            table.add_row("Total Disk (/)", f"{disk.total / (1024**3):.2f} GiB")
+            table.add_row("Free Disk (/)", f"{disk.free / (1024**3):.2f} GiB ({disk.percent}% used)")
+
+            # Network Info (basic)
+            net_io = psutil.net_io_counters()
+            table.add_row("Network Sent", f"{net_io.bytes_sent / (1024**2):.2f} MiB")
+            table.add_row("Network Received", f"{net_io.bytes_recv / (1024**2):.2f} MiB")
+
+        except Exception as e:
+            table.add_row("[red]psutil Error[/red]", str(e))
+    else:
+        # Fallback for basic memory info if psutil not available
+        try:
+            mem_bytes = os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES')
+            mem_gib = mem_bytes / (1024.**3)
+            table.add_row("Total Memory (approx)", f"{mem_gib:.2f} GiB")
+        except Exception: # Broad except as os.sysconf might not be available/applicable
+            table.add_row("Total Memory (approx)", "N/A (psutil not installed for details)")
+
+    console.print(table) # Display the table within a Panel
+
+def load_history():
+    if HISTORY_FILE_PATH.exists():
+        try:
+            with open(HISTORY_FILE_PATH, 'r', encoding='utf-8') as f:
+                history_list = json.load(f)
+                # Manually extend the deque to respect its maxlen
+                for item in history_list:
+                    conversation_history.append(item) # deque will handle maxlen
+            console.print(f"Loaded {len(conversation_history)} history entries from {HISTORY_FILE_PATH}", style="dim info")
+        except (json.JSONDecodeError, IOError) as e:
+            console.print(f"Error loading history from {HISTORY_FILE_PATH}: {e}", style="warning")
+    else:
+        console.print(f"No history file found at {HISTORY_FILE_PATH}. Starting fresh.", style="dim info")
+
+def save_history():
     try:
-        # This is a very rough estimate and platform dependent for free memory
-        # For a more robust solution, psutil would be better.
-        mem_bytes = os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES')  # e.g. Linux
-        mem_gib = mem_bytes / (1024.**3)
-        info_text.append("Total Memory (approx): ", style="bold")
-        info_text.append(f"{mem_gib:.2f} GiB\n")
-    except Exception:
-         info_text.append("Total Memory (approx): ", style="bold")
-         info_text.append("N/A (could not determine)\n")
-
-    console.print(Panel(info_text, title="[bold blue]System Information[/bold blue]", border_style="blue"))
+        HISTORY_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(HISTORY_FILE_PATH, 'w', encoding='utf-8') as f:
+            json.dump(list(conversation_history), f, indent=2) # Convert deque to list for saving
+        # console.print(f"Saved {len(conversation_history)} history entries to {HISTORY_FILE_PATH}", style="dim info") # Optional: too verbose on every save
+    except IOError as e:
+        console.print(f"Error saving history to {HISTORY_FILE_PATH}: {e}", style="warning")
 
 
 if __name__ == "__main__":
-    main()
+    load_history() # Load history at startup
+    try:
+        main()
+    except SystemExit: # Catch sys.exit for graceful termination without re-printing message
+        pass
+    finally:
+        save_history() # Save history on exit (graceful or via interrupt)
+        console.print("AGI session terminated. History saved.", style="info") # Overwrites the one in main()
