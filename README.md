@@ -68,18 +68,20 @@ The automated setup handles the initial phases. Here's an overview of the compon
 1.  ***`interactive_agi.py` for Actual Model Loading***:
     *   The `interactive_agi.py` script is designed to load the tokenizer and model from `./merged_model`.
     *   **Key Features of `interactive_agi.py`:**
-        *   **Rich UI:** Uses the `rich` library for styled output, syntax highlighting for code, tables for commands like `/ls` and `/sysinfo`, and panels for AI responses.
-        *   **Context Awareness:** Information about CWD, Git status, and file types is passed to the model.
-        *   **Task-Specific Prompting:** Prompts are adjusted based on inferred task type.
-        *   **Persistent History:** Conversation history is saved to `./.agi_terminal_cache/history.json`.
-        *   **Desktop Logging:** Full session transcripts are saved to text files on your Desktop (or `./agi_desktop_logs/`).
-        *   **Configuration:** Terminal behavior can be customized via `./.agi_terminal_cache/config.toml` (see "Configuration" section below).
-        *   **Expanded Commands:** Includes commands for file operations, Git interaction, search, and more (see "How to Run" for command list).
-    *   Error handling and device placement are implemented.
+        *   **Rich UI:** Uses the `rich` library for styled output, syntax highlighting, tables, panels, etc.
+        *   **Context Awareness:** Passes CWD, Git status, file type counts, and key file snippets to the AGI.
+        *   **Task-Specific Prompting & Styling:** Tailors prompts and response panel styles based on inferred task type.
+        *   **Tool Execution Framework (Basic):** AGI can suggest whitelisted shell commands (e.g., `ls`, `pwd`, `date`) for execution with user confirmation.
+        *   **Self-Referential Capability:** `/read_script <filename>` allows viewing whitelisted project scripts.
+        *   **Experimental Code Suggestion:** `/suggest_code_change <file_path>` allows AGI to propose changes (diff/text) to whitelisted files for manual user application.
+        *   **Persistent History & Logging:** Saves JSON history (`./.agi_terminal_cache/history.json`) and plain text session logs to Desktop/fallback dir.
+        *   **Configuration:** Settings managed via `./.agi_terminal_cache/config.toml` and `/config` commands.
+        *   **Expanded Commands:** Extensive command set for file ops, Git, search, system info, etc. (see "How to Run").
+    *   Robust error handling and device placement are implemented.
 2.  ***Test Merged Model Interaction***:
     *   Users can test the merged model by running `python interactive_agi.py`.
 
-**Phase 3: Enabling Learning and Self-Improvement**
+**Phase 3: Enabling Learning and Self-Improvement** (largely in place, usability of `adaptive_train.py` enhanced)
 1.  ***Interaction Logging for Training:***
     *   Interactions for fine-tuning are logged by `train_on_interaction.sh` to `./interaction_logs/`.
     *   Readable session transcripts are also saved to the user's Desktop.
@@ -219,7 +221,9 @@ This script helps you fine-tune the `./merged_model` using your interaction hist
         *   `/git status`: Show parsed Git status for the current directory.
         *   `/git diff [file_path]`: Show Git diff (staged if no file, else for that file).
         *   `/git log [-n <count>]`: Show Git log with formatting (default last 10).
-        *   `/analyze_dir [path]`: (Experimental) Asks the AGI to analyze the directory structure and provide a JSON response, which is then displayed as a tree.
+        *   `/analyze_dir [path]`: (Experimental) Asks the AGI to analyze a directory's structure and provide a JSON response, displayed as a tree.
+        *   `/read_script <filename>`: Displays content of whitelisted project scripts (e.g., `interactive_agi.py`). Useful for asking the AGI about its own code.
+        *   `/suggest_code_change <file_path>`: (Highly Experimental) Allows you to describe a change to a whitelisted project file. The AGI will suggest the change (e.g., in diff format), which you must then review and apply manually.
         *   `/config show`: Display current application configuration.
         *   `/config get <section.key>`: Get a specific configuration value.
         *   `/config set <section.key> <value>`: Set a configuration value (e.g., `/config set display.syntax_theme native`).

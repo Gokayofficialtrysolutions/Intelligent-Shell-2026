@@ -108,7 +108,83 @@ class ContextAnalyzer:
             file_str_parts = [f"{lang}:{count}" for lang, count in file_counts.items()]
             context_parts.append(f"Files=({', '.join(file_str_parts)})")
 
-        return "Context: " + ", ".join(context_parts)
+        # Add file snippets
+        snippets = self.get_key_file_snippets()
+        if snippets:
+            context_parts.append("\nKey File Snippets:\n" + "\n".join(snippets))
+
+        return "Context:\n" + "\n".join(context_parts)
+
+    def get_key_file_snippets(self, max_files: int = 2, max_lines_per_file_half: int = 5, max_total_snippet_chars: int = 1000) -> list[str]:
+        """Gets snippets from key files in the current directory."""
+        snippets = []
+        chars_added = 0
+
+        # Prioritize README.md
+        key_files_candidates = []
+        readme_path = Path("README.md")
+        if readme_path.exists() and readme_path.is_file():
+            key_files_candidates.append(readme_path)
+
+        # Then Python files, then other common text files, sort by modification time (most recent first)
+        other_candidates = []
+        py_files = []
+        common_text_exts = ['.txt', '.sh', '.js', '.json', '.yml', '.toml', '.css', '.html']
+
+        for item_path in Path(".").iterdir():
+            if item_path.is_file():
+                if item_path.suffix == '.py' and item_path.name != "interactive_agi.py" and item_path.name != "setup_agi_terminal.py": # Exclude self
+                    py_files.append(item_path)
+                elif item_path.suffix.lower() in common_text_exts and item_path.name.lower() != "readme.md": # Avoid re-adding README
+                    other_candidates.append(item_path)
+
+        # Sort by modification time, most recent first
+        py_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        other_candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+
+        key_files_candidates.extend(py_files)
+        key_files_candidates.extend(other_candidates)
+
+        files_processed_count = 0
+        for file_path in key_files_candidates:
+            if files_processed_count >= max_files:
+                break
+            if chars_added >= max_total_snippet_chars:
+                break
+
+            try:
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    lines = f.readlines()
+
+                if not lines: continue
+
+                snippet_parts = []
+                # Head
+                head_snippet = "".join(lines[:max_lines_per_file_half])
+                snippet_parts.append(f"--- Snippet from {file_path.name} (first {max_lines_per_file_half} lines) ---\n{head_snippet.strip()}")
+
+                # Tail (if file is larger than twice the half-lines to show, to avoid overlap)
+                if len(lines) > max_lines_per_file_half * 2:
+                    tail_snippet = "".join(lines[-max_lines_per_file_half:])
+                    snippet_parts.append(f"--- (last {max_lines_per_file_half} lines) ---\n{tail_snippet.strip()}")
+
+                full_snippet_text = "\n".join(snippet_parts)
+
+                if chars_added + len(full_snippet_text) > max_total_snippet_chars and snippets: # If not first snippet, and adding this exceeds total
+                    remaining_chars = max_total_snippet_chars - chars_added
+                    if remaining_chars > 50: # Only add if a meaningful part can be added
+                        snippets.append(full_snippet_text[:remaining_chars] + "\n[...snippet truncated...]")
+                    chars_added = max_total_snippet_chars # Mark as full
+                    break
+
+                snippets.append(full_snippet_text)
+                chars_added += len(full_snippet_text)
+                files_processed_count += 1
+
+            except Exception: # Ignore errors reading individual files for snippets
+                pass
+
+        return snippets
 
 from collections import deque # For conversation history
 from rich.table import Table # For /ls command
@@ -317,6 +393,7 @@ class MergedAGI:
         self.is_model_loaded = False
         self.generation_params = DEFAULT_GENERATION_PARAMS.copy() # Start with defaults
         self.model_max_length = 2048 # Default, will try to update from model config
+        self.last_detected_task_type = "general" # Initialize last detected task type
 
         if not TRANSFORMERS_AVAILABLE:
             console.print("ERROR: Transformers/PyTorch not available. Cannot load merged model.", style="error")
@@ -395,19 +472,62 @@ class MergedAGI:
 
             # --- Task-Specific Prompt Engineering ---
             query_lower = prompt.lower()
-            task_prefix = "General Query: " # Default prefix
+            task_type = "general" # Default task type
+            task_prefix = "General Query: "
 
-            code_keywords = ["code", "script", "function", "class", "algorithm", "module", "generate python", "write go", "debug this"]
-            explanation_keywords = ["explain", "what is", "describe", "how does", "tell me about"]
-            # Add more keyword sets as needed
+            # Order matters: more specific keyword sets should come first.
+            code_generation_keywords = ["generate code", "write a script", "create a function", "implement class", "python code for", "javascript for"]
+            code_debugging_keywords = ["debug this code", "fix this error", "what's wrong with this snippet", "error in my code"]
+            code_explanation_keywords = ["explain this code", "what does this function do", "code walkthrough"]
+            summarization_keywords = ["summarize", "tl;dr", "give me a summary", "briefly explain this document"]
+            git_keywords = ["git status", "git diff", "git log", "git commit", "git branch"] # For when user asks AGI about git, not just runs /git
+            explanation_keywords = ["explain", "what is", "describe", "how does", "tell me about", "define"] # General explanations
 
-            if any(keyword in query_lower for keyword in code_keywords):
-                task_prefix = "Coding Task: "
+            if any(keyword in query_lower for keyword in code_generation_keywords):
+                task_type = "code_generation"
+                task_prefix = "Code Generation Task: "
+            elif any(keyword in query_lower for keyword in code_debugging_keywords):
+                task_type = "code_debugging"
+                task_prefix = "Code Debugging Task: "
+            elif any(keyword in query_lower for keyword in code_explanation_keywords):
+                task_type = "code_explanation"
+                task_prefix = "Code Explanation Request: "
+            elif any(keyword in query_lower for keyword in summarization_keywords):
+                task_type = "summarization"
+                task_prefix = "Summarization Request: "
+            elif any(keyword in query_lower for keyword in git_keywords) and not prompt.strip().startswith("/git"): # Avoid if it's already a /git command
+                task_type = "git_query"
+                task_prefix = "Git Related Query: "
             elif any(keyword in query_lower for keyword in explanation_keywords):
+                task_type = "explanation"
                 task_prefix = "Explanation Request: "
 
+            # Store task_type for potential use in response styling (though not directly returned by this func yet)
+            self.last_detected_task_type = task_type
+
+
             # Construct the full prompt with context and task-specific prefix
-            full_prompt = f"{current_context_str}\n{task_prefix}{prompt}"
+
+            # --- Tool Execution Prompt Engineering ---
+            # Check if the query might imply a shell command the AGI could suggest
+            shell_command_keywords = ["list files", "show directory", "what is my current path", "print working directory", "show disk space", "display memory usage", "what's the date", "system information", "who am i"]
+            prompt_for_tool_use = False
+            if any(keyword in query_lower for keyword in shell_command_keywords):
+                prompt_for_tool_use = True
+
+            if prompt_for_tool_use:
+                # Guide the AGI to consider using a shell command
+                tool_instruction = (
+                    "If you can answer this by suggesting a safe, read-only shell command, "
+                    "please respond ONLY with a JSON object in the format: "
+                    "{\"action\": \"run_shell\", \"command\": \"<your_command_here>\", \"reasoning\": \"<why_this_command>\"}. "
+                    "Allowed commands are: ls, pwd, echo, date, uname, df, free. "
+                    "Otherwise, answer directly as a helpful assistant.\n"
+                )
+                full_prompt = f"{current_context_str}\n{tool_instruction}\n{task_prefix}{prompt}"
+            else:
+                full_prompt = f"{current_context_str}\n{task_prefix}{prompt}"
+
             # console.print(f"[Dim]Full prompt being sent to model:\n{full_prompt}[/Dim]") # For debugging
 
             # Ensure prompt length + max_new_tokens is within model_max_length
@@ -739,6 +859,23 @@ def main():
                     edit_file_command(file_path_to_edit)
                 else:
                     console.print("[red]Usage: /edit <file_path>[/red]")
+            elif user_input.lower().startswith("/read_script "):
+                script_name_to_read = user_input[len("/read_script "):].strip()
+                allowed_scripts = ["interactive_agi.py", "setup_agi_terminal.py", "adaptive_train.py", "download_models.sh", "train_on_interaction.sh", "merge_config.yml"]
+                if script_name_to_read and script_name_to_read in allowed_scripts:
+                    # Check if file exists in current dir or one level up (common for dev setups)
+                    script_path = Path(script_name_to_read)
+                    if not script_path.exists():
+                        script_path = Path("..") / script_name_to_read # Check parent if not in CWD
+
+                    if script_path.exists() and script_path.is_file():
+                         cat_file_command(str(script_path), agi_interface)
+                    else:
+                         console.print(f"[red]Error: Script '{script_name_to_read}' not found at expected locations.[/red]")
+                elif script_name_to_read:
+                    console.print(f"[red]Error: Reading script '{script_name_to_read}' is not allowed. Allowed scripts: {', '.join(allowed_scripts)}[/red]")
+                else:
+                    console.print("[red]Usage: /read_script <script_filename>[/red]")
             elif user_input.lower().startswith("/config"):
                 config_args = user_input.strip()[len("/config"):].strip() # Get args after /config
                 config_command_handler(config_args)
@@ -758,35 +895,111 @@ def main():
                 else:
                     console.print(f"[red]Unknown git subcommand: {git_subcommand}[/red]")
                     console.print("[info]Available git commands: status, diff [file], log [-n count][/info]")
-            else:
+            else: # Default: AGI generates a response or suggests a command
                 with console.status("[yellow]AGI is thinking...[/yellow]", spinner="dots"):
                     agi_response_text = agi_interface.generate_response(user_input)
 
-                conversation_history.append({"role": "assistant", "content": agi_response_text, "timestamp": datetime.now().isoformat()})
-                if session_logger:
-                    session_logger.log_entry("AGI", agi_response_text)
+                action_taken_by_tool_framework = False
+                try:
+                    # Attempt to parse for tool use first
+                    json_match = re.search(r"```json\n(.*?)\n```", agi_response_text, re.DOTALL)
+                    json_str_to_parse = json_match.group(1) if json_match else agi_response_text
 
-                response_parts = detect_code_blocks(agi_response_text)
+                    first_brace = json_str_to_parse.find('{')
+                    last_brace = json_str_to_parse.rfind('}')
+                    if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+                        json_str_to_parse = json_str_to_parse[first_brace : last_brace+1]
 
-                console.print(f"[agiprompt]AGI Output:[/agiprompt]")
-                for part in response_parts:
-                    if part["type"] == "text":
-                        console.print(Text(part["content"]))
-                    elif part["type"] == "code":
-                        lang_for_syntax = part["lang"] if part["lang"] else "plaintext"
-                        try:
+                    data = json.loads(json_str_to_parse)
+
+                    if isinstance(data, dict) and data.get("action") == "run_shell":
+                        command_to_run = data.get("command")
+                        reasoning = data.get("reasoning", "No reasoning provided.")
+                        command_executable = command_to_run.split()[0] if command_to_run else ""
+
+                        if command_to_run and command_executable in SHELL_COMMAND_WHITELIST:
+                            console.print(Panel(Text(f"AGI suggests running command: [bold cyan]{command_to_run}[/bold cyan]\nReason: {reasoning}", style="yellow"), title="[bold blue]Shell Command Suggestion[/bold blue]"))
+
+                            confirmed = False
+                            if RICH_AVAILABLE:
+                                from rich.prompt import Confirm
+                                confirmed = Confirm.ask("Execute this command?", default=False, console=console)
+                            else:
+                                confirmed = input("Execute this command? (yes/NO): ").lower() == "yes"
+
+                            if confirmed:
+                                execute_shell_command(command_to_run)
+                            else:
+                                console.print("Command execution cancelled by user.", style="yellow")
+                                if session_logger: session_logger.log_entry("System", f"Cancelled execution of: {command_to_run}")
+                            action_taken_by_tool_framework = True
+                        elif command_to_run: # Command suggested but not whitelisted
+                            console.print(f"[warning]AGI suggested a non-whitelisted command: '{command_to_run}'. Execution denied for safety.[/warning]")
+                            if session_logger: session_logger.log_entry("AGI_Suggestion (Denied)", f"Command: {command_to_run}, Reason: {reasoning}")
+                            # Fall through to display reasoning/response as text if not executing
+                            action_taken_by_tool_framework = False
+                            agi_response_text = f"The AGI suggested a command that is not on the whitelist: '{command_to_run}'. Reasoning: {reasoning} (Displaying as text instead)."
+
+
+                except json.JSONDecodeError:
+                    # Not a JSON response for tool use, treat as normal chat
+                    action_taken_by_tool_framework = False
+                except Exception as e:
+                    console.print(f"[warning]Could not fully process AGI response for potential tool use: {e}[/warning]")
+                    action_taken_by_tool_framework = False
+
+                # If no tool action was taken, display as regular AGI response
+                if not action_taken_by_tool_framework:
+                    conversation_history.append({"role": "assistant", "content": agi_response_text, "timestamp": datetime.now().isoformat()})
+                    if session_logger and getattr(session_logger, 'enabled', True): # Check if enabled
+                        session_logger.log_entry("AGI", agi_response_text)
+
+                    response_parts = detect_code_blocks(agi_response_text)
+
+                    # Determine panel style based on detected task type
+                    panel_title_text = "[agiprompt]AGI Output[/agiprompt]"
+                    panel_border_style_color = "blue" # Default
+                    task_type_for_style = agi_interface.last_detected_task_type
+
+                    if task_type_for_style == "code_generation":
+                        panel_title_text = "[agiprompt]AGI Code Generation[/agiprompt]"
+                        panel_border_style_color = "green"
+                    elif task_type_for_style == "code_debugging":
+                        panel_title_text = "[agiprompt]AGI Code Debugging[/agiprompt]"
+                        panel_border_style_color = "yellow"
+                    elif task_type_for_style == "explanation" or task_type_for_style == "code_explanation":
+                        panel_title_text = "[agiprompt]AGI Explanation[/agiprompt]"
+                        panel_border_style_color = "cyan"
+                    elif task_type_for_style == "summarization":
+                        panel_title_text = "[agiprompt]AGI Summary[/agiprompt]"
+                        panel_border_style_color = "magenta"
+                    elif task_type_for_style == "git_query":
+                        panel_title_text = "[agiprompt]AGI Git Query Response[/agiprompt]"
+                        panel_border_style_color = "bright_black"
+
+                    output_renderable = Text()
+                    for part_idx, part in enumerate(response_parts):
+                        if part["type"] == "text":
+                            output_renderable.append(part["content"])
+                        elif part["type"] == "code":
+                            # Add a newline before code block if previous part was text and didn't end with newline
+                            if part_idx > 0 and response_parts[part_idx-1]["type"] == "text" and not response_parts[part_idx-1]["content"].endswith("\n"):
+                                output_renderable.append("\n")
                             current_theme = APP_CONFIG.get("display", {}).get("syntax_theme", "monokai")
-                            code_syntax = Syntax(part["content"], lang_for_syntax, theme=current_theme, line_numbers=True, word_wrap=True)
-                            console.print(code_syntax)
-                        except Exception as e_rich_syntax:
-                            console.print(f"[dim warning]Rich Syntax Error for lang '{lang_for_syntax}': {e_rich_syntax}. Falling back to plaintext.[/dim warning]")
-                            current_theme = APP_CONFIG.get("display", {}).get("syntax_theme", "monokai") # Ensure theme is fetched again for fallback
-                            code_syntax = Syntax(part["content"], "plaintext", theme=current_theme, line_numbers=True, word_wrap=True)
-                            console.print(code_syntax)
+                            lang_for_syntax = part["lang"] if part["lang"] else "plaintext"
+                            try:
+                                code_syntax = Syntax(part["content"], lang_for_syntax, theme=current_theme, line_numbers=True, word_wrap=True)
+                                output_renderable.append(code_syntax)
+                            except Exception as e_rich_syntax:
+                                console.print(f"[dim warning]Rich Syntax Error for lang '{lang_for_syntax}': {e_rich_syntax}. Falling back to plaintext.[/dim warning]")
+                                code_syntax_fallback = Syntax(part["content"], "plaintext", theme=current_theme, line_numbers=True, word_wrap=True)
+                                output_renderable.append(code_syntax_fallback)
+                        if part_idx < len(response_parts) -1: # Add newline between parts if not last part
+                             output_renderable.append("\n")
+
+                    console.print(Panel(output_renderable, title=panel_title_text, border_style=panel_border_style_color, expand=False))
 
                 if agi_interface.is_model_loaded or isinstance(agi_interface, AGIPPlaceholder):
-                    # call_training_script is for the specific ./interaction_logs for adaptive_train.py
-                    # Desktop logging of this exchange is handled by session_logger.log_entry() above.
                     call_training_script(user_input, agi_response_text)
 
             console.print("-" * console.width)
@@ -794,6 +1007,149 @@ def main():
     except KeyboardInterrupt:
         console.print("\nExiting due to KeyboardInterrupt...", style="info")
     # The main __main__ block's finally clause handles saving history and the final "AGI session terminated" message.
+
+# --- Shell Command Whitelist & Execution ---
+SHELL_COMMAND_WHITELIST = ["ls", "pwd", "echo", "date", "uname", "df", "free", "whoami", "uptime", "hostname"]
+
+# --- Experimental Code Change Suggestion ---
+# Whitelist of files the AGI can suggest changes for (mostly its own project files)
+SUGGEST_CHANGE_WHITELIST = ["interactive_agi.py", "setup_agi_terminal.py", "adaptive_train.py", "merge_config.yml", "download_models.sh", "train_on_interaction.sh", "README.md"]
+
+def suggest_code_change_command(file_path_str: str, agi_interface: MergedAGI):
+    target_path = Path(file_path_str)
+
+    if target_path.name not in SUGGEST_CHANGE_WHITELIST:
+        console.print(f"[red]Error: Suggestions for modifying '{target_path.name}' are not allowed for safety.[/red]")
+        console.print(f"[info]Allowed files for suggestions: {', '.join(SUGGEST_CHANGE_WHITELIST)}[/info]")
+        return
+
+    if not target_path.exists() or not target_path.is_file():
+        console.print(f"[red]Error: File not found or is not a regular file: {target_path.resolve()}[/red]")
+        return
+
+    console.print(f"[info]Selected file for change suggestion: {target_path.resolve()}[/info]")
+
+    try:
+        with open(target_path, 'r', encoding='utf-8') as f:
+            file_content = f.read()
+    except Exception as e:
+        console.print(f"[red]Error reading file '{target_path.name}': {e}[/red]")
+        return
+
+    # Display a portion of the file for context if it's large
+    max_display_lines = 50
+    display_lines = file_content.splitlines()
+    if len(display_lines) > max_display_lines:
+        console.print(Panel("\n".join(display_lines[:max_display_lines]) + "\n... (file content truncated for display)",
+                              title=f"Start of {target_path.name}", border_style="dim"))
+    else:
+        cat_file_command(str(target_path), agi_interface) # Use existing cat to show it with syntax highlighting
+
+    console.print(f"\n[prompt]Describe the change you want to make to '{target_path.name}' (or type 'cancel'):[/prompt]")
+    change_description = console.input("> ")
+
+    if not change_description or change_description.lower() == 'cancel':
+        console.print("Code change suggestion cancelled.", style="yellow")
+        return
+
+    # Prepare prompt for AGI
+    # Truncate file content if very large, to keep prompt size reasonable
+    max_content_chars_for_prompt = 8000 # Example limit
+    content_for_prompt = file_content
+    if len(file_content) > max_content_chars_for_prompt:
+        content_for_prompt = file_content[:max_content_chars_for_prompt] + "\n\n[...FILE CONTENT TRUNCATED FOR PROMPT...]"
+        console.print(f"[yellow]Warning: File content is large, sending a truncated version ({max_content_chars_for_prompt} chars) to AGI.[/yellow]")
+
+    prompt_text = (
+        f"You are an expert software developer. The user wants to make a change to the file '{target_path.name}'.\n"
+        f"Current file content of '{target_path.name}':\n```\n{content_for_prompt}\n```\n\n"
+        f"User's requested change: \"{change_description}\"\n\n"
+        "Please provide the suggested code modification in a `diff -u` format. "
+        "The diff should be relative to the provided file content. "
+        "Output ONLY the diff content, enclosed in a ```diff ... ``` markdown block. "
+        "If you cannot represent the change as a diff, describe the necessary find/replace operations or line changes clearly."
+    )
+
+    console.print("\n[info]Requesting code change suggestion from AGI...[/info]")
+    with console.status("[yellow]AGI is thinking about the code change...[/yellow]", spinner="dots"):
+        suggestion_response = agi_interface.generate_response(prompt_text)
+
+    if session_logger:
+        session_logger.log_entry("User", f"/suggest_code_change {file_path_str} - Request: {change_description}")
+        session_logger.log_entry("AGI_Suggestion", suggestion_response)
+    conversation_history.append({"role": "user", "content": f"/suggest_code_change {file_path_str} - Request: {change_description}", "timestamp": datetime.now().isoformat()})
+    conversation_history.append({"role": "assistant", "content": f"Suggested change for {target_path.name}:\n{suggestion_response}", "timestamp": datetime.now().isoformat()})
+
+    console.print(f"\n[agiprompt]AGI's Suggested Change for {target_path.name}:[/agiprompt]")
+
+    # Try to display as diff, otherwise plain text
+    diff_match = re.search(r"```diff\n(.*?)\n```", suggestion_response, re.DOTALL)
+    if diff_match:
+        diff_content = diff_match.group(1)
+        console.print(Panel(Syntax(diff_content, "diff", theme=APP_CONFIG.get("display",{}).get("syntax_theme","monokai"), line_numbers=True),
+                            title="Suggested Diff", border_style="yellow"))
+    else:
+        # If not a diff block, display as regular text/code blocks
+        response_parts = detect_code_blocks(suggestion_response)
+        for part in response_parts:
+            if part["type"] == "text":
+                console.print(Text(part["content"]))
+            elif part["type"] == "code":
+                current_theme = APP_CONFIG.get("display", {}).get("syntax_theme", "monokai")
+                lang_for_syntax = part["lang"] if part["lang"] else "plaintext"
+                try:
+                    code_syntax = Syntax(part["content"], lang_for_syntax, theme=current_theme, line_numbers=True, word_wrap=True)
+                    console.print(code_syntax)
+                except Exception as e_rich_syntax:
+                    console.print(f"[dim warning]Rich Syntax Error for lang '{lang_for_syntax}': {e_rich_syntax}. Falling back to plaintext.[/dim warning]")
+                    code_syntax_fallback = Syntax(part["content"], "plaintext", theme=current_theme, line_numbers=True, word_wrap=True)
+                    console.print(code_syntax_fallback)
+
+    console.print("\n[bold yellow]IMPORTANT: This is only a suggestion. Review it carefully. You must apply these changes manually if you agree.[/bold yellow]")
+
+
+def execute_shell_command(command_to_run: str):
+    # Basic safety: ensure the command starts with a whitelisted executable
+    # This is not foolproof for complex commands with ;, &&, || etc. but is a first step.
+
+def execute_shell_command(command_to_run: str):
+    # Basic safety: ensure the command starts with a whitelisted executable
+    # This is not foolproof for complex commands with ;, &&, || etc. but is a first step.
+    # `shell=True` is used, so the command string is passed directly.
+    # A more robust solution would involve shlex.split and running with shell=False,
+    # but that makes handling aliases or simple pipes harder without more logic.
+
+    command_executable = command_to_run.split()[0] if command_to_run else ""
+    if command_executable not in SHELL_COMMAND_WHITELIST:
+        console.print(f"[bold red]Error: Command '{command_executable}' is not in the allowed list of safe commands.[/bold red]")
+        if session_logger: session_logger.log_entry("System", f"Denied execution (not whitelisted): {command_to_run}")
+        return
+
+    console.print(f"Executing: [bold cyan]{command_to_run}[/bold cyan]", style="info")
+    try:
+        process = subprocess.run(command_to_run, shell=True, capture_output=True, text=True, timeout=15, check=False)
+
+        output_panel_title = f"[bold green]Output of: {command_to_run}[/bold green]"
+        output_content = ""
+        if process.stdout:
+            output_content += f"[bold]Stdout:[/bold]\n{process.stdout.strip()}\n"
+        else:
+            output_content += "[dim]No output (stdout)[/dim]\n"
+
+        if process.stderr:
+            output_content += f"\n[bold red]Stderr:[/bold red]\n{process.stderr.strip()}"
+
+        console.print(Panel(Text(output_content.strip()), title=output_panel_title))
+
+        if session_logger:
+            session_logger.log_entry("System", f"Executed: {command_to_run}\nStdout: {process.stdout.strip()}\nStderr: {process.stderr.strip()}")
+
+    except subprocess.TimeoutExpired:
+        console.print(f"[red]Error: Command '{command_to_run}' timed out.[/red]")
+        if session_logger: session_logger.log_entry("System", f"Command timed out: {command_to_run}")
+    except Exception as e:
+        console.print(f"[red]Error executing command '{command_to_run}': {e}[/red]")
+        if session_logger: session_logger.log_entry("System", f"Error executing {command_to_run}: {e}")
 
 # --- Command Implementations ---
 def create_directory_command(path_str: str):
