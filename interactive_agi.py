@@ -122,13 +122,17 @@ from rich.table import Table # For /ls command and sysinfo
 from datetime import datetime # For history timestamps
 import json # For saving/loading history
 import platform # Already used, but good to note for sysinfo
+import urllib.parse # For encoding search queries
+import shutil # For file operations like rm (recursive), cp, mv
+
 try:
     import psutil
     PSUTIL_AVAILABLE = True
 except ImportError:
     PSUTIL_AVAILABLE = False
-    console.print("WARNING: `psutil` library not found. Detailed system info in /sysinfo will be limited.", style="warning")
-    console.print("Install with: pip install psutil", style="info")
+    # console.print("WARNING: `psutil` library not found. Detailed system info in /sysinfo will be limited.", style="warning")
+    # console.print("Install with: pip install psutil", style="info")
+    # Quieten this for now as it's printed by setup script if needed.
 
 
 # --- Configuration & Globals ---
@@ -140,6 +144,96 @@ context_analyzer = ContextAnalyzer()
 
 # Global conversation history
 conversation_history = deque(maxlen=HISTORY_MAX_LEN)
+
+# --- Desktop Path for Session Logs ---
+def get_desktop_path() -> Path:
+    """Determines the user's desktop path."""
+    home = Path.home()
+    # Common desktop paths; order can matter if multiple exist (e.g. via symlinks)
+    desktop_paths = [
+        home / "Desktop",
+        home / "Pulpit",  # Polish
+        home / "Bureau",  # French
+        home / "Schreibtisch",  # German
+        home / "Escritorio",  # Spanish
+        home / "Scrivania" # Italian
+    ]
+
+    # For Linux, also check XDG user dirs
+    if platform.system() == "Linux":
+        try:
+            xdg_desktop_dir_bytes = subprocess.check_output(
+                ["xdg-user-dir", "DESKTOP"], text=False, stderr=subprocess.DEVNULL
+            )
+            xdg_desktop_dir_str = xdg_desktop_dir_bytes.decode("utf-8").strip()
+            if xdg_desktop_dir_str: # Ensure it's not empty
+                desktop_paths.insert(0, Path(xdg_desktop_dir_str)) # Prioritize XDG
+        except (FileNotFoundError, subprocess.CalledProcessError, UnicodeDecodeError):
+            pass # xdg-user-dir might not be available or configured
+
+    # For Windows
+    if platform.system() == "Windows":
+        # USERPROFILE should point to C:\Users\<username>
+        # Desktop is usually directly under this.
+        user_profile = os.environ.get("USERPROFILE")
+        if user_profile:
+            desktop_paths.insert(0, Path(user_profile) / "Desktop") # Prioritize
+
+    for path in desktop_paths:
+        if path.is_dir():
+            return path
+
+    # Fallback if no standard desktop path is found
+    fallback_path = Path("./agi_desktop_logs")
+    console.print(f"WARNING: Could not determine standard Desktop path. Logging session to: {fallback_path.resolve()}", style="warning")
+    fallback_path.mkdir(parents=True, exist_ok=True)
+    return fallback_path
+
+class SessionLogger:
+    def __init__(self, log_directory: Path):
+        self.log_file = None
+        if not log_directory.exists():
+            try:
+                log_directory.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                console.print(f"Error creating log directory {log_directory}: {e}", style="error")
+                # If log dir creation fails, don't attempt to log.
+                return
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.log_file = log_directory / f"AGI_Terminal_Log_{timestamp}.txt"
+        try:
+            # Touch the file to ensure it's creatable early
+            with open(self.log_file, 'a', encoding='utf-8') as f:
+                f.write(f"--- AGI Terminal Session Log ---\n")
+                f.write(f"Session started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write("------------------------------------\n\n")
+            console.print(f"INFO: Logging this session to: {self.log_file.resolve()}", style="info")
+        except Exception as e:
+            console.print(f"Error creating session log file {self.log_file}: {e}", style="error")
+            self.log_file = None # Disable logging if file can't be created
+
+    def log_entry(self, role: str, content: str):
+        if not self.log_file:
+            return # Logging disabled
+
+        try:
+            with open(self.log_file, 'a', encoding='utf-8') as f:
+                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                # Clean up potential rich formatting for plain text log
+                plain_content = re.sub(r'\[/?\w+\]', '', content) # Basic removal of [style] tags
+                f.write(f"[{timestamp}] {role.upper()}: {plain_content}\n\n")
+        except Exception as e:
+            # Don't crash the app if logging fails, just print a warning once.
+            if hasattr(self, "_log_error_printed") and self._log_error_printed:
+                pass
+            else:
+                console.print(f"Error writing to session log {self.log_file}: {e}", style="warning")
+                self._log_error_printed = True # Print only once
+
+# Global session logger instance (will be initialized in main)
+session_logger = None
+
 
 # Attempt to import PyTorch and Transformers
 try:
@@ -453,6 +547,10 @@ def detect_code_blocks(text: str) -> list:
     return parts
 
 def main():
+    global session_logger # Allow modification of the global instance
+    desktop_path = get_desktop_path()
+    session_logger = SessionLogger(desktop_path)
+
     display_startup_banner()
     console.print("Initializing AGI System (Interactive Mode)...", style="info")
 
@@ -507,6 +605,8 @@ def main():
 
             # Add user input to history before processing
             conversation_history.append({"role": "user", "content": user_input, "timestamp": datetime.now().isoformat()})
+            if session_logger:
+                session_logger.log_entry("User", user_input)
 
             if user_input.lower().startswith("/set parameter "):
                 parts = user_input.strip().split(maxsplit=3)
@@ -514,6 +614,7 @@ def main():
                     _, _, param_name, param_value = parts
                     response = agi_interface.set_parameter(param_name, param_value)
                     console.print(f"AGI System: {response}")
+                    # No specific logging for system responses to desktop log, but they are in internal history.
                 else:
                     console.print("AGI System: [red]Invalid command.[/red] Usage: /set parameter <NAME> <VALUE>")
             elif user_input.lower() == "/show parameters":
@@ -538,11 +639,46 @@ def main():
                 display_conversation_history()
             elif user_input.lower() == "/sysinfo":
                 display_system_info()
+            elif user_input.lower().startswith("/search "):
+                query = user_input[len("/search "):].strip()
+                if query:
+                    perform_internet_search(query)
+                else:
+                    console.print("[red]Usage: /search <your query>[/red]")
+            elif user_input.lower().startswith("/mkdir "):
+                path_to_create = user_input[len("/mkdir "):].strip()
+                if path_to_create:
+                    create_directory_command(path_to_create)
+                else:
+                    console.print("[red]Usage: /mkdir <directory_name>[/red]")
+            elif user_input.lower().startswith("/rm "):
+                path_to_remove = user_input[len("/rm "):].strip()
+                if path_to_remove:
+                    remove_path_command(path_to_remove)
+                else:
+                    console.print("[red]Usage: /rm <file_or_directory_path>[/red]")
+            elif user_input.lower().startswith("/cp "):
+                parts = user_input.strip().split()
+                if len(parts) == 3:
+                    source, destination = parts[1], parts[2]
+                    copy_path_command(source, destination)
+                else:
+                    console.print("[red]Usage: /cp <source> <destination>[/red]")
+            elif user_input.lower().startswith("/mv "):
+                parts = user_input.strip().split()
+                if len(parts) == 3:
+                    source, destination = parts[1], parts[2]
+                    move_path_command(source, destination)
+                else:
+                    console.print("[red]Usage: /mv <source> <destination>[/red]")
             else:
                 with console.status("[yellow]AGI is thinking...[/yellow]", spinner="dots"):
                     agi_response_text = agi_interface.generate_response(user_input)
 
                 conversation_history.append({"role": "assistant", "content": agi_response_text, "timestamp": datetime.now().isoformat()})
+                if session_logger:
+                    session_logger.log_entry("AGI", agi_response_text)
+
                 response_parts = detect_code_blocks(agi_response_text)
 
                 console.print(f"[agiprompt]AGI Output:[/agiprompt]")
@@ -571,6 +707,134 @@ def main():
 
 
 # --- Command Implementations ---
+def create_directory_command(path_str: str):
+    try:
+        target_path = Path(path_str)
+        # Use exist_ok=False to mimic standard mkdir behavior (error if exists)
+        # For interactive use, often exist_ok=True is friendlier if re-running.
+        # Let's stick to erroring if it exists for now, can be changed based on UX preference.
+        target_path.mkdir(parents=True, exist_ok=False)
+        console.print(f"Directory created: [green]{target_path.resolve()}[/green]")
+    except FileExistsError:
+        console.print(f"[yellow]Directory already exists: {Path(path_str).resolve()}[/yellow]")
+    except PermissionError:
+        console.print(f"[red]Error: Permission denied to create directory: {path_str}[/red]")
+    except Exception as e:
+        console.print(f"[red]Error creating directory '{path_str}': {type(e).__name__} - {e}[/red]")
+
+def remove_path_command(path_str: str):
+    target_path = Path(path_str).resolve() # Resolve first to show absolute path in prompt
+    if not target_path.exists():
+        console.print(f"[red]Error: Path does not exist: {target_path}[/red]")
+        return
+
+    confirm_prompt = f"Are you sure you want to remove '{target_path}'?"
+    if target_path.is_dir():
+        confirm_prompt += " [bold red](This is a directory and will be removed recursively!)[/bold red]"
+
+    try:
+        if RICH_AVAILABLE:
+            from rich.prompt import Confirm
+            if not Confirm.ask(confirm_prompt, default=False, console=console):
+                console.print("Removal cancelled.", style="yellow")
+                return
+        else: # Fallback for basic confirmation
+            if input(f"{confirm_prompt} (yes/NO): ").lower() != "yes":
+                console.print("Removal cancelled.", style="yellow")
+                return
+
+        if target_path.is_file() or target_path.is_symlink():
+            target_path.unlink()
+            console.print(f"File removed: [green]{target_path}[/green]")
+        elif target_path.is_dir():
+            shutil.rmtree(target_path)
+            console.print(f"Directory removed recursively: [green]{target_path}[/green]")
+        else:
+            # This case should be rare if .exists() was true
+            console.print(f"[red]Error: Path is not a file or directory: {target_path}[/red]")
+
+    except PermissionError:
+        console.print(f"[red]Error: Permission denied to remove: {path_str}[/red]")
+    except Exception as e:
+        console.print(f"[red]Error removing '{path_str}': {type(e).__name__} - {e}[/red]")
+
+def copy_path_command(source_str: str, destination_str: str):
+    source_path = Path(source_str).resolve()
+    # For destination, don't resolve yet, as it might be a new filename in an existing dir
+    destination_path = Path(destination_str)
+
+
+    if not source_path.exists():
+        console.print(f"[red]Error: Source path does not exist: {source_path}[/red]")
+        return
+
+    try:
+        # Ensure destination parent directory exists if destination is a full path
+        if not destination_path.parent.exists() and not destination_path.is_dir() : # if dest is like /a/b/newfile.txt, parent must exist
+             # Check if it's a directory path being specified or a file in a non-existent dir.
+             # If the destination_str ends with / or \ or if source is a dir, assume dest is a dir.
+            if str(destination_str).endswith(os.sep) or source_path.is_dir():
+                destination_path.mkdir(parents=True, exist_ok=True) # Create dest dir if it's explicitly a dir path
+            # else: it's a file path, parent must exist. shutil.copy2 will fail if parent dir doesn't exist for a file.
+            # This logic can be complex if destination_path itself is intended to be a new directory name.
+            # For simplicity, shutil.copytree handles dest dir creation. For files, parent must exist.
+
+        if source_path.is_file():
+            shutil.copy2(source_path, destination_path)
+            console.print(f"File copied from [cyan]{source_path}[/cyan] to [cyan]{destination_path.resolve()}[/cyan]", style="success")
+        elif source_path.is_dir():
+            # For copytree, if destination_path is an existing directory, files are copied inside it.
+            # If it does not exist, it will be created.
+            shutil.copytree(source_path, destination_path, dirs_exist_ok=True)
+            console.print(f"Directory copied from [cyan]{source_path}[/cyan] to [cyan]{destination_path.resolve()}[/cyan]", style="success")
+        else:
+            console.print(f"[red]Error: Source path is not a file or directory: {source_path}[/red]")
+    except FileNotFoundError: # e.g. destination parent directory doesn't exist for a file copy
+        console.print(f"[red]Error: File not found or destination path invalid. Ensure destination directory exists if copying a file. {destination_str}[/red]")
+    except PermissionError:
+        console.print(f"[red]Error: Permission denied during copy operation.[/red]")
+    except shutil.SameFileError:
+        console.print(f"[yellow]Warning: Source and destination are the same file: {source_path}[/yellow]")
+    except Exception as e:
+        console.print(f"[red]Error copying '{source_str}' to '{destination_str}': {type(e).__name__} - {e}[/red]")
+
+def move_path_command(source_str: str, destination_str: str):
+    source_path = Path(source_str).resolve()
+    # Destination path for move can be a directory or a new name.
+    destination_path_obj = Path(destination_str)
+
+
+    if not source_path.exists():
+        console.print(f"[red]Error: Source path does not exist: {source_path}[/red]")
+        return
+
+    try:
+        # If destination is an existing directory, move source inside it.
+        # Otherwise, move/rename source to destination_str.
+        # shutil.move handles this logic.
+        final_dest_path_str = str(destination_path_obj.resolve() if destination_path_obj.is_dir() else destination_path_obj)
+
+        shutil.move(str(source_path), destination_str) # shutil.move prefers strings for src and dst
+
+        # Try to resolve the final path of the moved item for the message
+        # This can be tricky if destination_str was a directory
+        final_resolved_dest = Path(destination_str)
+        if final_resolved_dest.is_dir() and not Path(destination_str, source_path.name).exists(): # If dest was a dir, and source was moved into it
+             final_resolved_dest = Path(destination_str, source_path.name) # Construct the full path
+        elif not final_resolved_dest.exists() and Path(destination_str).parent.joinpath(source_path.name).exists(): # Renamed in same dir
+             final_resolved_dest = Path(destination_str).parent.joinpath(source_path.name)
+        elif Path(destination_str).exists():
+             final_resolved_dest = Path(destination_str)
+
+
+        console.print(f"Moved [cyan]{source_path}[/cyan] to [cyan]{final_resolved_dest.resolve()}[/cyan]", style="success")
+    except PermissionError:
+        console.print(f"[red]Error: Permission denied during move operation.[/red]")
+    except shutil.Error as e: # Catches things like "Destination path '...' already exists" if it's a file and not a dir
+        console.print(f"[red]Error moving '{source_str}' to '{destination_str}': {e}[/red]")
+    except Exception as e:
+        console.print(f"[red]Unexpected error moving '{source_str}' to '{destination_str}': {type(e).__name__} - {e}[/red]")
+
 def list_directory_contents(path_str: str):
     try:
         target_path = Path(path_str).resolve()
@@ -721,3 +985,153 @@ if __name__ == "__main__":
     finally:
         save_history() # Save history on exit (graceful or via interrupt)
         console.print("AGI session terminated. History saved.", style="info") # Overwrites the one in main()
+
+# --- Internet Search Implementation ---
+def parse_duckduckgo_html_results(html_content: str, num_results: int = 5) -> list[dict]:
+    """
+    Parses DuckDuckGo HTML results to extract titles, snippets, and URLs.
+    This is specific to DDG's HTML version and might break if their structure changes.
+    """
+    results = []
+    # Regex to find result blocks. DDG HTML uses <div class="result"> or similar,
+    # but class names can change. We'll look for common patterns.
+    # A result typically has a link with class result__a, a snippet with result__snippet.
+    # This is a simplified parser focusing on common structures.
+
+    # Pattern for each result block (very approximate and fragile)
+    # Looks for <a class="result__a" href="<url>">title</a> ... <a class="result__snippet">snippet</a>
+    # The actual classes are often "result__a", "result__snippet", and title is within the <a> tag.
+    # The URL in href usually needs to be de-proxied from duckduckgo.
+
+    # Simplified regex focusing on common patterns seen in DDG HTML results
+    # This will need refinement and testing.
+    # Each result block is roughly: <h2 class="result__title">...<a href="URL">TITLE</a>...</h2>...<a class="result__snippet" href="URL">SNIPPET</a>
+    # Or variations like: <div class="result"> <a class="result__a" href="...">TITLE</a> <div class="result__snippet">SNIPPET</div> </div>
+
+    # Let's try to find result blocks and then extract parts.
+    # This regex attempts to find a block starting with a result link and containing a snippet.
+    # It is very basic and might need significant refinement.
+    # For stability, a proper HTML parsing library (like BeautifulSoup) would be much better,
+    # but per instructions, trying with regex/string methods first.
+
+    # Regex to capture link, title, and snippet for each result
+    # This pattern assumes a structure like:
+    # <a class="result__a" href="<url>"> <text_title> </a> ... <a class="result__snippet" ...> <text_snippet> </a>
+    # It's simplified and might need to be more robust.
+
+    # A common pattern for DDG HTML results:
+    # <div class="web-result">
+    #   <div class="result__header">
+    #     <a class="result__a" href="<actual_url_after_ddg_redirect_parsing>">TITLE</a>
+    #   </div>
+    #   <div class="result__body">
+    #     <a class="result__snippet" href="...">SNIPPET</a>
+    #   </div>
+    # </div>
+    # The URL in result__a needs de-proxying. Example: /l/?kh=-1&amp;uddg=DECODED_URL
+
+    # More robust: find result blocks first, then parse within them
+    result_blocks = re.findall(r'(<div class="web-result".*?</div>\s*</div>)', html_content, re.DOTALL)
+    if not result_blocks: # Fallback to an older possible structure
+        result_blocks = re.findall(r'(<div class="result".*?</div>\s*</div>)', html_content, re.DOTALL)
+
+
+    for block in result_blocks:
+        if len(results) >= num_results:
+            break
+
+        title_match = re.search(r'<a class="result__a"[^>]*>(.*?)</a>', block, re.DOTALL)
+        url_match = re.search(r'<a class="result__a"[^>]*href="([^"]*)"', block, re.DOTALL)
+        snippet_match = re.search(r'<a class="result__snippet"[^>]*>(.*?)</a>', block, re.DOTALL)
+        if not snippet_match: # Try another common snippet class
+             snippet_match = re.search(r'<div class="result__snippet"[^>]*>(.*?)</div>', block, re.DOTALL)
+
+
+        if title_match and url_match and snippet_match:
+            raw_url = url_match.group(1)
+            # Decode DDG's URL
+            parsed_url_params = urllib.parse.parse_qs(urllib.parse.urlsplit(raw_url).query)
+            actual_url = parsed_url_params.get('uddg', [raw_url])[0] # Get 'uddg' param if exists
+
+            title = re.sub('<[^<]+?>', '', title_match.group(1)).strip() # Remove HTML tags
+            snippet = re.sub('<[^<]+?>', '', snippet_match.group(1)).strip() # Remove HTML tags
+
+            results.append({'title': title, 'snippet': snippet, 'url': actual_url})
+
+    if not results and len(html_content) > 500 : # If main regex failed, try a very broad one as a last resort
+        # This is a very greedy and less accurate fallback.
+        # Looks for any link with some text after it.
+        console.print("[dim]Main search parser failed, trying broad fallback...", style="warning")
+        fallback_matches = re.findall(r'<a href="(http[^"]+)">(.*?)</a>.*?<p>(.*?)</p>', html_content, re.DOTALL | re.IGNORECASE)
+        for url, title, snippet in fallback_matches:
+            if len(results) >= num_results:
+                break
+            title = re.sub('<[^<]+?>', '', title).strip()
+            snippet = re.sub('<[^<]+?>', '', snippet).strip()
+            if len(title) > 10 and len(snippet) > 20 : # Basic quality check
+                 results.append({'title': title, 'snippet': snippet, 'url': url})
+
+
+    return results[:num_results]
+
+
+def perform_internet_search(query: str):
+    """Performs an internet search using DuckDuckGo HTML version and displays results."""
+    console.print(f"Searching the web for: \"{query}\"...", style="info")
+
+    encoded_query = urllib.parse.quote_plus(query)
+    search_url = f"https://html.duckduckgo.com/html/?q={encoded_query}"
+
+    # This is where the view_text_website tool would be called in a real agent environment
+    # For now, we'll simulate it or expect it to be available via a different mechanism
+    # if this script is run by an agent executor.
+    # Since Jules has `view_text_website`, let's assume it can be called.
+    # However, Jules' tools are not directly callable from the Python code it writes.
+    # This function needs to be structured so Jules can call its tool.
+
+    # To make this testable if run directly (and for Jules to adapt):
+    # We can use requests here for direct execution, but Jules would replace this part.
+    html_content = ""
+    try:
+        # This block is for direct execution / testing.
+        # Jules would replace this with its `view_text_website` tool call.
+        import requests
+        headers = { # Mimic a common browser to avoid simple blocks
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        }
+        response = requests.get(search_url, headers=headers, timeout=10)
+        response.raise_for_status() # Raise an exception for bad status codes
+        html_content = response.text
+        console.print(f"Successfully fetched search results page (length: {len(html_content)} chars).", style="dim success")
+    except ImportError:
+        console.print("[bold red]Error:[/bold red] The 'requests' library is needed for direct search test. Jules would use its internal tools.", style="error")
+        console.print("Please run `pip install requests` if you want to test this search directly.", style="info")
+        return
+    except requests.exceptions.RequestException as e:
+        console.print(f"[bold red]Error fetching search results:[/bold red] {e}", style="error")
+        return
+    except Exception as e: # Catch any other unexpected error
+        console.print(f"[bold red]An unexpected error occurred during web fetch:[/bold red] {e}", style="error")
+        return
+
+    if not html_content:
+        console.print("No content received from search page.", style="warning")
+        return
+
+    parsed_results = parse_duckduckgo_html_results(html_content)
+
+    if not parsed_results:
+        console.print("Could not parse any search results. The page structure might have changed or no results found.", style="warning")
+        # console.print(f"[dim]Raw HTML snippet for debugging (first 1000 chars):\n{html_content[:1000]}[/dim]") # For debugging
+        return
+
+    console.print(f"\n[bold green]Search Results for \"{query}\":[/bold green]")
+    for i, res in enumerate(parsed_results):
+        panel_content = Text()
+        panel_content.append(f"{i+1}. {res['title']}\n", style="bold link " + str(res['url'])) # Make URL clickable if terminal supports
+        panel_content.append(f"   {res['snippet']}\n", style="italic")
+        panel_content.append(f"   Source: {res['url']}", style="dim")
+        console.print(Panel(panel_content, expand=False, border_style="blue"))
+
+# --- Command Implementations ---
+def list_directory_contents(path_str: str):
