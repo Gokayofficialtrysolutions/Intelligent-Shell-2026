@@ -16,7 +16,8 @@ REQUIRED_PYTHON_PACKAGES = [
     "peft",
     "bitsandbytes", # May have OS-specific build issues if not from wheel
     "sentencepiece",
-    "scipy"
+    "scipy",
+    "rich"
 ]
 
 # --- Utility Functions ---

@@ -67,6 +67,9 @@ The automated setup handles the initial phases. Here's an overview of the compon
 **Phase 2: Activating the Merged Model (AI Task, post-setup)**
 1.  ***`interactive_agi.py` for Actual Model Loading***:
     *   The `interactive_agi.py` script is designed to load the tokenizer and model from `./merged_model`.
+    *   It now features an improved user interface using the `rich` library for styled output, including syntax highlighting for code.
+    *   Context awareness is enhanced: information about the current working directory, Git status, and common file types is passed to the model.
+    *   Prompt engineering techniques are used to guide the model based on the inferred task type from the user's query.
     *   Error handling for model loading will be implemented.
     *   Basic inference capabilities will be added to generate responses.
     *   Device placement (`.to('cuda')` if GPU available, else CPU) will be handled.
@@ -191,6 +194,16 @@ After you have interacted with `interactive_agi.py` for some time, logs will acc
         python interactive_agi.py
         ```
     *   Interact with the AGI. Your interactions will be logged to `./interaction_logs/`.
+    *   The terminal now supports several commands for better interaction:
+        *   `/set parameter <NAME> <VALUE>`: Adjust model generation parameters (e.g., `MAX_TOKENS`, `TEMPERATURE`).
+        *   `/show parameters`: Display current generation parameters.
+        *   `/ls [path]`: List contents of the specified directory (default: current).
+        *   `/cwd`: Show the current working directory.
+        *   `/cd <path>`: Change the current working directory.
+        *   `/clear`: Clear the terminal screen.
+        *   `/history`: Display recent conversation history.
+        *   `/sysinfo`: Show basic system information.
+        *   `exit` or `quit`: Terminate the AGI session.
 
 3.  **Fine-tune the Model (Optional but Recommended)**:
     *   After accumulating interaction logs, you can fine-tune the model using `adaptive_train.py`.
