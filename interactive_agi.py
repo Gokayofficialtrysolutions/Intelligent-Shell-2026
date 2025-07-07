@@ -192,6 +192,26 @@ class ContextAnalyzer:
 
         return snippets
 
+    def get_full_context_dict(self) -> dict:
+        """Returns the context information as a dictionary."""
+        cwd = self.get_cwd_context()
+        git_info = self.get_git_context()
+        file_counts = self.get_file_type_counts()
+
+        context_dict = {
+            "cwd": cwd,
+            "git_info": git_info, # This is already a dict
+            "file_type_counts": file_counts, # This is already a dict
+            "key_file_snippets": self.get_key_file_snippets() # This is a list of strings
+        }
+
+        # Add project root if available and different from CWD
+        resolved_cwd = Path(cwd).resolve()
+        if PROJECT_ROOT_PATH and PROJECT_ROOT_PATH != resolved_cwd:
+            context_dict["project_root"] = str(PROJECT_ROOT_PATH)
+
+        return context_dict
+
 from collections import deque # For conversation history
 from rich.table import Table # For /ls command
 from datetime import datetime # For history timestamps
@@ -248,6 +268,7 @@ DEFAULT_CONFIG = {
     "logging": {
         "desktop_logging_enabled": True,
         "desktop_log_path_override": "", # Empty means use default desktop path
+        "jsonl_logging_enabled": True, # New setting for JSONL interaction logs
     }
 }
 APP_CONFIG = {} # Will be loaded from file or defaults
@@ -359,6 +380,24 @@ class SessionLogger:
 
 # Global session logger instance (will be initialized in main)
 session_logger = None
+
+# --- JSONL Interaction Logging ---
+JSONL_LOG_FILE_PATH = CACHE_DIR / "interaction_logs.jsonl"
+JSONL_LOGGING_ENABLED = True # Will be updated from config
+SESSION_ID = "" # Will be set at startup
+TURN_ID_COUNTER = 0
+
+def log_interaction_to_jsonl(interaction_data: dict):
+    if not JSONL_LOGGING_ENABLED:
+        return
+    try:
+        JSONL_LOG_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(JSONL_LOG_FILE_PATH, 'a', encoding='utf-8') as f:
+            json.dump(interaction_data, f)
+            f.write('\n')
+    except Exception as e:
+        console.print(f"[warning]Failed to write to JSONL interaction log: {e}[/warning]")
+
 
 # --- Project Root Detection ---
 PROJECT_ROOT_PATH: Optional[Path] = None
@@ -803,7 +842,10 @@ def detect_code_blocks(text: str) -> list:
     return parts
 
 def main():
-    global session_logger, APP_CONFIG, conversation_history, DEFAULT_GENERATION_PARAMS, PROJECT_ROOT_PATH
+    global session_logger, APP_CONFIG, conversation_history, DEFAULT_GENERATION_PARAMS, PROJECT_ROOT_PATH, SESSION_ID, JSONL_LOGGING_ENABLED
+
+    # --- Initialize Session ID ---
+    SESSION_ID = datetime.now().strftime("%Y%m%d_%H%M%S_") + Path(sys.argv[0]).stem # e.g., 20231027_103000_interactive_agi
 
     # --- Initialize Project Root ---
     # Done early as other parts might use it (e.g. config loading from project root in future)
@@ -857,10 +899,20 @@ def main():
     console.print("Press Ctrl+C for forceful interruption.")
     console.print("-" * console.width)
 
+    global TURN_ID_COUNTER
     try:
         while True:
+            TURN_ID_COUNTER += 1
+            current_turn_interaction_data = {
+                "session_id": SESSION_ID,
+                "turn_id": TURN_ID_COUNTER,
+                "timestamp_user_query": datetime.now().isoformat(),
+                "tool_interactions": [], # Initialize as empty list
+            }
+
             try:
                 user_input = console.input("[prompt]You: [/prompt]")
+                current_turn_interaction_data["user_query"] = user_input
             except EOFError:
                 console.print("\nExiting (EOF detected)...", style="info")
                 break
@@ -999,14 +1051,37 @@ def main():
                     console.print("[info]Available git commands: status, diff [file], log [-n count][/info]")
             elif user_input.lower() == "/help":
                 display_help_command()
+                # For /help and other user commands that don't involve AGI, we might log them differently or skip full AGI log
+                # For now, let's assume they might have a minimal log entry or are handled outside the main AGI interaction logging path
+                # For simplicity in this step, we'll focus on interactions that go to the AGI.
+                # So, if a command is handled here, it bypasses the main AGI JSONL logging for the turn.
+                # This could be refined later if needed. A simple log_interaction_to_jsonl call could be made here too.
             else: # Default: AGI generates a response or suggests a command
-                with console.status("[yellow]AGI is thinking...[/yellow]", spinner="dots"):
-                    agi_response_text = agi_interface.generate_response(user_input)
+                # Capture context before AGI call
+                current_turn_interaction_data["context_at_query_time"] = context_analyzer.get_full_context_dict()
+                current_turn_interaction_data["agi_initial_processing_details"] = {
+                    "generation_params_used": agi_interface.generation_params.copy(), # Log a copy
+                    "detected_task_type": agi_interface.last_detected_task_type # This is updated before generation
+                }
 
-                action_taken_by_tool_framework = False
+                with console.status("[yellow]AGI is thinking...[/yellow]", spinner="dots"):
+                    # Note: generate_response uses context_analyzer internally, so context is applied there.
+                    # The user_input here is the raw one.
+                    agi_initial_raw_response = agi_interface.generate_response(user_input)
+
+                current_turn_interaction_data["agi_initial_raw_response"] = agi_initial_raw_response
+                agi_response_text = agi_initial_raw_response # This might be overwritten if a tool is used and re-prompts AGI
+
+                action_taken_by_tool_framework = False # True if a tool action is successfully initiated
+                                                       # False if it's a direct answer or tool fails before execution.
+
+                # This variable will hold the final text displayed to the user for this turn.
+                # It starts as the AGI's initial response, but can be updated by tool processing outcomes.
+                final_text_for_user_display = agi_initial_raw_response
+
                 try:
                     # Attempt to parse for tool use first
-                    json_match = re.search(r"```json\n(.*?)\n```", agi_response_text, re.DOTALL)
+                    json_match = re.search(r"```json\n(.*?)\n```", agi_initial_raw_response, re.DOTALL)
                     json_str_to_parse = json_match.group(1) if json_match else agi_response_text
 
                     first_brace = json_str_to_parse.find('{')
@@ -1037,21 +1112,61 @@ def main():
                             else:
                                 confirmed = input(f"Execute: {command_to_display}? (yes/NO): ").lower() == "yes"
 
+                            tool_interaction_log_entry = {
+                                "tool_request_timestamp": datetime.now().isoformat(), # Approx time of request processing
+                                "action_type": "run_shell",
+                                "action_details": {"command": command_executable, "args": command_args_list},
+                                "reasoning": reasoning,
+                                "user_confirmation": "confirmed" if confirmed else "cancelled"
+                            }
+
                             if confirmed:
+                                # Note: execute_shell_command prints output directly. For logging, we'd ideally capture it.
+                                # For now, the log will just note execution. A more advanced setup might return output.
                                 execute_shell_command(command_executable, command_args_list)
+                                tool_interaction_log_entry["tool_outcome_summary"] = f"Command '{command_to_display}' executed by user."
+                                # Since shell output is directly displayed and not fed back to AGI for this tool,
+                                # there's no distinct "context_for_next_agi_step" or "agi_secondary_raw_response" here.
+                                # The AGI's initial response (the tool request) is its only contribution this turn for this path.
+                                final_text_for_user_display = f"System: Executed command '{command_to_display}' as per AGI suggestion." # Or silent
                             else:
                                 console.print("Command execution cancelled by user.", style="yellow")
                                 if session_logger: session_logger.log_entry("System", f"Cancelled execution of: {command_to_display}")
-                            action_taken_by_tool_framework = True
+                                tool_interaction_log_entry["tool_outcome_summary"] = f"Command '{command_to_display}' execution cancelled by user."
+                                final_text_for_user_display = "System: Command execution cancelled."
+
+                            tool_interaction_log_entry["tool_outcome_timestamp"] = datetime.now().isoformat()
+                            current_turn_interaction_data["tool_interactions"].append(tool_interaction_log_entry)
+                            action_taken_by_tool_framework = True # Mark that a tool path was taken
+
                         elif command_executable: # Command suggested but not whitelisted
                             command_to_display = f"{command_executable} {' '.join(command_args_list)}"
                             console.print(f"[warning]AGI suggested a non-whitelisted command: '{command_to_display}'. Execution denied for safety.[/warning]")
                             if session_logger: session_logger.log_entry("AGI_Suggestion (Denied)", f"Command: {command_to_display}, Reason: {reasoning}")
-                            action_taken_by_tool_framework = False
+
+                            current_turn_interaction_data["tool_interactions"].append({
+                                "tool_request_timestamp": datetime.now().isoformat(),
+                                "action_type": "run_shell",
+                                "action_details": {"command": command_executable, "args": command_args_list},
+                                "reasoning": reasoning,
+                                "user_confirmation": "denied_by_system_whitelist",
+                                "tool_outcome_timestamp": datetime.now().isoformat(),
+                                "tool_outcome_summary": "Command execution denied by system (not whitelisted)."
+                            })
+                            action_taken_by_tool_framework = False # Let the error message display
                             agi_response_text = f"The AGI suggested a command that is not on the whitelist: '{command_to_display}'. Reasoning: {reasoning} (Displaying as text instead)."
                         else: # No command_executable provided
                             console.print(f"[warning]AGI suggestion for 'run_shell' did not include a 'command'. Payload: {data}[/warning]")
-                            action_taken_by_tool_framework = False
+                            current_turn_interaction_data["tool_interactions"].append({
+                                "tool_request_timestamp": datetime.now().isoformat(),
+                                "action_type": "run_shell",
+                                "action_details": data, # Log the malformed data
+                                "reasoning": reasoning,
+                                "user_confirmation": "n/a_malformed_request",
+                                "tool_outcome_timestamp": datetime.now().isoformat(),
+                                "tool_outcome_summary": "Malformed request: missing 'command'."
+                            })
+                            action_taken_by_tool_framework = False # Let the error message display
                             agi_response_text = f"AGI's suggested command was malformed (missing command). Reasoning: {reasoning}"
 
                     elif isinstance(data, dict) and data.get("action") == "read_file":
@@ -1130,33 +1245,47 @@ def main():
                             # Prepare message for AGI based on write outcome
                             if write_error:
                                 outcome_summary = f"An attempt to write the file '{filepath_str}' failed. Error: {write_error}"
+                                tool_outcome_for_log = f"Error: {write_error}"
                             else: # write_message contains success or cancellation message
                                 outcome_summary = f"File write operation for '{filepath_str}': {write_message}"
+                                tool_outcome_for_log = write_message # Success or cancellation message
+
+                            tool_interaction_log_entry = {
+                                "tool_request_timestamp": tool_request_start_time,
+                                "action_type": "write_file",
+                                "action_details": {"filepath": filepath_str, "content_length": len(content_to_write)}, # Not logging full content here
+                                "reasoning": reasoning,
+                                "user_confirmation": "confirmed" if "successfully" in tool_outcome_for_log else ("cancelled" if "cancelled" in tool_outcome_for_log else "n/a"), # Infer from message
+                                "tool_outcome_timestamp": datetime.now().isoformat(),
+                                "tool_outcome_summary": tool_outcome_for_log
+                            }
 
                             # Re-prompt AGI with the outcome
-                            subsequent_prompt = (
+                            subsequent_prompt_for_agi = (
                                 f"{context_analyzer.get_full_context_string()}\n\n"
                                 f"Outcome of your 'write_file' request for '{filepath_str}':\n{outcome_summary}\n\n"
                                 f"Original User Query that may have led to this write request: \"{user_input}\"\n\n"
                                 "Based on this outcome, please formulate your response to the user or decide on the next step."
                             )
+                            tool_interaction_log_entry["context_for_next_agi_step"] = subsequent_prompt_for_agi # Log the prompt
+
                             console.print(f"[info]File write attempt for '{filepath_str}' processed. Outcome: {outcome_summary}. Re-prompting AGI...[/info]")
                             with console.status("[yellow]AGI is processing file write outcome...[/yellow]", spinner="dots"):
-                                agi_response_text = agi_interface.generate_response(subsequent_prompt)
+                                agi_secondary_raw_response = agi_interface.generate_response(subsequent_prompt_for_agi)
 
-                            action_taken_by_tool_framework = False # Let the normal display path handle this final response.
+                            tool_interaction_log_entry["agi_secondary_raw_response"] = agi_secondary_raw_response
+                            final_text_for_user_display = agi_secondary_raw_response # This is now the final response
 
-                            # Log the AGI's initial request to write the file and the outcome
+                            current_turn_interaction_data["tool_interactions"].append(tool_interaction_log_entry)
+                            action_taken_by_tool_framework = True # A tool action sequence completed.
+
+                            # Log the AGI's initial request to write the file and the outcome to plain text log
                             if session_logger:
-                                session_logger.log_entry("AGI_Request_WriteFile", f"File: {filepath_str}, Reason: {reasoning}, Outcome: {outcome_summary}")
-                            conversation_history.append({
-                                "role": "assistant_tool_request",
-                                "content": f"Requested to write file: {filepath_str}. Reason: {reasoning}. Outcome: {outcome_summary}",
-                                "timestamp": datetime.now().isoformat()
-                            })
-                            # The final AGI response (after getting write outcome) will be logged by the generic handler below.
+                                session_logger.log_entry("AGI_Request_WriteFile", f"File: {filepath_str}, Reason: {reasoning}, Outcome: {tool_outcome_for_log}")
+                            # JSONL log is built in current_turn_interaction_data
 
                     elif isinstance(data, dict) and data.get("action") == "web_search":
+                        tool_request_start_time = datetime.now().isoformat()
                         search_query = data.get("query")
                         reasoning = data.get("reasoning", "No reasoning provided for web search.")
 
@@ -1205,64 +1334,89 @@ def main():
 
                 except json.JSONDecodeError:
                     # Not a JSON response for tool use, treat as normal chat
-                    action_taken_by_tool_framework = False
+                    action_taken_by_tool_framework = False # No tool action was completed or properly initiated
+                    # final_text_for_user_display remains agi_initial_raw_response
                 except Exception as e: # Catch-all for other errors during tool processing
                     console.print(f"[warning]Could not fully process AGI response for potential tool use: {type(e).__name__} - {e}[/warning]")
-                    action_taken_by_tool_framework = False
+                    action_taken_by_tool_framework = False # Tool processing failed
+                    # final_text_for_user_display remains agi_initial_raw_response or an error message assigned by tool block
 
-                # If no tool action was taken, or if a tool action resulted in a final text response from AGI (e.g. after file read), display it.
-                if not action_taken_by_tool_framework:
-                    conversation_history.append({"role": "assistant", "content": agi_response_text, "timestamp": datetime.now().isoformat()})
-                    if session_logger and getattr(session_logger, 'enabled', True): # Check if enabled
-                        session_logger.log_entry("AGI", agi_response_text)
+                # Display the final response to the user (either direct AGI response or AGI response after tool use)
+                # The variable `final_text_for_user_display` holds what needs to be shown.
+                # `action_taken_by_tool_framework` helps distinguish if a tool was involved in producing this final text.
+                # If a tool was successfully initiated AND it doesn't re-prompt (like run_shell when confirmed),
+                # final_text_for_user_display might be a system message.
+                # If a tool re-prompts AGI (read_file, write_file, web_search), final_text_for_user_display is AGI's secondary response.
+                # If no tool, it's AGI's initial response.
 
-                    response_parts = detect_code_blocks(agi_response_text)
+                # Log to conversation_history (internal deque)
+                # This should always be the text that was actually displayed or the final synthesis from AGI.
+                conversation_history.append({"role": "assistant", "content": final_text_for_user_display, "timestamp": datetime.now().isoformat()})
+                if session_logger and getattr(session_logger, 'enabled', True): # Check if enabled
+                    session_logger.log_entry("AGI", final_text_for_user_display) # Log final user-facing text
 
-                    # Determine panel style based on detected task type
-                    panel_title_text = "[agiprompt]AGI Output[/agiprompt]"
-                    panel_border_style_color = "blue" # Default
-                    task_type_for_style = agi_interface.last_detected_task_type
+                response_parts = detect_code_blocks(final_text_for_user_display)
 
-                    if task_type_for_style == "code_generation":
-                        panel_title_text = "[agiprompt]AGI Code Generation[/agiprompt]"
-                        panel_border_style_color = "green"
-                    elif task_type_for_style == "code_debugging":
-                        panel_title_text = "[agiprompt]AGI Code Debugging[/agiprompt]"
-                        panel_border_style_color = "yellow"
-                    elif task_type_for_style == "explanation" or task_type_for_style == "code_explanation":
-                        panel_title_text = "[agiprompt]AGI Explanation[/agiprompt]"
-                        panel_border_style_color = "cyan"
-                    elif task_type_for_style == "summarization":
-                        panel_title_text = "[agiprompt]AGI Summary[/agiprompt]"
-                        panel_border_style_color = "magenta"
-                    elif task_type_for_style == "git_query":
-                        panel_title_text = "[agiprompt]AGI Git Query Response[/agiprompt]"
-                        panel_border_style_color = "bright_black"
+                # Determine panel style based on detected task type from the *last* AGI interaction
+                # (could be initial or secondary if a tool was used)
+                panel_title_text = "[agiprompt]AGI Output[/agiprompt]"
+                panel_border_style_color = "blue" # Default
+                task_type_for_style = agi_interface.last_detected_task_type # This reflects the type for the *last* call to generate_response
 
-                    output_renderable = Text()
-                    for part_idx, part in enumerate(response_parts):
-                        if part["type"] == "text":
-                            output_renderable.append(part["content"])
-                        elif part["type"] == "code":
-                            # Add a newline before code block if previous part was text and didn't end with newline
-                            if part_idx > 0 and response_parts[part_idx-1]["type"] == "text" and not response_parts[part_idx-1]["content"].endswith("\n"):
-                                output_renderable.append("\n")
-                            current_theme = APP_CONFIG.get("display", {}).get("syntax_theme", "monokai")
-                            lang_for_syntax = part["lang"] if part["lang"] else "plaintext"
-                            try:
-                                code_syntax = Syntax(part["content"], lang_for_syntax, theme=current_theme, line_numbers=True, word_wrap=True)
-                                output_renderable.append(code_syntax)
-                            except Exception as e_rich_syntax:
-                                console.print(f"[dim warning]Rich Syntax Error for lang '{lang_for_syntax}': {e_rich_syntax}. Falling back to plaintext.[/dim warning]")
-                                code_syntax_fallback = Syntax(part["content"], "plaintext", theme=current_theme, line_numbers=True, word_wrap=True)
-                                output_renderable.append(code_syntax_fallback)
-                        if part_idx < len(response_parts) -1: # Add newline between parts if not last part
-                             output_renderable.append("\n")
+                if task_type_for_style == "code_generation":
+                    panel_title_text = "[agiprompt]AGI Code Generation[/agiprompt]"
+                    panel_border_style_color = "green"
+                # ... (other styling rules remain the same) ...
+                elif task_type_for_style == "code_debugging":
+                    panel_title_text = "[agiprompt]AGI Code Debugging[/agiprompt]"
+                    panel_border_style_color = "yellow"
+                elif task_type_for_style == "explanation" or task_type_for_style == "code_explanation":
+                    panel_title_text = "[agiprompt]AGI Explanation[/agiprompt]"
+                    panel_border_style_color = "cyan"
+                elif task_type_for_style == "summarization":
+                    panel_title_text = "[agiprompt]AGI Summary[/agiprompt]"
+                    panel_border_style_color = "magenta"
+                elif task_type_for_style == "git_query":
+                    panel_title_text = "[agiprompt]AGI Git Query Response[/agiprompt]"
+                    panel_border_style_color = "bright_black"
 
-                    console.print(Panel(output_renderable, title=panel_title_text, border_style=panel_border_style_color, expand=False))
+                output_renderable = Text()
+                contains_code_blocks_in_final_output = False
+                for part_idx, part in enumerate(response_parts):
+                    if part["type"] == "text":
+                        output_renderable.append(part["content"])
+                    elif part["type"] == "code":
+                        contains_code_blocks_in_final_output = True
+                        if part_idx > 0 and response_parts[part_idx-1]["type"] == "text" and not response_parts[part_idx-1]["content"].endswith("\n"):
+                            output_renderable.append("\n")
+                        current_theme = APP_CONFIG.get("display", {}).get("syntax_theme", "monokai")
+                        lang_for_syntax = part["lang"] if part["lang"] else "plaintext"
+                        try:
+                            code_syntax = Syntax(part["content"], lang_for_syntax, theme=current_theme, line_numbers=True, word_wrap=True)
+                            output_renderable.append(code_syntax)
+                        except Exception as e_rich_syntax:
+                            console.print(f"[dim warning]Rich Syntax Error for lang '{lang_for_syntax}': {e_rich_syntax}. Falling back to plaintext.[/dim warning]")
+                            code_syntax_fallback = Syntax(part["content"], "plaintext", theme=current_theme, line_numbers=True, word_wrap=True)
+                            output_renderable.append(code_syntax_fallback)
+                    if part_idx < len(response_parts) -1:
+                         output_renderable.append("\n")
+
+                console.print(Panel(output_renderable, title=panel_title_text, border_style=panel_border_style_color, expand=False))
+
+                current_turn_interaction_data["timestamp_final_response"] = datetime.now().isoformat()
+                current_turn_interaction_data["agi_final_response_to_user"] = final_text_for_user_display
+                current_turn_interaction_data["final_response_formatting_details"] = {
+                    "panel_title": panel_title_text, # Store the actual text used
+                    "panel_border_style": panel_border_style_color,
+                    "contains_code_blocks": contains_code_blocks_in_final_output
+                }
 
                 if agi_interface.is_model_loaded or isinstance(agi_interface, AGIPPlaceholder):
-                    call_training_script(user_input, agi_response_text)
+                    # Pass the final user-facing AGI text to training script
+                    call_training_script(user_input, final_text_for_user_display)
+
+                log_interaction_to_jsonl(current_turn_interaction_data)
+
 
             console.print("-" * console.width)
 
@@ -1742,6 +1896,37 @@ def load_config() -> dict:
     # The enabled flag can be set after initialization.
     # get_desktop_path() now reads APP_CONFIG, so it's fine.
     # session_logger.enabled is set after its init based on config.
+
+    global JSONL_LOGGING_ENABLED
+    JSONL_LOGGING_ENABLED = APP_CONFIG.get("logging", {}).get("jsonl_logging_enabled", True)
+    if JSONL_LOGGING_ENABLED:
+        console.print(f"INFO: JSONL interaction logging is ENABLED. Logs will be saved to: {JSONL_LOG_FILE_PATH}", style="info")
+    else:
+        console.print("INFO: JSONL interaction logging is DISABLED via config.", style="info")
+
+    # --- Ensure .gitignore for cache directory ---
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        gitignore_path = CACHE_DIR / ".gitignore"
+        ignore_entry = "interaction_logs.jsonl"
+        if gitignore_path.exists():
+            with open(gitignore_path, 'r+', encoding='utf-8') as f:
+                current_ignores = f.read().splitlines()
+                if ignore_entry not in current_ignores:
+                    f.seek(0, os.SEEK_END) # Go to end of file
+                    if f.tell() > 0 and current_ignores and current_ignores[-1]: # If not empty and last line not blank
+                        f.write('\n')
+                    f.write(f"{ignore_entry}\n")
+        else:
+            with open(gitignore_path, 'w', encoding='utf-8') as f:
+                f.write(f"# Ignore cache-specific files\n")
+                f.write("history.json\n") # Good to ignore the regular history too if not already
+                f.write("config.toml\n")  # And the config if it's auto-generated with defaults
+                f.write(f"{ignore_entry}\n")
+        # Also good practice to have a .gitignore in the main project root that ignores .agi_terminal_cache/
+        # but this script manages the .gitignore *inside* the cache dir.
+    except Exception as e:
+        console.print(f"[warning]Could not create or update .gitignore in {CACHE_DIR}: {e}[/warning]")
 
     return config
 

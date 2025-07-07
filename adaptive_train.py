@@ -49,7 +49,7 @@ DEFAULT_OUTPUT_DIR = "./merged_model_adapters" # Save adapters here
 
 # --- Argument Parsing ---
 def parse_arguments():
-    parser = argparse.ArgumentParser(description="Adaptive fine-tuning script for the merged AGI model.")
+    parser = argparse.ArgumentParser(description="Adaptive fine-tuning script for the merged AGI model using JSONL interaction logs.")
     parser.add_argument(
         "--model_path",
         type=str,
@@ -57,10 +57,10 @@ def parse_arguments():
         help="Path to the base model to be fine-tuned (./merged_model).",
     )
     parser.add_argument(
-        "--log_dir",
+        "--jsonl_log_path", # Changed from --log_dir
         type=str,
-        default=DEFAULT_LOG_DIR,
-        help="Directory containing interaction logs.",
+        default=str(Path(__file__).parent / ".agi_terminal_cache" / "interaction_logs.jsonl"), # Assumes train script is in project root
+        help="Path to the JSONL file containing interaction logs.",
     )
     parser.add_argument(
         "--output_dir",
@@ -104,57 +104,84 @@ def parse_arguments():
     # Add more training arguments as needed (e.g., weight_decay, lr_scheduler_type)
     return parser.parse_args()
 
+# --- Helper functions for formatting JSONL data for prompt ---
+def format_context_for_prompt(context_dict: dict) -> str:
+    if not context_dict:
+        return "CONTEXT: None"
+
+    parts = []
+    if context_dict.get("cwd"):
+        parts.append(f"CWD: {context_dict['cwd']}")
+    if context_dict.get("project_root"):
+        parts.append(f"ProjectRoot: {context_dict['project_root']}")
+    if context_dict.get("git_info", {}).get("in_git_repo"):
+        branch = context_dict['git_info'].get('branch', 'N/A')
+        modified = context_dict['git_info'].get('modified_files', 0)
+        parts.append(f"Git: Branch '{branch}', Modified files: {modified}")
+    if context_dict.get("key_file_snippets"):
+        parts.append(f"File Snippets: ({len(context_dict['key_file_snippets'])} available)")
+        # Could optionally include snippet headers or very short summaries here if desired
+
+    if not parts:
+        return "CONTEXT: Minimal"
+    return "CONTEXT:\n" + "\n".join(f"- {p}" for p in parts)
+
+def format_tool_interactions_for_prompt(tool_interactions: list) -> str:
+    if not tool_interactions:
+        return "" # No tool interactions to report in prompt
+
+    summary_parts = ["\nTOOL_INTERACTIONS:"]
+    for i, tool_call in enumerate(tool_interactions):
+        action = tool_call.get('action_type', 'unknown_action')
+        details = tool_call.get('action_details', {})
+        outcome = tool_call.get('tool_outcome_summary', 'No outcome summary.')
+
+        # Simplify details for prompt
+        simple_details = ""
+        if action == "run_shell":
+            simple_details = f"command='{details.get('command')}' args={details.get('args')}"
+        elif action == "read_file":
+            simple_details = f"filepath='{details.get('filepath')}'"
+        elif action == "write_file":
+            simple_details = f"filepath='{details.get('filepath')}'" # content not shown in prompt summary
+        elif action == "web_search":
+            simple_details = f"query='{details.get('query')}'"
+
+        summary_parts.append(f"  Tool Call {i+1}: {action}({simple_details}) -> Outcome: {outcome[:100]}{'...' if len(outcome) > 100 else ''}")
+    return "\n".join(summary_parts)
+
 # --- Log Parsing ---
-def load_interaction_logs(log_dir: str, tokenizer: AutoTokenizer, max_seq_length: int, log_count: Optional[int] = None, log_days: Optional[int] = None):
+def load_interaction_logs(jsonl_log_path: str, tokenizer: AutoTokenizer, max_seq_length: int):
     """
-    Loads interaction logs, formats them, and tokenizes them.
-    Current log format:
-    Timestamp: YYYYMMDD_HHMMSS
-    User Input: <text>
-    Model Output: <text>
-    ----------------------------------------
+    Loads interaction logs from a JSONL file, formats them, and tokenizes them.
     """
     formatted_texts = []
-    log_files = glob.glob(os.path.join(log_dir, "interaction_*.log"))
+    raw_interactions = []
 
-    if not log_files:
-        console.print(f"[yellow]No log files found in {log_dir}. Nothing to train on.[/yellow]")
+    log_file = Path(jsonl_log_path)
+    if not log_file.exists():
+        console.print(f"[yellow]JSONL log file not found at {jsonl_log_path}. Nothing to train on.[/yellow]")
         return []
 
-    # Sort files by name (timestamp) to get recent ones if --log_count or --log_days is used
-    log_files.sort(reverse=True) # Newest first
+    console.print(f"[info]Processing JSONL log file: {jsonl_log_path}...[/info]")
 
-    # Filter by --log_days
-    if log_days is not None:
-        filtered_by_date = []
-        cutoff_date = datetime.now() - timedelta(days=log_days)
-        for log_file in log_files:
-            try:
-                # Extract timestamp from filename: interaction_YYYYMMDD_HHMMSS.log
-                filename = Path(log_file).name
-                ts_str = filename.split('_')[1] # YYYYMMDD
-                file_date = datetime.strptime(ts_str, "%Y%m%d") # Just compare date part for simplicity
-                if file_date >= cutoff_date.replace(hour=0, minute=0, second=0, microsecond=0): # Compare date part only
-                    filtered_by_date.append(log_file)
-            except (IndexError, ValueError) as e:
-                console.print(f"[yellow]Could not parse date from log file {filename}: {e}. Skipping for date filter.[/yellow]")
-                continue
-        log_files = filtered_by_date
-        console.print(f"[info]Filtered logs by date: {len(log_files)} files from the last {log_days} days remaining.[/info]")
-
-
-    # Filter by --log_count (applied after date filter if both are present)
-    if log_count is not None and len(log_files) > log_count:
-        log_files = log_files[:log_count] # Already sorted newest first
-        console.print(f"[info]Filtered logs by count: Using the latest {len(log_files)} files.[/info]")
-
-    if not log_files:
-        console.print(f"[yellow]No log files remaining after filters. Nothing to train on.[/yellow]")
+    try:
+        with open(log_file, 'r', encoding='utf-8') as f:
+            for line_num, line in enumerate(f):
+                try:
+                    raw_interactions.append(json.loads(line))
+                except json.JSONDecodeError as e:
+                    console.print(f"[yellow]Skipping malformed JSON line {line_num + 1} in {jsonl_log_path}: {e}[/yellow]")
+                    continue
+    except Exception as e:
+        console.print(f"[error]Error reading or parsing JSONL log file {jsonl_log_path}: {e}[/error]")
         return []
 
-    console.print(f"[info]Processing {len(log_files)} log files...[/info]")
+    if not raw_interactions:
+        console.print(f"[yellow]No valid interactions found in {jsonl_log_path}.[/yellow]")
+        return []
 
-    # Use Rich Progress for parsing
+    # Use Rich Progress for formatting and tokenizing
     if RICH_AVAILABLE:
         progress_bar = Progress(
             TextColumn("[progress.description]{task.description}"),
@@ -164,65 +191,70 @@ def load_interaction_logs(log_dir: str, tokenizer: AutoTokenizer, max_seq_length
             TimeElapsedColumn(),
             console=console
         )
-        task_id = progress_bar.add_task("Parsing logs", total=len(log_files))
+        task_id_format = progress_bar.add_task("Formatting logs", total=len(raw_interactions))
         progress_bar.start()
 
-    for log_file in log_files:
+    for entry in raw_interactions:
         if RICH_AVAILABLE:
-            progress_bar.update(task_id, advance=1, description=f"Parsing {Path(log_file).name}")
-        try:
-            with open(log_file, 'r', encoding='utf-8') as f:
-                content = f.read()
+            progress_bar.update(task_id_format, advance=1)
 
-            # Simple parsing based on keywords
-            parts = content.split("User Input:")
-            if len(parts) < 2: continue
+        user_query = entry.get("user_query", "")
+        agi_final_response = entry.get("agi_final_response_to_user", "")
+        context_dict = entry.get("context_at_query_time", {})
+        tool_interactions_list = entry.get("tool_interactions", [])
 
-            input_part = parts[1]
-            output_parts = input_part.split("Model Output:")
-            if len(output_parts) < 2: continue
-
-            user_input = output_parts[0].strip()
-            model_output = output_parts[1].split("----------------------------------------")[0].strip()
-
-            if user_input and model_output:
-                # Format for instruction fine-tuning
-                # Using a common format. The exact tokens (USER:, ASSISTANT:, \n) matter.
-                # Ensure the tokenizer handles these tokens correctly or add them if they are special.
-                # For merged models, the base model's tokenizer conventions are important.
-                # This format aims for the model to learn to complete the "ASSISTANT:" part.
-                text = f"USER: {user_input}\nASSISTANT: {model_output}{tokenizer.eos_token}"
-                formatted_texts.append(text)
-        except Exception as e:
-            console.print(f"[yellow]Error parsing log file {Path(log_file).name}: {e}. Skipping.[/yellow]")
+        if not user_query or not agi_final_response: # Skip entries without essential I/O
             continue
+
+        # Construct the training text
+        # This aims for the model to learn to complete the "ASSISTANT:" part given context, user query, and tool use summary
+        context_str = format_context_for_prompt(context_dict)
+        tool_summary_str = format_tool_interactions_for_prompt(tool_interactions_list)
+
+        # Training text format:
+        # CONTEXT:
+        # - CWD: /path/to/project
+        # - Git: Branch 'main', Modified files: 0
+        # USER: How do I do X?
+        # TOOL_INTERACTIONS: (optional)
+        #   Tool Call 1: read_file(filepath='foo.py') -> Outcome: Content of foo.py...
+        # ASSISTANT: You can do X by using Y from foo.py... <eos_token>
+
+        # Need to ensure the prompt part (everything before ASSISTANT:) is distinct from the completion part.
+        # A common way is to have the model generate everything after "ASSISTANT: ".
+
+        prompt_part = f"{context_str}\nUSER: {user_query}{tool_summary_str}\nASSISTANT: "
+        completion_part = f"{agi_final_response}{tokenizer.eos_token}"
+
+        text = prompt_part + completion_part
+        formatted_texts.append(text)
 
     if RICH_AVAILABLE:
         progress_bar.stop()
 
+
     if not formatted_texts:
-        console.print("[yellow]No valid interactions parsed from logs after processing.[/yellow]")
+        console.print("[yellow]No valid interactions formatted for training after processing.[/yellow]")
         return []
 
     min_dataset_size = 10 # Arbitrary minimum, can be adjusted
     if len(formatted_texts) < min_dataset_size:
-        console.print(f"[warning]Warning: The number of parsed interactions ({len(formatted_texts)}) is very small (less than {min_dataset_size}). Fine-tuning may not be effective or could lead to overfitting.[/warning]")
+        console.print(f"[warning]Warning: The number of formatted interactions ({len(formatted_texts)}) is very small (less than {min_dataset_size}). Fine-tuning may not be effective or could lead to overfitting.[/warning]")
         if input(f"Continue with {len(formatted_texts)} interactions? (yes/NO): ").lower() != "yes":
             console.print("[info]Training aborted by user due to small dataset size.[/info]")
             return []
 
-
-    console.print(f"[success]Successfully parsed {len(formatted_texts)} interactions.[/success]")
+    console.print(f"[success]Successfully formatted {len(formatted_texts)} interactions from JSONL.[/success]")
 
     # Tokenize the formatted texts
     tokenized_dataset = []
     if RICH_AVAILABLE:
-        task_id_tokenize = progress_bar.add_task("Tokenizing data", total=len(formatted_texts))
-        progress_bar.start()
+        task_id_tokenize = progress_bar.add_task("Tokenizing data", total=len(formatted_texts)) # Re-add task for progress
+        progress_bar.start() # Re-start if stopped
 
     for text in formatted_texts:
         if RICH_AVAILABLE:
-            progress_bar.update(task_id_tokenize, advance=1)
+            progress_bar.update(task_id_tokenize, advance=1) # Use the new task_id
         tokenized_input = tokenizer(
             text,
             truncation=True,
