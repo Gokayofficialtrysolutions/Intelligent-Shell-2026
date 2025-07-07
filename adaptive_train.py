@@ -110,45 +110,93 @@ def format_context_for_prompt(context_dict: dict) -> str:
         return "CONTEXT: None"
 
     parts = []
-    if context_dict.get("cwd"):
+    if "cwd" in context_dict: # Check if key exists
         parts.append(f"CWD: {context_dict['cwd']}")
-    if context_dict.get("project_root"):
+    if "project_root" in context_dict: # Check if key exists
         parts.append(f"ProjectRoot: {context_dict['project_root']}")
-    if context_dict.get("git_info", {}).get("in_git_repo"):
-        branch = context_dict['git_info'].get('branch', 'N/A')
-        modified = context_dict['git_info'].get('modified_files', 0)
-        parts.append(f"Git: Branch '{branch}', Modified files: {modified}")
-    if context_dict.get("key_file_snippets"):
-        parts.append(f"File Snippets: ({len(context_dict['key_file_snippets'])} available)")
-        # Could optionally include snippet headers or very short summaries here if desired
+
+    git_info = context_dict.get("git_info", {})
+    if git_info.get("in_git_repo"):
+        branch = git_info.get('branch', 'N/A')
+        modified_files = git_info.get('modified_files', 0)
+        status_str = f"{modified_files} modified files" if modified_files > 0 else "Clean"
+        parts.append(f"Git: Branch='{branch}', Status='{status_str}'")
+    else:
+        parts.append("Git: Not a git repository or no info")
+
+    file_counts = context_dict.get("file_type_counts", {})
+    if file_counts:
+        # Sort by count descending, take top N (e.g., 3)
+        top_files = sorted(file_counts.items(), key=lambda item: item[1], reverse=True)[:3]
+        files_str = ", ".join([f"{lang}:{count}" for lang, count in top_files])
+        parts.append(f"FileTypes: {files_str}{'...' if len(file_counts) > 3 else ''}")
+
+    key_snippets = context_dict.get("key_file_snippets", [])
+    if key_snippets:
+        # Extract filenames from snippet headers (assuming format "--- Snippet from FILENAME ...")
+        filenames = []
+        for snippet_header in key_snippets:
+            match = re.search(r"--- Snippet from ([\w\._-]+)", snippet_header)
+            if match:
+                filenames.append(match.group(1))
+        if filenames:
+            parts.append(f"KeyFileSnippetsProvided: [{', '.join(filenames)}]")
 
     if not parts:
-        return "CONTEXT: Minimal"
-    return "CONTEXT:\n" + "\n".join(f"- {p}" for p in parts)
+        return "CONTEXT: (No specific context details available)" # Fallback if all parts are empty
+    return "SYSTEM_CONTEXT:\n" + "\n".join(f"  {p}" for p in parts)
 
-def format_tool_interactions_for_prompt(tool_interactions: list) -> str:
+def format_tool_interactions_for_prompt(tool_interactions: list, max_outcome_chars: int = 200) -> str:
     if not tool_interactions:
-        return "" # No tool interactions to report in prompt
+        return ""
 
-    summary_parts = ["\nTOOL_INTERACTIONS:"]
+    turn_dialogue = ["\nINTERMEDIATE_STEPS:"]
     for i, tool_call in enumerate(tool_interactions):
-        action = tool_call.get('action_type', 'unknown_action')
-        details = tool_call.get('action_details', {})
-        outcome = tool_call.get('tool_outcome_summary', 'No outcome summary.')
+        turn_dialogue.append(f"  --- TOOL CALL {i+1} ---")
+        action_type = tool_call.get('action_type', 'unknown_action')
+        action_details = tool_call.get('action_details', {})
+        reasoning = tool_call.get('reasoning', 'No reasoning provided.')
+        user_confirmation = tool_call.get('user_confirmation', 'N/A')
+        tool_outcome_summary = tool_call.get('tool_outcome_summary', 'No outcome summary.')
+        agi_secondary_response = tool_call.get('agi_secondary_raw_response', None)
 
-        # Simplify details for prompt
-        simple_details = ""
-        if action == "run_shell":
-            simple_details = f"command='{details.get('command')}' args={details.get('args')}"
-        elif action == "read_file":
-            simple_details = f"filepath='{details.get('filepath')}'"
-        elif action == "write_file":
-            simple_details = f"filepath='{details.get('filepath')}'" # content not shown in prompt summary
-        elif action == "web_search":
-            simple_details = f"query='{details.get('query')}'"
+        turn_dialogue.append(f"    AGI_TOOL_REQUEST:")
+        turn_dialogue.append(f"      Action: {action_type}")
+        # Format action_details
+        details_str_parts = []
+        if action_type == "run_shell":
+            details_str_parts.append(f"command: '{action_details.get('command')}'")
+            if 'args' in action_details: details_str_parts.append(f"args: {action_details['args']}")
+        elif action_type == "read_file":
+            details_str_parts.append(f"filepath: '{action_details.get('filepath')}'")
+            if 'max_lines' in action_details: details_str_parts.append(f"max_lines: {action_details['max_lines']}")
+        elif action_type == "write_file":
+            details_str_parts.append(f"filepath: '{action_details.get('filepath')}'")
+            details_str_parts.append(f"content_length: {action_details.get('content_length', 'N/A')}")
+        elif action_type == "web_search":
+            details_str_parts.append(f"query: '{action_details.get('query')}'")
+        else: # Generic fallback for unknown action_details
+            details_str_parts.append(f"details: {json.dumps(action_details)}")
+        turn_dialogue.append(f"      Details: {', '.join(details_str_parts)}")
+        turn_dialogue.append(f"      Reasoning: {reasoning}")
 
-        summary_parts.append(f"  Tool Call {i+1}: {action}({simple_details}) -> Outcome: {outcome[:100]}{'...' if len(outcome) > 100 else ''}")
-    return "\n".join(summary_parts)
+        turn_dialogue.append(f"    SYSTEM_TOOL_RESPONSE:")
+        turn_dialogue.append(f"      UserConfirmation: {user_confirmation}")
+        # Truncate long outcomes for the prompt
+        outcome_display = tool_outcome_summary
+        if len(outcome_display) > max_outcome_chars:
+            outcome_display = outcome_display[:max_outcome_chars] + f"... (outcome truncated, full length {len(tool_outcome_summary)})"
+        turn_dialogue.append(f"      Outcome: {outcome_display}")
+
+        if agi_secondary_response:
+            # Truncate secondary AGI response if it's very long (e.g. AGI explains a large file)
+            secondary_resp_display = agi_secondary_response
+            if len(secondary_resp_display) > max_outcome_chars * 2: # Allow a bit more for AGI's own words
+                 secondary_resp_display = secondary_resp_display[:max_outcome_chars*2] + f"... (AGI response truncated, full length {len(agi_secondary_response)})"
+            turn_dialogue.append(f"    AGI_RESPONSE_AFTER_TOOL: {secondary_resp_display}")
+        turn_dialogue.append(f"  --- END TOOL CALL {i+1} ---")
+
+    return "\n".join(turn_dialogue)
 
 # --- Log Parsing ---
 def load_interaction_logs(jsonl_log_path: str, tokenizer: AutoTokenizer, max_seq_length: int):

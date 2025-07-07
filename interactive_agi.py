@@ -652,7 +652,32 @@ class MergedAGI:
                     "- You should then use that information to formulate your final answer to the user.\n"
                     "- Example: {\"action\": \"web_search\", \"query\": \"current weather in London\", \"reasoning\": \"To fetch the current weather conditions in London for the user.\"}\n"
                     "\n"
-                    "If the query cannot be answered with one of these tools ('run_shell', 'read_file', 'write_file', 'web_search'), or if it requires actions not supported, answer directly as a helpful assistant without using the JSON format.\n"
+                    "You also have Git-related tools. To suggest creating a new Git branch, use:\n"
+                    "{\n"
+                    "  \"action\": \"git_branch_create\",\n"
+                    "  \"branch_name\": \"<new_branch_name>\",\n"
+                    "  \"base_branch\": \"<optional_source_branch_name>\",\n"
+                    "  \"reasoning\": \"<why_create_this_branch>\"\n"
+                    "}\n"
+                    "Details for 'git_branch_create':\n"
+                    "- 'branch_name' is required. 'base_branch' is optional; if omitted, the new branch starts from the current HEAD.\n"
+                    "- User confirmation will be required before the branch is created.\n"
+                    "- Example: {\"action\": \"git_branch_create\", \"branch_name\": \"feature/new-widget\", \"base_branch\": \"develop\", \"reasoning\": \"To start development on the new widget feature, branching off develop.\"}\n"
+                    "\n"
+                    "To suggest checking out a Git branch (existing or new with -b), use:\n"
+                    "{\n"
+                    "  \"action\": \"git_checkout\",\n"
+                    "  \"branch_name\": \"<branch_name_to_checkout_or_create>\",\n"
+                    "  \"create_new\": <true_or_false>, \n"
+                    "  \"reasoning\": \"<why_checkout_this_branch>\"\n"
+                    "}\n"
+                    "Details for 'git_checkout':\n"
+                    "- 'branch_name' is required. 'create_new' is a boolean (true for 'checkout -b', false for regular checkout), defaults to false if omitted.\n"
+                    "- User confirmation will be required.\n"
+                    "- Example (checkout existing): {\"action\": \"git_checkout\", \"branch_name\": \"main\", \"create_new\": false, \"reasoning\": \"Switch to the main branch.\"}\n"
+                    "- Example (create and checkout new): {\"action\": \"git_checkout\", \"branch_name\": \"bugfix/login-issue\", \"create_new\": true, \"reasoning\": \"Create and switch to a new branch for fixing the login issue.\"}\n"
+                    "\n"
+                    "If the query cannot be answered with one of these tools ('run_shell', 'read_file', 'write_file', 'web_search', 'git_branch_create', 'git_checkout'), or if it requires actions not supported, answer directly as a helpful assistant without using the JSON format.\n"
                     "Choose only ONE action per turn if you decide to use a tool. Do not combine them in one JSON response.\n"
                 )
                 full_prompt = f"{current_context_str}\n\nTool Instructions:\n{tool_instruction}\n\nUser Query:\n{task_prefix}{prompt}"
@@ -1331,6 +1356,118 @@ def main():
                                 "timestamp": datetime.now().isoformat()
                             })
                             # Final AGI response logged by generic handler.
+
+                    elif isinstance(data, dict) and data.get("action") == "git_branch_create":
+                        tool_request_start_time = datetime.now().isoformat()
+                        branch_name = data.get("branch_name")
+                        base_branch = data.get("base_branch") # Optional
+                        reasoning = data.get("reasoning", "No reasoning provided for git branch create.")
+
+                        tool_interaction_log_entry = {
+                            "tool_request_timestamp": tool_request_start_time,
+                            "action_type": "git_branch_create",
+                            "action_details": {"branch_name": branch_name, "base_branch": base_branch},
+                            "reasoning": reasoning,
+                        }
+
+                        if not branch_name:
+                            error_msg = f"AGI 'git_branch_create' request missing 'branch_name' field. Payload: {data}"
+                            console.print(f"[warning]{error_msg}[/warning]")
+                            final_text_for_user_display = f"Your 'git_branch_create' request was malformed ({error_msg})."
+                            action_taken_by_tool_framework = False # Let error display
+                            tool_interaction_log_entry["user_confirmation"] = "n/a_malformed_request"
+                            tool_interaction_log_entry["tool_outcome_summary"] = "Malformed request: missing 'branch_name'."
+                        else:
+                            console.print(Panel(Text(f"AGI requests to create git branch: [bold cyan]{branch_name}[/bold cyan]" +
+                                                     (f" from base [bold cyan]{base_branch}[/bold cyan]" if base_branch else "") +
+                                                     f"\nReason: {reasoning}", style="yellow"), title="[bold blue]Git Branch Create Request[/bold blue]"))
+
+                            outcome_message, outcome_error = handle_git_branch_create_request(branch_name, base_branch)
+
+                            tool_interaction_log_entry["user_confirmation"] = "confirmed" if "successfully" in (outcome_message or "") or "processed" in (outcome_message or "") else \
+                                                                           ("cancelled" if "cancelled" in (outcome_message or "") else "n/a_error_or_not_applicable")
+                            tool_interaction_log_entry["tool_outcome_timestamp"] = datetime.now().isoformat()
+
+                            if outcome_error:
+                                tool_interaction_log_entry["tool_outcome_summary"] = f"Error: {outcome_error}"
+                                outcome_summary_for_agi = f"An attempt to create branch '{branch_name}' failed. Error: {outcome_error}"
+                            else:
+                                tool_interaction_log_entry["tool_outcome_summary"] = outcome_message
+                                outcome_summary_for_agi = f"Git branch operation for '{branch_name}': {outcome_message}"
+
+                            subsequent_prompt_for_agi = (
+                                f"{context_analyzer.get_full_context_string()}\n\n"
+                                f"Outcome of your 'git_branch_create' request for '{branch_name}':\n{outcome_summary_for_agi}\n\n"
+                                f"Original User Query: \"{user_input}\"\n\n"
+                                "Based on this outcome, please formulate your response to the user or decide on the next step."
+                            )
+                            tool_interaction_log_entry["context_for_next_agi_step"] = subsequent_prompt_for_agi
+
+                            console.print(f"[info]Git branch create attempt for '{branch_name}' processed. Outcome: {outcome_summary_for_agi}. Re-prompting AGI...[/info]")
+                            with console.status("[yellow]AGI is processing git branch create outcome...[/yellow]", spinner="dots"):
+                                agi_secondary_raw_response = agi_interface.generate_response(subsequent_prompt_for_agi)
+
+                            tool_interaction_log_entry["agi_secondary_raw_response"] = agi_secondary_raw_response
+                            final_text_for_user_display = agi_secondary_raw_response
+                            action_taken_by_tool_framework = True
+
+                        current_turn_interaction_data["tool_interactions"].append(tool_interaction_log_entry)
+
+                    elif isinstance(data, dict) and data.get("action") == "git_checkout":
+                        tool_request_start_time = datetime.now().isoformat()
+                        branch_name = data.get("branch_name")
+                        create_new = data.get("create_new", False) # Default to False if not provided
+                        reasoning = data.get("reasoning", "No reasoning provided for git checkout.")
+
+                        tool_interaction_log_entry = {
+                            "tool_request_timestamp": tool_request_start_time,
+                            "action_type": "git_checkout",
+                            "action_details": {"branch_name": branch_name, "create_new": create_new},
+                            "reasoning": reasoning,
+                        }
+
+                        if not branch_name:
+                            error_msg = f"AGI 'git_checkout' request missing 'branch_name' field. Payload: {data}"
+                            console.print(f"[warning]{error_msg}[/warning]")
+                            final_text_for_user_display = f"Your 'git_checkout' request was malformed ({error_msg})."
+                            action_taken_by_tool_framework = False
+                            tool_interaction_log_entry["user_confirmation"] = "n/a_malformed_request"
+                            tool_interaction_log_entry["tool_outcome_summary"] = "Malformed request: missing 'branch_name'."
+                        else:
+                            action_desc_for_print = "Create and checkout new branch" if create_new else "Checkout branch"
+                            console.print(Panel(Text(f"AGI requests to {action_desc_for_print.lower()}: [bold cyan]{branch_name}[/bold cyan]\nReason: {reasoning}", style="yellow"),
+                                                title="[bold blue]Git Checkout Request[/bold blue]"))
+
+                            outcome_message, outcome_error = handle_git_checkout_request(branch_name, create_new)
+
+                            tool_interaction_log_entry["user_confirmation"] = "confirmed" if outcome_message and "Successfully" in outcome_message else \
+                                                                           ("cancelled" if outcome_message and "cancelled" in outcome_message else "n/a_error_or_not_applicable")
+                            tool_interaction_log_entry["tool_outcome_timestamp"] = datetime.now().isoformat()
+
+                            if outcome_error:
+                                tool_interaction_log_entry["tool_outcome_summary"] = f"Error: {outcome_error}"
+                                outcome_summary_for_agi = f"An attempt to {action_desc_for_print.lower()} '{branch_name}' failed. Error: {outcome_error}"
+                            else:
+                                tool_interaction_log_entry["tool_outcome_summary"] = outcome_message
+                                outcome_summary_for_agi = f"Git checkout operation for '{branch_name}': {outcome_message}"
+
+                            subsequent_prompt_for_agi = (
+                                f"{context_analyzer.get_full_context_string()}\n\n"
+                                f"Outcome of your 'git_checkout' request for '{branch_name}' (create_new={create_new}):\n{outcome_summary_for_agi}\n\n"
+                                f"Original User Query: \"{user_input}\"\n\n"
+                                "Based on this outcome, please formulate your response to the user or decide on the next step."
+                            )
+                            tool_interaction_log_entry["context_for_next_agi_step"] = subsequent_prompt_for_agi
+
+                            console.print(f"[info]Git checkout attempt for '{branch_name}' processed. Outcome: {outcome_summary_for_agi}. Re-prompting AGI...[/info]")
+                            with console.status("[yellow]AGI is processing git checkout outcome...[/yellow]", spinner="dots"):
+                                agi_secondary_raw_response = agi_interface.generate_response(subsequent_prompt_for_agi)
+
+                            tool_interaction_log_entry["agi_secondary_raw_response"] = agi_secondary_raw_response
+                            final_text_for_user_display = agi_secondary_raw_response
+                            action_taken_by_tool_framework = True
+
+                        current_turn_interaction_data["tool_interactions"].append(tool_interaction_log_entry)
 
                 except json.JSONDecodeError:
                     # Not a JSON response for tool use, treat as normal chat
@@ -2479,6 +2616,109 @@ def handle_write_file_request(filepath_str: str, content_to_write: str) -> tuple
     except Exception as e:
         console.print(f"[bold red]Unexpected error in handle_write_file_request for '{filepath_str}': {type(e).__name__} - {e}[/bold red]")
         return None, f"An unexpected error occurred processing the write request: {type(e).__name__}"
+
+def handle_git_branch_create_request(branch_name: str, base_branch: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """Handles AGI request to create a new git branch."""
+    if not branch_name:
+        return None, "Branch name cannot be empty."
+
+    # Basic validation for branch name (simplified)
+    # Git has more complex rules, but this catches common issues.
+    # Ref: man git-check-ref-format
+    if re.search(r"[\s~^:*?\[\]\\]|@{|\.\.", branch_name) or \
+       branch_name.startswith('/') or branch_name.endswith('/') or \
+       branch_name.endswith(".lock"):
+        return None, f"Invalid branch name: '{branch_name}'. Contains invalid characters or patterns."
+
+    git_command_list = ["git", "branch", branch_name]
+    confirm_message = f"Create new branch '{branch_name}'"
+    if base_branch and base_branch.strip():
+        # Further validation for base_branch could be added if needed
+        git_command_list.append(base_branch.strip())
+        confirm_message += f" from base branch '{base_branch.strip()}'"
+    confirm_message += "?"
+
+    if RICH_AVAILABLE:
+        from rich.prompt import Confirm
+        confirmed = Confirm.ask(confirm_message, default=False, console=console)
+    else:
+        confirmed = input(f"{confirm_message} (yes/NO): ").lower() == "yes"
+
+    if not confirmed:
+        return "Branch creation cancelled by user.", None
+
+    try:
+        process = subprocess.run(git_command_list, shell=False, capture_output=True, text=True, check=False)
+        if process.returncode == 0:
+            # Check stderr for common "warning: " or if branch already exists type messages from git.
+            # Git branch might return 0 even if branch already exists but just prints to stderr.
+            # "git branch <name>" successfully creates or does nothing if exists (stderr: "fatal: A branch named '...' already exists.")
+            # Let's check stderr for "fatal" or "error"
+            if "fatal:" in process.stderr.lower() or "error:" in process.stderr.lower():
+                 return None, f"Git error: {process.stderr.strip()}"
+            success_msg = f"Branch '{branch_name}' operation processed."
+            if process.stdout: success_msg += f"\nGit stdout: {process.stdout.strip()}"
+            if process.stderr: success_msg += f"\nGit stderr (warnings): {process.stderr.strip()}" # e.g. if it already existed and command did nothing.
+            return success_msg.strip(), None
+        else:
+            # Return code is non-zero, this is definitely an error.
+            return None, f"Git command failed with return code {process.returncode}. Error: {process.stderr.strip() if process.stderr else process.stdout.strip()}"
+    except FileNotFoundError:
+        return None, "Git command not found. Is Git installed and in PATH?"
+    except Exception as e:
+        console.print(f"[bold red]Unexpected error in handle_git_branch_create_request: {type(e).__name__} - {e}[/bold red]")
+        return None, f"An unexpected error occurred: {type(e).__name__}"
+
+def handle_git_checkout_request(branch_name: str, create_new: bool) -> tuple[Optional[str], Optional[str]]:
+    """Handles AGI request to checkout a git branch, optionally creating it."""
+    if not branch_name:
+        return None, "Branch name cannot be empty for checkout."
+
+    # Validate branch_name, especially if creating new
+    if create_new:
+        if re.search(r"[\s~^:*?\[\]\\]|@{|\.\.", branch_name) or \
+           branch_name.startswith('/') or branch_name.endswith('/') or \
+           branch_name.endswith(".lock"):
+            return None, f"Invalid new branch name: '{branch_name}'. Contains invalid characters or patterns."
+
+    git_command_list = ["git", "checkout"]
+    action_desc = "Checkout branch"
+    if create_new:
+        git_command_list.append("-b")
+        action_desc = "Create and checkout new branch"
+    git_command_list.append(branch_name)
+
+    confirm_message = f"{action_desc} '{branch_name}'?"
+
+    if RICH_AVAILABLE:
+        from rich.prompt import Confirm
+        confirmed = Confirm.ask(confirm_message, default=False, console=console)
+    else:
+        confirmed = input(f"{confirm_message} (yes/NO): ").lower() == "yes"
+
+    if not confirmed:
+        return f"{action_desc} operation cancelled by user.", None
+
+    try:
+        process = subprocess.run(git_command_list, shell=False, capture_output=True, text=True, check=False)
+        # Git checkout often prints to stderr even on success (e.g., "Switched to a new branch '...'")
+        # So, check returncode first.
+        if process.returncode == 0:
+            success_msg = process.stderr.strip() if process.stderr.strip() else process.stdout.strip() # Prefer stderr for messages like "Switched to..."
+            if not success_msg : success_msg = f"Successfully performed: {' '.join(git_command_list)}"
+            return success_msg, None
+        else:
+            # Error occurred
+            error_msg = process.stderr.strip() if process.stderr else process.stdout.strip()
+            if not error_msg: error_msg = f"Git command failed with return code {process.returncode} but no specific error message."
+            return None, f"Git error: {error_msg}"
+
+    except FileNotFoundError:
+        return None, "Git command not found. Is Git installed and in PATH?"
+    except Exception as e:
+        console.print(f"[bold red]Unexpected error in handle_git_checkout_request: {type(e).__name__} - {e}[/bold red]")
+        return None, f"An unexpected error occurred during git checkout: {type(e).__name__}"
+
 
 # --- Help Command ---
 def display_help_command():
