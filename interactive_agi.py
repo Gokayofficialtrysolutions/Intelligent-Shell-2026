@@ -576,18 +576,45 @@ class MergedAGI:
                     "respond ONLY with a JSON object in the following format:\n"
                     "{\n"
                     "  \"action\": \"read_file\",\n"
-                    "  \"filepath\": \"<path_to_file_relative_to_CWD>\",\n"
+                    "  \"filepath\": \"<path_to_file_relative_to_project_root>\",\n"
                     "  \"max_lines\": <optional_integer_max_lines_to_read_for_context_usually_around_100_to_200>,\n"
                     "  \"reasoning\": \"<brief_explanation_why_you_need_to_read_this_file>\"\n"
                     "}\n"
                     "Details for 'read_file':\n"
-                    "- 'filepath' MUST be a relative path to a file. Do not use absolute paths.\n"
+                    "- 'filepath' MUST be a relative path to a file (relative to project root). Do not use absolute paths.\n"
                     "- 'max_lines' is optional. If the file is very large, the system may truncate it or provide a summary. Suggesting max_lines helps focus.\n"
                     "- After you request a file read, the system will provide its content (or a part of it) in the next turn, along with the original user query. You should then use that information to formulate your final answer.\n"
                     "- Example: {\"action\": \"read_file\", \"filepath\": \"src/utils.py\", \"max_lines\": 100, \"reasoning\": \"To understand the helper functions available before answering how to implement the feature.\"}\n"
                     "\n"
-                    "If the query cannot be answered with a whitelisted shell command or by reading a file, or if it requires a command not on the list, answer directly as a helpful assistant without using the JSON format.\n"
-                    "Choose only ONE action ('run_shell' or 'read_file') if you decide to use a tool. Do not combine them in one JSON response.\n"
+                    "Additionally, you have a 'write_file' tool. If you need to create a new file or suggest modifications to an existing one, "
+                    "respond ONLY with a JSON object in the following format:\n"
+                    "{\n"
+                    "  \"action\": \"write_file\",\n"
+                    "  \"filepath\": \"<path_to_file_relative_to_project_root>\",\n"
+                    "  \"content\": \"<full_content_to_be_written>\",\n"
+                    "  \"reasoning\": \"<brief_explanation_for_this_file_creation_or_modification>\"\n"
+                    "}\n"
+                    "Details for 'write_file':\n"
+                    "- 'filepath' MUST be a relative path (relative to project root). Do not use absolute paths.\n"
+                    "- 'content' MUST be the complete, new content for the file.\n"
+                    "- ALL write operations require explicit user confirmation. If the file exists, a diff will be shown to the user. If it's a new file, the full content will be shown for confirmation.\n"
+                    "- Example (new file): {\"action\": \"write_file\", \"filepath\": \"notes/todo.txt\", \"content\": \"- Buy milk\\n- Plan project\", \"reasoning\": \"Create a new todo list file.\"}\n"
+                    "- Example (suggesting modification to existing file - system shows diff to user): {\"action\": \"write_file\", \"filepath\": \"app/config.py\", \"content\": \"DEBUG = False\\nSECRET_KEY = 'new_secret'\", \"reasoning\": \"Disable debug mode and update secret key.\"}\n"
+                    "\n"
+                    "Finally, you have a 'web_search' tool. If you need to search the internet to answer the user's query, "
+                    "respond ONLY with a JSON object in the following format:\n"
+                    "{\n"
+                    "  \"action\": \"web_search\",\n"
+                    "  \"query\": \"<your_search_query_string>\",\n"
+                    "  \"reasoning\": \"<brief_explanation_why_internet_search_is_needed>\"\n"
+                    "}\n"
+                    "Details for 'web_search':\n"
+                    "- The system will perform the search and provide you with a summary of results in the next turn.\n"
+                    "- You should then use that information to formulate your final answer to the user.\n"
+                    "- Example: {\"action\": \"web_search\", \"query\": \"current weather in London\", \"reasoning\": \"To fetch the current weather conditions in London for the user.\"}\n"
+                    "\n"
+                    "If the query cannot be answered with one of these tools ('run_shell', 'read_file', 'write_file', 'web_search'), or if it requires actions not supported, answer directly as a helpful assistant without using the JSON format.\n"
+                    "Choose only ONE action per turn if you decide to use a tool. Do not combine them in one JSON response.\n"
                 )
                 full_prompt = f"{current_context_str}\n\nTool Instructions:\n{tool_instruction}\n\nUser Query:\n{task_prefix}{prompt}"
             else:
@@ -1082,6 +1109,99 @@ def main():
                             })
                             # The final AGI response (after getting file content or error) will be logged by the generic handler below.
 
+                    elif isinstance(data, dict) and data.get("action") == "write_file":
+                        filepath_str = data.get("filepath")
+                        content_to_write = data.get("content") # Content can be empty string
+                        reasoning = data.get("reasoning", "No reasoning provided for file write.")
+
+                        if filepath_str is None or content_to_write is None: # Check for None, empty string for content is allowed
+                            missing_fields = []
+                            if filepath_str is None: missing_fields.append("'filepath'")
+                            if content_to_write is None: missing_fields.append("'content'")
+                            error_msg = f"AGI 'write_file' request missing required field(s): {', '.join(missing_fields)}. Payload: {data}"
+                            console.print(f"[warning]{error_msg}[/warning]")
+                            agi_response_text = f"Your 'write_file' request was malformed ({error_msg}). Please provide all required fields."
+                            action_taken_by_tool_framework = False # Fall through to display error to user via AGI
+                        else:
+                            console.print(Panel(Text(f"AGI requests to write file: [bold cyan]{filepath_str}[/bold cyan]\nReason: {reasoning}", style="yellow"), title="[bold blue]File Write Request[/bold blue]"))
+
+                            write_message, write_error = handle_write_file_request(filepath_str, content_to_write)
+
+                            # Prepare message for AGI based on write outcome
+                            if write_error:
+                                outcome_summary = f"An attempt to write the file '{filepath_str}' failed. Error: {write_error}"
+                            else: # write_message contains success or cancellation message
+                                outcome_summary = f"File write operation for '{filepath_str}': {write_message}"
+
+                            # Re-prompt AGI with the outcome
+                            subsequent_prompt = (
+                                f"{context_analyzer.get_full_context_string()}\n\n"
+                                f"Outcome of your 'write_file' request for '{filepath_str}':\n{outcome_summary}\n\n"
+                                f"Original User Query that may have led to this write request: \"{user_input}\"\n\n"
+                                "Based on this outcome, please formulate your response to the user or decide on the next step."
+                            )
+                            console.print(f"[info]File write attempt for '{filepath_str}' processed. Outcome: {outcome_summary}. Re-prompting AGI...[/info]")
+                            with console.status("[yellow]AGI is processing file write outcome...[/yellow]", spinner="dots"):
+                                agi_response_text = agi_interface.generate_response(subsequent_prompt)
+
+                            action_taken_by_tool_framework = False # Let the normal display path handle this final response.
+
+                            # Log the AGI's initial request to write the file and the outcome
+                            if session_logger:
+                                session_logger.log_entry("AGI_Request_WriteFile", f"File: {filepath_str}, Reason: {reasoning}, Outcome: {outcome_summary}")
+                            conversation_history.append({
+                                "role": "assistant_tool_request",
+                                "content": f"Requested to write file: {filepath_str}. Reason: {reasoning}. Outcome: {outcome_summary}",
+                                "timestamp": datetime.now().isoformat()
+                            })
+                            # The final AGI response (after getting write outcome) will be logged by the generic handler below.
+
+                    elif isinstance(data, dict) and data.get("action") == "web_search":
+                        search_query = data.get("query")
+                        reasoning = data.get("reasoning", "No reasoning provided for web search.")
+
+                        if not search_query:
+                            error_msg = f"AGI 'web_search' request missing 'query' field. Payload: {data}"
+                            console.print(f"[warning]{error_msg}[/warning]")
+                            agi_response_text = f"Your 'web_search' request was malformed ({error_msg}). Please provide a query."
+                            action_taken_by_tool_framework = False # Fall through to display error to user via AGI
+                        else:
+                            console.print(Panel(Text(f"AGI requests web search for: [bold cyan]{search_query}[/bold cyan]\nReason: {reasoning}", style="yellow"), title="[bold blue]Web Search Request[/bold blue]"))
+
+                            search_results_str, search_error = handle_web_search_request(search_query)
+
+                            outcome_summary_for_log = "Search successful."
+                            if search_error:
+                                outcome_summary_for_log = f"Search failed: {search_error}"
+                            elif not search_results_str or "No search results found." in search_results_str : # handle_web_search_request can return "No search results found." as non-error
+                                outcome_summary_for_log = "Search returned no results or no usable results."
+
+                            # Content for AGI: either results or an error/status message
+                            content_for_agi = search_results_str if not search_error else f"Web search for '{search_query}' failed. Error: {search_error}"
+                            if not content_for_agi and not search_error: # e.g. "No search results found."
+                                content_for_agi = "No search results were found for your query."
+
+
+                            subsequent_prompt = (
+                                f"{context_analyzer.get_full_context_string()}\n\n"
+                                f"Search Results for your query \"{search_query}\":\n{content_for_agi}\n\n"
+                                f"Original User Query that may have led to this web search: \"{user_input}\"\n\n"
+                                "Based on these search results (or lack thereof), please formulate your response to the user."
+                            )
+                            console.print(f"[info]Web search for '{search_query}' processed. Re-prompting AGI...[/info]")
+                            with console.status("[yellow]AGI is processing web search results...[/yellow]", spinner="dots"):
+                                agi_response_text = agi_interface.generate_response(subsequent_prompt)
+
+                            action_taken_by_tool_framework = False # Let the normal display path handle this final response.
+
+                            if session_logger:
+                                session_logger.log_entry("AGI_Request_WebSearch", f"Query: {search_query}, Reason: {reasoning}, Outcome: {outcome_summary_for_log}")
+                            conversation_history.append({
+                                "role": "assistant_tool_request",
+                                "content": f"Requested web search for: '{search_query}'. Reason: {reasoning}. Outcome: {outcome_summary_for_log}",
+                                "timestamp": datetime.now().isoformat()
+                            })
+                            # Final AGI response logged by generic handler.
 
                 except json.JSONDecodeError:
                     # Not a JSON response for tool use, treat as normal chat
@@ -2055,6 +2175,126 @@ def handle_read_file_request(filepath_str: str, max_lines_from_agi: Optional[int
         console.print(f"[bold red]Unexpected error in handle_read_file_request for '{filepath_str}': {type(e).__name__} - {e}[/bold red]")
         return None, f"An unexpected error occurred while trying to read file: {type(e).__name__}"
 
+import difflib # For generating diffs in handle_write_file_request
+
+def handle_write_file_request(filepath_str: str, content_to_write: str) -> tuple[Optional[str], Optional[str]]:
+    """
+    Handles an AGI's request to write content to a file.
+
+    Args:
+        filepath_str: The relative path to the file (within project root).
+        content_to_write: The full string content to write to the file.
+
+    Returns:
+        A tuple (success_message, None) on success,
+        or (None, error_message_string) on failure.
+    """
+    try:
+        if PROJECT_ROOT_PATH is None: # Should have been initialized in main()
+            console.print("[bold red]CRITICAL: PROJECT_ROOT_PATH is not set. File write access denied for safety.[/bold red]")
+            return None, "Project scope (PROJECT_ROOT_PATH) is not defined. Cannot write file."
+
+        requested_path = Path(filepath_str)
+        if requested_path.is_absolute():
+            return None, f"File path must be relative, but got absolute path: {filepath_str}"
+
+        # Resolve path relative to project root
+        abs_path = (PROJECT_ROOT_PATH / requested_path).resolve()
+
+        # Security Check: Ensure abs_path is within PROJECT_ROOT_PATH
+        if not (abs_path == PROJECT_ROOT_PATH.resolve() or str(abs_path).startswith(str(PROJECT_ROOT_PATH.resolve()) + os.sep)):
+            return None, f"Access denied: File path '{filepath_str}' resolves to '{abs_path}', which is outside the defined project root '{PROJECT_ROOT_PATH.resolve()}'."
+
+        if abs_path.is_dir():
+            return None, f"Path '{filepath_str}' points to an existing directory. Cannot write file content to a directory."
+
+        parent_dir = abs_path.parent
+        if not parent_dir.exists():
+            return None, f"Parent directory '{parent_dir}' for file '{filepath_str}' does not exist. Please create it first."
+        if not parent_dir.is_dir():
+            return None, f"The parent path '{parent_dir}' for file '{filepath_str}' is not a directory."
+
+        user_confirmed = False
+        final_content_for_file = content_to_write
+        # Standardize newlines for diffing and writing: use '\n'
+        if "\r\n" in final_content_for_file:
+            final_content_for_file = final_content_for_file.replace("\r\n", "\n")
+        if "\r" in final_content_for_file:
+            final_content_for_file = final_content_for_file.replace("\r", "\n")
+
+        # Ensure content ends with a newline if it's not empty, for cleaner diffs and typical file formats.
+        if final_content_for_file and not final_content_for_file.endswith('\n'):
+            content_for_display_and_diff = final_content_for_file + '\n'
+        elif not final_content_for_file: # Empty content
+            content_for_display_and_diff = "" # An empty file is just empty
+        else: # Already ends with newline
+            content_for_display_and_diff = final_content_for_file
+
+
+        if abs_path.exists() and abs_path.is_file():
+            try:
+                existing_content = abs_path.read_text(encoding='utf-8')
+                # Standardize newlines for existing content for diffing
+                if "\r\n" in existing_content: existing_content = existing_content.replace("\r\n", "\n")
+                if "\r" in existing_content: existing_content = existing_content.replace("\r", "\n")
+
+                existing_content_lines = existing_content.splitlines(keepends=True)
+                content_to_write_lines = content_for_display_and_diff.splitlines(keepends=True)
+
+                if existing_content == content_for_display_and_diff: # Check after newline standardization
+                     return f"No changes detected for '{filepath_str}'. Content is identical.", None
+
+                diff = difflib.unified_diff(
+                    existing_content_lines,
+                    content_to_write_lines,
+                    fromfile=f"a/{filepath_str}",
+                    tofile=f"b/{filepath_str}",
+                    lineterm='\n' # Important for difflib
+                )
+                diff_output = "".join(diff)
+
+                if not diff_output: # Should be caught by direct content comparison above, but as fallback:
+                    diff_output = f"--- a/{filepath_str}\n+++ b/{filepath_str}\n@@ -1 +1 @@\n-{existing_content.strip()}\n+{content_for_display_and_diff.strip()}"
+
+
+                console.print(Panel(Syntax(diff_output, "diff", theme=APP_CONFIG.get("display",{}).get("syntax_theme","monokai"), line_numbers=False, word_wrap=True),
+                                    title=f"[bold yellow]Suggested changes for {filepath_str}[/bold yellow]", border_style="yellow"))
+                if RICH_AVAILABLE:
+                    from rich.prompt import Confirm
+                    user_confirmed = Confirm.ask(f"Apply these changes to '{filepath_str}'?", default=False, console=console)
+                else:
+                    user_confirmed = input(f"Apply these changes to '{filepath_str}'? (yes/NO): ").lower() == "yes"
+
+            except Exception as e_read_diff:
+                return None, f"Error reading existing file for diff '{filepath_str}': {e_read_diff}"
+        else: # New file
+            lexer = get_lexer_for_filename(filepath_str)
+            console.print(Panel(Syntax(content_for_display_and_diff, lexer, theme=APP_CONFIG.get("display",{}).get("syntax_theme","monokai"), line_numbers=True, word_wrap=True),
+                                title=f"[bold green]Content for new file: {filepath_str}[/bold green]", border_style="green"))
+            if RICH_AVAILABLE:
+                from rich.prompt import Confirm
+                user_confirmed = Confirm.ask(f"Create new file '{filepath_str}' with this content?", default=False, console=console)
+            else:
+                user_confirmed = input(f"Create new file '{filepath_str}'? (yes/NO): ").lower() == "yes"
+
+        if user_confirmed:
+            try:
+                # Write the version that has standardized newlines and a trailing newline if content exists
+                with open(abs_path, 'w', encoding='utf-8', newline='\n') as f: # newline='\n' ensures only \n is written
+                    f.write(content_for_display_and_diff)
+
+                return f"File '{filepath_str}' written successfully.", None
+            except IOError as e:
+                return None, f"IOError writing to file '{filepath_str}': {e}"
+            except Exception as e_write:
+                return None, f"Unexpected error writing to file '{filepath_str}': {e_write}"
+        else:
+            return "Write operation cancelled by user.", None
+
+    except Exception as e:
+        console.print(f"[bold red]Unexpected error in handle_write_file_request for '{filepath_str}': {type(e).__name__} - {e}[/bold red]")
+        return None, f"An unexpected error occurred processing the write request: {type(e).__name__}"
+
 # --- Help Command ---
 def display_help_command():
     """Displays a list of available slash commands and their descriptions."""
@@ -2463,63 +2703,104 @@ def parse_duckduckgo_html_results(html_content: str, num_results: int = 5) -> li
     return results[:num_results]
 
 
-def perform_internet_search(query: str):
-    """Performs an internet search using DuckDuckGo HTML version and displays results."""
-    console.print(f"Searching the web for: \"{query}\"...", style="info")
+MAX_SEARCH_RESULTS_FOR_AGI = 3 # Max number of search results to format for AGI context
+MAX_SEARCH_SNIPPET_LENGTH_FOR_AGI = 250 # Max chars per snippet for AGI
 
+def fetch_and_parse_search_results(query: str) -> tuple[Optional[list[dict]], Optional[str]]:
+    """
+    Fetches HTML from DuckDuckGo for a query and parses it.
+
+    Returns:
+        A tuple (list_of_result_dicts, None) on success,
+        or (None, error_message_string) on failure.
+        Each result_dict contains 'title', 'snippet', 'url'.
+    """
     encoded_query = urllib.parse.quote_plus(query)
     search_url = f"https://html.duckduckgo.com/html/?q={encoded_query}"
-
-    # This is where the view_text_website tool would be called in a real agent environment
-    # For now, we'll simulate it or expect it to be available via a different mechanism
-    # if this script is run by an agent executor.
-    # Since Jules has `view_text_website`, let's assume it can be called.
-    # However, Jules' tools are not directly callable from the Python code it writes.
-    # This function needs to be structured so Jules can call its tool.
-
-    # To make this testable if run directly (and for Jules to adapt):
-    # We can use requests here for direct execution, but Jules would replace this part.
     html_content = ""
+
     try:
-        # This block is for direct execution / testing.
-        # Jules would replace this with its `view_text_website` tool call.
-        import requests
-        headers = { # Mimic a common browser to avoid simple blocks
+        import requests # Ensure requests is available
+        headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
         }
         response = requests.get(search_url, headers=headers, timeout=10)
-        response.raise_for_status() # Raise an exception for bad status codes
+        response.raise_for_status()
         html_content = response.text
-        console.print(f"Successfully fetched search results page (length: {len(html_content)} chars).", style="dim success")
     except ImportError:
-        console.print("[bold red]Error:[/bold red] The 'requests' library is needed for direct search test. Jules would use its internal tools.", style="error")
-        console.print("Please run `pip install requests` if you want to test this search directly.", style="info")
-        return
+        return None, "The 'requests' library is required for web search but is not installed."
     except requests.exceptions.RequestException as e:
-        console.print(f"[bold red]Error fetching search results:[/bold red] {e}", style="error")
-        return
-    except Exception as e: # Catch any other unexpected error
-        console.print(f"[bold red]An unexpected error occurred during web fetch:[/bold red] {e}", style="error")
-        return
+        return None, f"Network error during web search: {e}"
+    except Exception as e:
+        return None, f"An unexpected error occurred during web fetch: {e}"
 
     if not html_content:
-        console.print("No content received from search page.", style="warning")
-        return
+        return None, "No content received from search page."
 
     parsed_results = parse_duckduckgo_html_results(html_content)
-
     if not parsed_results:
-        console.print("Could not parse any search results. The page structure might have changed or no results found.", style="warning")
-        # console.print(f"[dim]Raw HTML snippet for debugging (first 1000 chars):\n{html_content[:1000]}[/dim]") # For debugging
+        return None, "Could not parse any search results from the page."
+
+    return parsed_results, None
+
+def perform_internet_search(query: str):
+    """User-facing /search command. Fetches, parses, and displays search results."""
+    console.print(f"Searching the web for: \"{query}\"...", style="info")
+
+    parsed_results, error = fetch_and_parse_search_results(query)
+
+    if error:
+        console.print(f"[bold red]Error performing search:[/bold red] {error}", style="error")
+        return
+
+    if not parsed_results: # Should be caught by error, but as a safeguard
+        console.print("No search results found or failed to parse.", style="warning")
         return
 
     console.print(f"\n[bold green]Search Results for \"{query}\":[/bold green]")
-    for i, res in enumerate(parsed_results):
+    for i, res in enumerate(parsed_results): # Show all results from parser for user command
         panel_content = Text()
-        panel_content.append(f"{i+1}. {res['title']}\n", style="bold link " + str(res['url'])) # Make URL clickable if terminal supports
+        panel_content.append(f"{i+1}. {res['title']}\n", style="bold link " + str(res['url']))
         panel_content.append(f"   {res['snippet']}\n", style="italic")
         panel_content.append(f"   Source: {res['url']}", style="dim")
         console.print(Panel(panel_content, expand=False, border_style="blue"))
+
+
+def handle_web_search_request(query: str) -> tuple[Optional[str], Optional[str]]:
+    """
+    Handles an AGI's request to search the web.
+    Fetches results, formats them into a single string for AGI context.
+    """
+    console.print(f"[dim info]AGI requested web search for: \"{query}\"[/dim info]")
+    parsed_results, error = fetch_and_parse_search_results(query)
+
+    if error:
+        return None, f"Web search failed: {error}"
+
+    if not parsed_results:
+        return "No search results found.", None # Not an error, but no results to give
+
+    # Format results for AGI
+    formatted_results_str = "Web Search Results:\n\n"
+    for i, res_dict in enumerate(parsed_results[:MAX_SEARCH_RESULTS_FOR_AGI]):
+        title = res_dict.get('title', 'N/A')
+        snippet = res_dict.get('snippet', 'N/A')
+        url = res_dict.get('url', '#')
+
+        # Truncate snippet if too long
+        if len(snippet) > MAX_SEARCH_SNIPPET_LENGTH_FOR_AGI:
+            snippet = snippet[:MAX_SEARCH_SNIPPET_LENGTH_FOR_AGI] + "..."
+
+        formatted_results_str += f"Result {i+1}:\n"
+        formatted_results_str += f"  Title: {title}\n"
+        formatted_results_str += f"  Snippet: {snippet}\n"
+        formatted_results_str += f"  URL: {url}\n\n"
+
+    if not formatted_results_str.strip() or len(parsed_results) == 0 :
+        return "No effectively formatted search results to provide.", None
+
+    return formatted_results_str.strip(), None
+
 
 # --- Command Implementations ---
 def list_directory_contents(path_str: str):
