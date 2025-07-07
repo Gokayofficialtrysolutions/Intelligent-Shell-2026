@@ -104,6 +104,12 @@ class ContextAnalyzer:
             if git_info["modified_files"] > 0:
                  context_parts.append(f"GitModified={git_info['modified_files']}")
 
+        # Add Project Root information if it's set and different from CWD
+        # (PROJECT_ROOT_PATH is resolved, cwd from get_cwd_context() might not be, so resolve it for comparison)
+        resolved_cwd = Path(cwd).resolve()
+        if PROJECT_ROOT_PATH and PROJECT_ROOT_PATH != resolved_cwd:
+            context_parts.append(f"ProjectRoot='{PROJECT_ROOT_PATH}'")
+
         if file_counts:
             file_str_parts = [f"{lang}:{count}" for lang, count in file_counts.items()]
             context_parts.append(f"Files=({', '.join(file_str_parts)})")
@@ -353,6 +359,37 @@ class SessionLogger:
 
 # Global session logger instance (will be initialized in main)
 session_logger = None
+
+# --- Project Root Detection ---
+PROJECT_ROOT_PATH: Optional[Path] = None
+
+def find_project_root(start_path: Path) -> Optional[Path]:
+    """
+    Searches upwards from start_path for project markers like .git or .agi_project_root.
+    Returns the path to the project root directory if found, otherwise None.
+    """
+    current_dir = start_path.resolve()
+    # Limit upward search to avoid going to the very root of the filesystem unnecessarily
+    # or getting stuck if home dir is not accessible in some edge cases.
+    # Max depth of 10 parent directories seems reasonable for most project structures.
+    for _ in range(10):
+        # Check for .git directory (common for git repositories)
+        git_dir = current_dir / ".git"
+        if git_dir.is_dir():
+            return current_dir
+
+        # Check for a custom marker file (e.g., if not a git repo but user wants to define scope)
+        marker_file = current_dir / ".agi_project_root"
+        if marker_file.is_file():
+            return current_dir
+
+        # Move to parent directory
+        parent_dir = current_dir.parent
+        if parent_dir == current_dir: # Reached filesystem root
+            break
+        current_dir = parent_dir
+
+    return None
 
 
 # Attempt to import PyTorch and Transformers
@@ -739,7 +776,17 @@ def detect_code_blocks(text: str) -> list:
     return parts
 
 def main():
-    global session_logger, APP_CONFIG, conversation_history, DEFAULT_GENERATION_PARAMS
+    global session_logger, APP_CONFIG, conversation_history, DEFAULT_GENERATION_PARAMS, PROJECT_ROOT_PATH
+
+    # --- Initialize Project Root ---
+    # Done early as other parts might use it (e.g. config loading from project root in future)
+    PROJECT_ROOT_PATH = find_project_root(Path.cwd())
+    if PROJECT_ROOT_PATH:
+        console.print(f"INFO: Project root detected at: [cyan]{PROJECT_ROOT_PATH}[/cyan]", style="info")
+    else:
+        PROJECT_ROOT_PATH = Path.cwd().resolve() # Fallback to current working directory
+        console.print(f"WARNING: No project root marker (.git or .agi_project_root) found. "
+                      f"Using current working directory as project scope: [cyan]{PROJECT_ROOT_PATH}[/cyan]", style="warning")
 
     # Load config first, as it affects other initializations
     load_config()
@@ -923,6 +970,8 @@ def main():
                 else:
                     console.print(f"[red]Unknown git subcommand: {git_subcommand}[/red]")
                     console.print("[info]Available git commands: status, diff [file], log [-n count][/info]")
+            elif user_input.lower() == "/help":
+                display_help_command()
             else: # Default: AGI generates a response or suggests a command
                 with console.status("[yellow]AGI is thinking...[/yellow]", spinner="dots"):
                     agi_response_text = agi_interface.generate_response(user_input)
@@ -1933,19 +1982,24 @@ def handle_read_file_request(filepath_str: str, max_lines_from_agi: Optional[int
         abs_path = (Path.cwd() / requested_path).resolve()
         cwd_resolved = Path.cwd().resolve()
 
-        # Security Validation 2: Check if the resolved path is within CWD or its subdirectories
-        # This is a basic sandboxing attempt.
-        if not str(abs_path).startswith(str(cwd_resolved)):
-             # Check if it's a sibling file/dir that's allowed (e.g. for ../file.txt)
-             # This can happen if CWD is a subdir of a project and AGI wants to access a file in parent.
-             # A more robust check would be against a defined "project_root".
-             # For now, let's allow one level up if it's still within a reasonable scope.
-             # A simple check: if path starts with '..' and after resolving, it's not going "too far up".
-             # This is tricky. `Path.is_relative_to` (Python 3.9+) is better.
-             # For now, the startswith check on resolved paths is a basic measure.
-             # If `abs_path` is not under `cwd_resolved`, it's potentially problematic.
-            return None, f"Access denied: File path '{filepath_str}' resolves outside the current working directory scope."
+        # Security Validation 2: Check if the resolved path is within the defined PROJECT_ROOT_PATH.
+        # PROJECT_ROOT_PATH is resolved at startup, so it's an absolute path.
+        if PROJECT_ROOT_PATH is None: # Should not happen if main() initializes it correctly
+             console.print("[bold red]CRITICAL: PROJECT_ROOT_PATH is not set. File access denied for safety.[/bold red]")
+             return None, "Project scope is not defined. Cannot read file."
 
+        # Ensure abs_path is within the project root.
+        # Using str.startswith for broader Python version compatibility (Path.is_relative_to is Py3.9+)
+        if not str(abs_path).startswith(str(PROJECT_ROOT_PATH)):
+            # Also check if PROJECT_ROOT_PATH itself is a parent of abs_path,
+            # which means abs_path is project_root/some/path.
+            # The check `str(abs_path).startswith(str(PROJECT_ROOT_PATH))` correctly handles this.
+            # However, if abs_path IS PROJECT_ROOT_PATH, it should also be allowed.
+            # The startswith check covers this too.
+            # The only edge case is if PROJECT_ROOT_PATH is /foo and abs_path is /foobar - this would pass.
+            # To be more robust: check that abs_path starts with PROJECT_ROOT_PATH AND the next char is '/' or it's identical.
+            if abs_path != PROJECT_ROOT_PATH and not str(abs_path).startswith(str(PROJECT_ROOT_PATH) + os.sep):
+                 return None, f"Access denied: File path '{filepath_str}' resolves to '{abs_path}', which is outside the defined project root '{PROJECT_ROOT_PATH}'."
 
         if not abs_path.exists():
             return None, f"File not found at resolved path: {abs_path}"
@@ -2001,6 +2055,43 @@ def handle_read_file_request(filepath_str: str, max_lines_from_agi: Optional[int
         console.print(f"[bold red]Unexpected error in handle_read_file_request for '{filepath_str}': {type(e).__name__} - {e}[/bold red]")
         return None, f"An unexpected error occurred while trying to read file: {type(e).__name__}"
 
+# --- Help Command ---
+def display_help_command():
+    """Displays a list of available slash commands and their descriptions."""
+    help_table = Table(title="[bold green]AGI Terminal Help - Available Commands[/bold green]", show_lines=True)
+    help_table.add_column("Command", style="bold cyan", min_width=20)
+    help_table.add_column("Parameters", style="yellow", min_width=25)
+    help_table.add_column("Description", style="white", max_width=70)
+
+    commands = [
+        ("/help", "", "Displays this help message."),
+        ("/ls", "[path]", "Lists directory contents. Defaults to current directory."),
+        ("/cd", "<path>", "Changes the current working directory."),
+        ("/cwd", "", "Shows the current working directory."),
+        ("/mkdir", "<directory_name>", "Creates a new directory."),
+        ("/rm", "<path>", "Removes a file or directory (confirms before deleting)."),
+        ("/cp", "<source> <destination>", "Copies a file or directory."),
+        ("/mv", "<source> <destination>", "Moves or renames a file or directory."),
+        ("/cat", "<file_path>", "Displays file content with syntax highlighting. Offers AGI summary for large files."),
+        ("/edit", "<file_path>", "Opens a file with the system's default editor (or $EDITOR)."),
+        ("/read_script", "<script_filename>", "Displays content of whitelisted project scripts (e.g., interactive_agi.py)."),
+        ("/config", "show | get <key> | set <key> <value>", "Manages application configuration. Shows current, gets a key, or sets a key's value."),
+        ("/git", "status | diff [file] | log [-n count]", "Executes git commands: status, diff (optionally for a file or staged), or log (optionally with count)."),
+        ("/search", "<query>", "Performs an internet search using DuckDuckGo (HTML version)."),
+        ("/history", "", "Displays the conversation history for the current session."),
+        ("/clear", "", "Clears the terminal screen and re-displays the startup banner."),
+        ("/sysinfo", "", "Displays system information (OS, Python, CPU, Memory, Disk)."),
+        ("/set parameter", "<NAME> <VALUE>", "Sets an AGI generation parameter (e.g., MAX_TOKENS, TEMPERATURE)."),
+        ("/show parameters", "", "Shows current AGI generation parameters."),
+        ("/analyze_dir", "[path]", "Asks AGI to analyze directory structure and provide a JSON summary. Defaults to current directory."),
+        ("/suggest_code_change", "<file_path>", "Asks AGI to suggest code changes for a whitelisted file based on user description."),
+        ("exit / quit", "", "Exits the AGI terminal session.")
+    ]
+
+    for cmd, params, desc in commands:
+        help_table.add_row(cmd, params, desc)
+
+    console.print(help_table)
 
 # --- File Content Interaction Commands ---
 MAX_CAT_LINES = 200 # Lines to display for large files before asking to summarize
