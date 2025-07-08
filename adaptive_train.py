@@ -103,13 +103,37 @@ def parse_arguments():
     parser.add_argument(
         "--use_qlora", action="store_true", help="Enable QLoRA (4-bit quantization) for training."
     )
+    # log_count and log_days were removed as JSONL processing is different. Filtering can be added later.
     parser.add_argument(
-        "--log_count", type=int, default=None, help="Process only the last N interaction log files."
+        "--lora_target_modules",
+        type=str,
+        default="q_proj,v_proj,k_proj,o_proj,gate_proj,up_proj,down_proj", # Common Llama-like modules
+        help="Comma-separated list of module names to target with LoRA (e.g., 'q_proj,v_proj')."
     )
     parser.add_argument(
-        "--log_days", type=int, default=None, help="Process logs from the last D days."
+        "--optimizer",
+        type=str,
+        default="adamw_torch", # Changed from adamw_hf, paged_adamw_8bit can be chosen for QLoRA
+        help="Optimizer to use (e.g., 'adamw_hf', 'adamw_torch', 'paged_adamw_8bit', 'adafactor')."
     )
-    # Add more training arguments as needed (e.g., weight_decay, lr_scheduler_type)
+    parser.add_argument(
+        "--lr_scheduler_type",
+        type=str,
+        default="linear",
+        help="Learning rate scheduler type (e.g., 'linear', 'cosine', 'constant', 'constant_with_warmup')."
+    )
+    parser.add_argument(
+        "--warmup_steps",
+        type=int,
+        default=0, # Default to 0 if not specified, common for some schedulers
+        help="Number of warmup steps for the learning rate scheduler."
+    )
+    parser.add_argument(
+        "--weight_decay",
+        type=float,
+        default=0.0,
+        help="Weight decay to apply (if not using an optimizer that handles it like AdamW)."
+    )
     return parser.parse_args()
 
 # --- Helper functions for formatting JSONL data for prompt ---
@@ -511,15 +535,21 @@ def main():
         return
 
     # --- 2. Configure PEFT (LoRA) ---
-    target_modules = ["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"] # Common for Llama-like
+    # Parse lora_target_modules string into a list
+    if args.lora_target_modules:
+        parsed_target_modules = [m.strip() for m in args.lora_target_modules.split(',') if m.strip()]
+    else: # Should not happen if default is set, but as a fallback
+        parsed_target_modules = ["q_proj", "v_proj"] # Minimal default
+
     console.print(f"[info]Configuring LoRA with r={args.lora_r}, alpha={args.lora_alpha}, dropout={args.lora_dropout}[/info]")
-    console.print(f"[info]Attempting to target modules for LoRA (common Llama-like modules): {target_modules}.[/info]")
-    console.print("[warning]If training fails around PEFT model configuration, these target_modules might need adjustment for your specific merged model architecture.[/warning]")
+    console.print(f"[info]Targeting LoRA modules: {parsed_target_modules}[/info]")
+    if not parsed_target_modules:
+        console.print("[warning]No LoRA target modules specified. LoRA may not be effective.[/warning]")
 
     lora_config = LoraConfig(
         r=args.lora_r,
         lora_alpha=args.lora_alpha,
-        target_modules=target_modules, # Adjust based on the actual model architecture
+        target_modules=parsed_target_modules,
         lora_dropout=args.lora_dropout,
         bias="none", # Typically 'none' for LoRA
         task_type=TaskType.CAUSAL_LM,
@@ -598,14 +628,18 @@ def main():
         learning_rate=args.learning_rate,
         logging_steps=10, # Log every N steps
         save_strategy="epoch", # Save checkpoint every epoch
-        # report_to="tensorboard", # Or "wandb", "none"
         fp16=not args.use_qlora,  # Use fp16 if not using QLoRA (which uses its own dtype)
-        bf16=args.use_qlora, # QLoRA often paired with bf16 compute_dtype
-        # Add other arguments like weight_decay, lr_scheduler_type, warmup_steps etc.
-        # optim="paged_adamw_8bit" if args.use_qlora else "adamw_hf", # QLoRA often uses paged optimizers
+        bf16=args.use_qlora and torch.cuda.is_bf16_supported(), # QLoRA often paired with bf16 compute_dtype, check support
+        optim=args.optimizer,
+        lr_scheduler_type=args.lr_scheduler_type,
+        warmup_steps=args.warmup_steps,
+        weight_decay=args.weight_decay,
+        # report_to="tensorboard", # Or "wandb", "none"
         disable_tqdm=RICH_AVAILABLE, # Disable default tqdm if Rich progress is used
         logging_dir=f"{args.output_dir}/logs", # Store training logs
     )
+    if args.use_qlora and not torch.cuda.is_bf16_supported() and args.optimizer == "paged_adamw_8bit":
+        console.print("[warning]BF16 is not supported on this GPU, but QLoRA setup might ideally use it. Training will proceed with default dtype for QLoRA compute (often float16). Consider if 'paged_adamw_8bit' is still appropriate or if another optimizer like 'adamw_torch' should be used.[/warning]")
 
     # --- 5. Initialize Trainer ---
     console.print("[info]Initializing Trainer...[/info]")

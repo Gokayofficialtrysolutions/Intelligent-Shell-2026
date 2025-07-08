@@ -269,6 +269,9 @@ DEFAULT_CONFIG = {
         "desktop_logging_enabled": True,
         "desktop_log_path_override": "", # Empty means use default desktop path
         "jsonl_logging_enabled": True, # New setting for JSONL interaction logs
+    },
+    "model": { # New section for model related configurations
+        "merged_model_path": "./merged_model" # Default path for the main model
     }
 }
 APP_CONFIG = {} # Will be loaded from file or defaults
@@ -484,8 +487,11 @@ DEFAULT_GENERATION_PARAMS = {
 }
 
 class MergedAGI:
-    def __init__(self, model_path_str="./merged_model"):
-        self.model_path = Path(model_path_str)
+    def __init__(self): # model_path_str argument removed
+        # Determine model path from config, with a fallback to default
+        configured_model_path = APP_CONFIG.get("model", {}).get("merged_model_path", "./merged_model")
+        self.model_path = Path(configured_model_path).resolve() # Resolve to absolute path early
+
         self.tokenizer = None
         self.model = None
         self.device = "cpu"
@@ -976,25 +982,29 @@ def main():
     display_startup_banner() # Uses APP_CONFIG for syntax_theme implicitly via console
     console.print("Initializing AGI System (Interactive Mode)...", style="info")
 
-    agi_interface = MergedAGI(model_path_str="./merged_model")
+    agi_interface = MergedAGI() # No longer pass model_path_str
 
     if not agi_interface.is_model_loaded:
         console.print("INFO: MergedAGI could not load the model. Falling back to AGIPPlaceholder.", style="warning")
-        if not agi_interface.model_path.exists() or not any(agi_interface.model_path.iterdir()):
+        # agi_interface.model_path is now the resolved path from config or default
+        model_path_for_error_msg = agi_interface.model_path
+        if not model_path_for_error_msg.exists() or not any(model_path_for_error_msg.iterdir()):
             msg = Text()
-            msg.append("\n---\nIMPORTANT: The './merged_model' directory, expected to contain the AI model,\n", style="bold yellow")
-            msg.append("is missing or empty. This script will use MOCK responses.\n", style="yellow")
-            msg.append("To enable actual AI responses:\n", style="yellow")
-            msg.append("  1. Ensure you have run './download_models.sh' (or `python setup_agi_terminal.py`) successfully.\n")
-            msg.append("  2. Configure 'merge_config.yml' with the correct model paths (if not using setup script).\n")
-            msg.append("  3. Run mergekit: 'mergekit-yaml merge_config.yml ./merged_model'\n---")
+            msg.append(f"\n---\nIMPORTANT: The model directory '{model_path_for_error_msg}',\n", style="bold yellow")
+            msg.append("expected to contain the AI model, is missing or empty.\n", style="yellow")
+            msg.append("This script will use MOCK responses.\nTo enable actual AI responses:\n", style="yellow")
+            msg.append("  1. Ensure models are downloaded (e.g., via `setup_agi_terminal.py`).\n")
+            msg.append(f"  2. Ensure 'merge_config.yml' (if used) points to correct downloaded models and mergekit output is at '{model_path_for_error_msg}'.\n")
+            msg.append(f"  3. OR, update 'merged_model_path' in '{CONFIG_FILE_PATH.name}' (in {CONFIG_FILE_PATH.parent}) to your model's location.\n---")
             console.print(Panel(msg, title="[bold red]Model Not Found[/bold red]", border_style="red"))
-        agi_interface = AGIPPlaceholder(model_path_str="./merged_model")
+
+        # AGIPPlaceholder doesn't actually use the path, but pass it for consistency if it ever did
+        agi_interface = AGIPPlaceholder(model_path_str=str(model_path_for_error_msg))
         terminal_mode = "[bold yellow]Mock Mode[/bold yellow]"
     else:
         terminal_mode = "[bold green]Merged Model Mode[/bold green]"
 
-    console.print(f"\nAGI Interactive Terminal ({terminal_mode})")
+    console.print(f"\nAGI Interactive Terminal ({terminal_mode}) - Model: {agi_interface.model_path}")
     console.print("Type '/set parameter <NAME> <VALUE>' to change generation settings (e.g., /set parameter MAX_TOKENS 512).")
     console.print("Type '/show parameters' to see current settings.")
     console.print("Type 'exit', 'quit', or press Ctrl+D to end.")
@@ -1193,6 +1203,8 @@ def process_single_input_turn(user_input_str: str,
                             scripts[script_name] = commands_list
                             save_user_scripts(scripts)
                             console.print(f"[green]Script '{script_name}' saved with {len(commands_list)} command(s).[/green]")
+            elif user_input_str.lower() == "/list_models": # New command
+                display_list_models_command()
             elif user_input_str.lower().startswith("/run_script "):
                 parts = user_input_str.strip().split(maxsplit=1)
                 if len(parts) < 2 or not parts[1].strip():
@@ -3027,6 +3039,54 @@ def handle_write_file_request(filepath_str: str, content_to_write: str) -> tuple
         console.print(f"[bold red]Unexpected error in handle_write_file_request for '{filepath_str}': {type(e).__name__} - {e}[/bold red]")
         return None, f"An unexpected error occurred processing the write request: {type(e).__name__}"
 
+# --- Model & Adapter Listing ---
+DEFAULT_ADAPTERS_DIR = Path("./merged_model_adapters") # Consistent with adaptive_train.py default output
+
+def display_list_models_command():
+    """Displays available local models and adapter sets."""
+    table = Table(title="[bold blue]Local Model and Adapter Status[/bold blue]", show_lines=True)
+    table.add_column("Type", style="cyan", no_wrap=True)
+    table.add_column("Path / Name", style="white")
+    table.add_column("Status", style="green")
+
+    # 1. Main Merged Model
+    configured_model_path_str = APP_CONFIG.get("model", {}).get("merged_model_path", "./merged_model")
+    main_model_path = Path(configured_model_path_str).resolve()
+
+    model_status = ""
+    if main_model_path.exists() and main_model_path.is_dir():
+        if (main_model_path / "config.json").is_file() or \
+           (main_model_path / "model.safetensors").is_file() or \
+           (main_model_path / "pytorch_model.bin").is_file():
+            model_status = "[green]Found, Appears Valid[/green]"
+        else:
+            model_status = "[yellow]Found, but may not be a valid model (missing key files)[/yellow]"
+    else:
+        model_status = "[red]Not Found[/red]"
+    table.add_row("Base Model Path (configured)", str(main_model_path), Text.from_markup(model_status))
+
+    # 2. PEFT Adapters
+    adapters_dir_to_check = DEFAULT_ADAPTERS_DIR.resolve()
+    if adapters_dir_to_check.exists() and adapters_dir_to_check.is_dir():
+        found_adapters = False
+        for item in sorted(adapters_dir_to_check.iterdir()):
+            if item.is_dir(): # Each subdirectory is potentially an adapter set
+                # Check for common adapter files
+                if (item / "adapter_config.json").is_file() and \
+                   ((item / "adapter_model.bin").is_file() or (item / "adapter_model.safetensors").is_file()):
+                    adapter_status = "[green]Found, Appears Valid[/green]"
+                else:
+                    adapter_status = "[yellow]Found, but may not be a valid adapter set (missing key files)[/yellow]"
+                table.add_row("Adapter Set", str(item.relative_to(Path.cwd())), Text.from_markup(adapter_status)) # Show relative path for brevity
+                found_adapters = True
+        if not found_adapters:
+            table.add_row("Adapter Sets", str(adapters_dir_to_check), "[yellow]Directory exists, but no adapter subdirectories found/valid.[/yellow]")
+    else:
+        table.add_row("Adapter Sets Path", str(adapters_dir_to_check), "[dim]Default adapter directory not found.[/dim]")
+
+    console.print(table)
+
+
 def handle_git_branch_create_request(branch_name: str, base_branch: Optional[str]) -> tuple[Optional[str], Optional[str]]:
     """
     Handles an AGI's request to create a new Git branch, after user confirmation.
@@ -3595,6 +3655,7 @@ def display_help_command():
         ("/show parameters", "", "Shows current AGI generation parameters."),
         ("/analyze_dir", "[path]", "Asks AGI to analyze directory structure and provide a JSON summary. Defaults to current directory."),
         ("/suggest_code_change", "<file_path>", "Asks AGI to suggest code changes for a whitelisted file based on user description."),
+        ("/list_models", "", "Lists the configured base model path and found local adapter sets."),
         ("exit / quit", "", "Exits the AGI terminal session.")
     ]
 
