@@ -381,6 +381,29 @@ class SessionLogger:
 # Global session logger instance (will be initialized in main)
 session_logger = None
 
+# --- User Command Scripts (Macros) ---
+USER_SCRIPTS_FILE_PATH = CACHE_DIR / "user_scripts.json"
+
+def load_user_scripts() -> dict:
+    """Loads user-defined command scripts from the JSON file."""
+    if USER_SCRIPTS_FILE_PATH.exists():
+        try:
+            with open(USER_SCRIPTS_FILE_PATH, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError) as e:
+            console.print(f"[warning]Error loading user scripts from {USER_SCRIPTS_FILE_PATH}: {e}[/warning]")
+    return {}
+
+def save_user_scripts(scripts: dict):
+    """Saves the user-defined command scripts to the JSON file."""
+    try:
+        USER_SCRIPTS_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(USER_SCRIPTS_FILE_PATH, 'w', encoding='utf-8') as f:
+            json.dump(scripts, f, indent=2)
+    except IOError as e:
+        console.print(f"[error]Could not save user scripts to {USER_SCRIPTS_FILE_PATH}: {e}[/error]")
+
+
 # --- JSONL Interaction Logging ---
 JSONL_LOG_FILE_PATH = CACHE_DIR / "interaction_logs.jsonl"
 JSONL_LOGGING_ENABLED = True # Will be updated from config
@@ -724,6 +747,11 @@ class MergedAGI:
                     "- If appropriate, ask the user for clarification (e.g., \"The file you specified was not found, could you please check the path?\" or \"The command resulted in an error, perhaps try a different approach?\").\n"
                     "- If a user's request is too ambiguous for you to confidently choose a tool or its parameters, ask for clarification BEFORE attempting to use a tool.\n"
                     "- Your primary goal is to be a helpful and coherent assistant. Use the information from tool outcomes (both success and failure) to inform your final response to the user for that turn.\n"
+                    "- For complex user requests that require multiple operations (e.g., reading several files, processing data, then writing a result):\n"
+                    "    - Briefly outline your plan in your reasoning for the first tool call, or in a natural language response if you need to clarify the overall goal with the user first.\n"
+                    "    - Request tools one at a time.\n"
+                    "    - After the system provides the outcome of a tool action, carefully consider that outcome to decide your next step. This might be another tool call (the next part of your plan) or generating the final answer.\n"
+                    "    - If a step in your plan fails, inform the user about the failure and why your overall plan might be affected or needs to change.\n"
                     "\n"
                     "If the query cannot be answered with one of these tools ('run_shell', 'read_file', 'write_file', 'web_search', 'git_branch_create', 'git_checkout', 'execute_python_code', 'git_commit', 'git_push'), or if it requires actions not supported, answer directly as a helpful assistant without using the JSON format.\n"
                     "Choose only ONE action per turn if you decide to use a tool. Do not combine them in one JSON response.\n"
@@ -973,48 +1001,62 @@ def main():
     console.print("Press Ctrl+C for forceful interruption.")
     console.print("-" * console.width)
 
-    global TURN_ID_COUNTER
-    try:
-        while True:
-            TURN_ID_COUNTER += 1
-            current_turn_interaction_data = {
-                "session_id": SESSION_ID,
-                "turn_id": TURN_ID_COUNTER,
-                "timestamp_user_query": datetime.now().isoformat(),
-                "tool_interactions": [], # Initialize as empty list
-            }
+    # --- Main Input Processing Function ---
+def process_single_input_turn(user_input_str: str,
+                              agi_interface_instance: Union[MergedAGI, AGIPPlaceholder],
+                              turn_log_data_ref: dict,
+                              is_scripted_input: bool = False) -> str: # Returns "CONTINUE" or "EXIT"
+    """
+    Processes a single input string as one turn of interaction.
+    This function contains the main logic for handling user slash commands or
+    sending input to the AGI, including tool processing and logging.
+    It's called by the main loop and by the /run_script command.
 
-            try:
-                user_input = console.input("[prompt]You: [/prompt]")
-                current_turn_interaction_data["user_query"] = user_input
-            except EOFError:
-                console.print("\nExiting (EOF detected)...", style="info")
-                break
-            except KeyboardInterrupt:
-                console.print("\nKeyboardInterrupt: Type 'exit' or Ctrl+D to quit, or press Ctrl-C again to force exit.", style="warning")
-                try: # Second Ctrl-C to force exit
-                    console.input("") # Dummy input to catch second Ctrl-C
-                except KeyboardInterrupt:
-                    console.print("\nForcing exit...", style="error")
-                    break
-                continue
+    Args:
+        user_input_str: The input string to process.
+        agi_interface_instance: The active AGI interface.
+        turn_log_data_ref: Reference to the dictionary for logging this turn's data.
+        is_scripted_input: True if this input comes from a /run_script command.
 
+    Returns:
+        "CONTINUE" if the terminal should continue to the next input.
+        "EXIT" if an 'exit' or 'quit' command was processed.
+    """
+    global final_text_for_user_display # To ensure it's assigned if an early exit happens
+    final_text_for_user_display = "" # Reset for the turn
 
-            if user_input.strip().lower() in ["exit", "quit"]:
-                console.print("Exiting AGI session.", style="info")
-                break
+    # Log the raw user query for this turn (already set by main loop or /run_script)
+    # turn_log_data_ref["user_query"] = user_input_str
+    # turn_log_data_ref["timestamp_user_query"] = datetime.now().isoformat() (also set by caller)
 
-            if not user_input.strip():
-                continue
+    if user_input_str.strip().lower() in ["exit", "quit"]:
+        console.print("Exiting AGI session.", style="info")
+        # For JSONL logging, we might want to log this exit action.
+        turn_log_data_ref["agi_final_response_to_user"] = "User initiated exit."
+        turn_log_data_ref["timestamp_final_response"] = datetime.now().isoformat()
+        log_interaction_to_jsonl(turn_log_data_ref)
+        return "EXIT"
 
-            # Add user input to history before processing
-            conversation_history.append({"role": "user", "content": user_input, "timestamp": datetime.now().isoformat()})
-            if session_logger:
-                session_logger.log_entry("User", user_input)
+    if not user_input_str.strip():
+        return "CONTINUE" # Skip empty inputs
 
-            if user_input.lower().startswith("/set parameter "):
-                parts = user_input.strip().split(maxsplit=3)
-                if len(parts) == 4:
+    # Add user input to internal conversation history and plain text session log
+    # This happens regardless of whether it's a command or AGI query.
+    conversation_history.append({"role": "user", "content": user_input_str, "timestamp": datetime.now().isoformat()})
+    if session_logger and not is_scripted_input: # Avoid double logging from /run_script's own print
+        session_logger.log_entry("User", user_input_str)
+
+    # Default assumption: action_taken_by_tool_framework will be false unless a tool is successfully parsed and handled.
+    action_taken_by_tool_framework = False
+
+    # --- User Command Processing ---
+    # This large if/elif block handles slash commands.
+    # If a command is handled, it typically prints its own output and this function will return "CONTINUE".
+    # If no slash command matches, it falls through to the 'else' which processes input via AGI.
+
+    if user_input_str.lower().startswith("/set parameter "):
+        parts = user_input_str.strip().split(maxsplit=3)
+        if len(parts) == 4:
                     _, _, param_name, param_value = parts
                     response = agi_interface.set_parameter(param_name, param_value)
                     console.print(f"AGI System: {response}")
@@ -1130,6 +1172,113 @@ def main():
                 # For simplicity in this step, we'll focus on interactions that go to the AGI.
                 # So, if a command is handled here, it bypasses the main AGI JSONL logging for the turn.
                 # This could be refined later if needed. A simple log_interaction_to_jsonl call could be made here too.
+            elif user_input.lower().startswith("/save_script "):
+                parts = user_input.strip().split(maxsplit=2)
+                if len(parts) < 3:
+                    console.print("[red]Usage: /save_script <script_name> <command1> ; <command2> ; ...[/red]")
+                else:
+                    script_name = parts[1]
+                    commands_str = parts[2]
+                    # Basic script name validation
+                    if not re.match(r"^[a-zA-Z0-9_-]+$", script_name):
+                        console.print(f"[red]Invalid script name: '{script_name}'. Use alphanumeric characters, underscores, or hyphens.[/red]")
+                    elif not commands_str.strip():
+                        console.print(f"[red]Cannot save an empty script for '{script_name}'.[/red]")
+                    else:
+                        commands_list = [cmd.strip() for cmd in commands_str.split(';') if cmd.strip()]
+                        if not commands_list:
+                             console.print(f"[red]No valid commands found in script string for '{script_name}'. Use ';' to separate commands.[/red]")
+                        else:
+                            scripts = load_user_scripts()
+                            scripts[script_name] = commands_list
+                            save_user_scripts(scripts)
+                            console.print(f"[green]Script '{script_name}' saved with {len(commands_list)} command(s).[/green]")
+            elif user_input_str.lower().startswith("/run_script "):
+                parts = user_input_str.strip().split(maxsplit=1)
+                if len(parts) < 2 or not parts[1].strip():
+                    console.print("[red]Usage: /run_script <script_name>[/red]")
+                else:
+                    script_name_to_run = parts[1].strip()
+                    scripts = load_user_scripts()
+                    if script_name_to_run not in scripts:
+                        console.print(f"[yellow]Script '{script_name_to_run}' not found.[/yellow]")
+                    else:
+                        console.print(f"[info]Running script: '{script_name_to_run}'...[/info]")
+                        script_commands = scripts[script_name_to_run]
+                        for i, command_str in enumerate(script_commands):
+                            console.print(f"\n[magenta]--- Script '{script_name_to_run}' Command {i+1}/{len(script_commands)} ---[/magenta]")
+                            console.print(f"[dim]Executing: [/dim][bold cyan]{command_str}[/bold cyan]")
+
+                            action = ""
+                            if RICH_AVAILABLE: # More controlled input if Rich is available
+                                action_prompt = Text.assemble(
+                                    ("Press ", "magenta"), ("ENTER", "bold white"), (" to execute, ", "magenta"),
+                                    ("S", "bold white"), (" to skip, ", "magenta"),
+                                    ("A", "bold white"), (" to abort script: ", "magenta")
+                                )
+                                user_choice = console.input(action_prompt).lower().strip()
+                            else: # Basic input
+                                user_choice = input("Press ENTER to execute, S to skip, A to abort script: ").lower().strip()
+
+                            if user_choice == 's':
+                                console.print("[yellow]Skipped.[/yellow]")
+                                continue
+                            elif user_choice == 'a':
+                                console.print("[yellow]Script aborted by user.[/yellow]")
+                                break
+                            elif user_choice == "": # Enter pressed
+                                global TURN_ID_COUNTER # Need to modify global counter
+                                TURN_ID_COUNTER +=1
+                                script_turn_data = {
+                                    "session_id": SESSION_ID, # Use global session ID
+                                    "turn_id": TURN_ID_COUNTER,
+                                    "timestamp_user_query": datetime.now().isoformat(),
+                                    "user_query": command_str, # The command from the script
+                                    "tool_interactions": [],
+                                    "script_info": {"parent_script": script_name_to_run, "command_index": i}
+                                }
+                                # Call the main processing function for this command
+                                # is_scripted_input=True prevents double logging of user input to session_logger
+                                status = process_single_input_turn(command_str, agi_interface_instance, script_turn_data, is_scripted_input=True)
+                                if status == "EXIT": # If the scripted command was 'exit' or 'quit'
+                                    console.print(f"[yellow]Script '{script_name_to_run}' encountered an exit command. Script terminated.[/yellow]")
+                                    # We need to decide if 'exit' in a script exits the whole app or just the script.
+                                    # For now, let's make it terminate the script only. The main loop will continue.
+                                    # If we wanted it to exit the app, this function would need to propagate "EXIT"
+                                    break
+                            else:
+                                console.print("[yellow]Invalid choice. Skipping command.[/yellow]")
+                                continue
+                        else: # For loop completed without break
+                            console.print(f"[info]Script '{script_name_to_run}' finished.[/info]")
+            elif user_input.lower() == "/list_scripts":
+                scripts = load_user_scripts()
+                if not scripts:
+                    console.print("[yellow]No user scripts saved yet. Use /save_script to create one.[/yellow]")
+                else:
+                    table = Table(title="[bold blue]Saved User Scripts[/bold blue]")
+                    table.add_column("Script Name", style="cyan", no_wrap=True)
+                    table.add_column("# Commands", style="magenta", justify="right")
+                    table.add_column("Commands (first few shown)", style="white")
+                    for name, cmds in sorted(scripts.items()):
+                        cmds_preview = " ; ".join(cmds[:3])
+                        if len(cmds) > 3:
+                            cmds_preview += " ; ..."
+                        table.add_row(name, str(len(cmds)), cmds_preview)
+                    console.print(table)
+            elif user_input.lower().startswith("/delete_script "):
+                parts = user_input.strip().split(maxsplit=1)
+                if len(parts) < 2 or not parts[1].strip():
+                    console.print("[red]Usage: /delete_script <script_name>[/red]")
+                else:
+                    script_name_to_delete = parts[1].strip()
+                    scripts = load_user_scripts()
+                    if script_name_to_delete in scripts:
+                        del scripts[script_name_to_delete]
+                        save_user_scripts(scripts)
+                        console.print(f"[green]Script '{script_name_to_delete}' deleted.[/green]")
+                    else:
+                        console.print(f"[yellow]Script '{script_name_to_delete}' not found.[/yellow]")
             elif user_input.lower().startswith("/suggest_code_change "): # New handler
                 file_path_to_suggest = user_input[len("/suggest_code_change "):].strip()
                 if file_path_to_suggest:
@@ -1203,14 +1352,19 @@ def main():
                             }
 
                             if confirmed:
-                                # Note: execute_shell_command prints output directly. For logging, we'd ideally capture it.
-                                # For now, the log will just note execution. A more advanced setup might return output.
-                                execute_shell_command(command_executable, command_args_list)
-                                tool_interaction_log_entry["tool_outcome_summary"] = f"Command '{command_to_display}' executed by user."
-                                # Since shell output is directly displayed and not fed back to AGI for this tool,
-                                # there's no distinct "context_for_next_agi_step" or "agi_secondary_raw_response" here.
-                                # The AGI's initial response (the tool request) is its only contribution this turn for this path.
-                                final_text_for_user_display = f"System: Executed command '{command_to_display}' as per AGI suggestion." # Or silent
+                                stdout_s, stderr_s, retcode = execute_shell_command(command_executable, command_args_list)
+                                outcome_parts = []
+                                if stdout_s and stdout_s.strip(): outcome_parts.append(f"Stdout: {stdout_s.strip()}")
+                                if stderr_s and stderr_s.strip(): outcome_parts.append(f"Stderr: {stderr_s.strip()}")
+                                if not outcome_parts and retcode == 0 : outcome_parts.append("Command executed with no output.")
+                                elif not outcome_parts and retcode !=0 : outcome_parts.append(f"Command failed with return code {retcode} and no output.")
+
+                                tool_outcome_summary = f"ReturnCode: {retcode}\n" + "\n".join(outcome_parts)
+                                # Truncate for log if very long
+                                if len(tool_outcome_summary) > 500:
+                                    tool_outcome_summary = tool_outcome_summary[:497] + "..."
+                                tool_interaction_log_entry["tool_outcome_summary"] = tool_outcome_summary
+                                final_text_for_user_display = f"System: Executed command '{command_to_display}'. Output was printed above."
                             else:
                                 console.print("Command execution cancelled by user.", style="yellow")
                                 if session_logger: session_logger.log_entry("System", f"Cancelled execution of: {command_to_display}")
@@ -1219,7 +1373,7 @@ def main():
 
                             tool_interaction_log_entry["tool_outcome_timestamp"] = datetime.now().isoformat()
                             current_turn_interaction_data["tool_interactions"].append(tool_interaction_log_entry)
-                            action_taken_by_tool_framework = True # Mark that a tool path was taken
+                            action_completed = True
 
                         elif command_executable: # Command suggested but not whitelisted
                             command_to_display = f"{command_executable} {' '.join(command_args_list)}"
@@ -1896,11 +2050,13 @@ def suggest_code_change_command(file_path_str: str, agi_interface: MergedAGI):
 def execute_shell_command(command_executable: str, command_args: list[str]):
     """
     Executes a whitelisted shell command with arguments using shell=False.
+    Prints the output directly to the console and returns captured stdout/stderr.
     """
     if command_executable not in SHELL_COMMAND_WHITELIST:
-        console.print(f"[bold red]Error: Command '{command_executable}' is not in the allowed list of safe commands.[/bold red]")
+        msg = f"Error: Command '{command_executable}' is not in the allowed list of safe commands."
+        console.print(f"[bold red]{msg}[/bold red]")
         if session_logger: session_logger.log_entry("System", f"Denied execution (not whitelisted): {command_executable} {' '.join(command_args)}")
-        return
+        return None, msg, -1 # stdout, stderr, returncode
 
     full_command_list = [command_executable] + command_args
     command_to_display = f"{command_executable} {' '.join(command_args)}" # For display purposes
@@ -1939,19 +2095,28 @@ def execute_shell_command(command_executable: str, command_args: list[str]):
                 f"Stderr: {process.stderr.strip()}"
             )
             session_logger.log_entry("System", log_message)
+        return process.stdout, process.stderr, process.returncode
 
     except FileNotFoundError: # command_executable not found
-        console.print(f"[red]Error: Command '{command_executable}' not found. Is it installed and in PATH?[/red]")
+        err_msg = f"Error: Command '{command_executable}' not found. Is it installed and in PATH?"
+        console.print(f"[red]{err_msg}[/red]")
         if session_logger: session_logger.log_entry("System", f"Command not found: {command_to_display}")
+        return None, err_msg, -1
     except subprocess.TimeoutExpired:
-        console.print(f"[red]Error: Command '{command_to_display}' timed out.[/red]")
+        err_msg = f"Error: Command '{command_to_display}' timed out."
+        console.print(f"[red]{err_msg}[/red]")
         if session_logger: session_logger.log_entry("System", f"Command timed out: {command_to_display}")
+        return None, err_msg, -1
     except PermissionError: # Should be less common with shell=False for the command itself
-        console.print(f"[red]Error: Permission denied when trying to execute '{command_to_display}'.[/red]")
+        err_msg = f"Error: Permission denied when trying to execute '{command_to_display}'."
+        console.print(f"[red]{err_msg}[/red]")
         if session_logger: session_logger.log_entry("System", f"Permission error executing: {command_to_display}")
+        return None, err_msg, -1
     except Exception as e:
-        console.print(f"[red]Error executing command '{command_to_display}': {type(e).__name__} - {e}[/red]")
+        err_msg = f"Error executing command '{command_to_display}': {type(e).__name__} - {e}"
+        console.print(f"[red]{err_msg}[/red]")
         if session_logger: session_logger.log_entry("System", f"Error executing {command_to_display}: {e}")
+        return None, err_msg, -1
 
 # --- Command Implementations ---
 def create_directory_command(path_str: str):
