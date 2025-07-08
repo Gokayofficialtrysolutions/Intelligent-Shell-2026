@@ -677,7 +677,29 @@ class MergedAGI:
                     "- Example (checkout existing): {\"action\": \"git_checkout\", \"branch_name\": \"main\", \"create_new\": false, \"reasoning\": \"Switch to the main branch.\"}\n"
                     "- Example (create and checkout new): {\"action\": \"git_checkout\", \"branch_name\": \"bugfix/login-issue\", \"create_new\": true, \"reasoning\": \"Create and switch to a new branch for fixing the login issue.\"}\n"
                     "\n"
-                    "If the query cannot be answered with one of these tools ('run_shell', 'read_file', 'write_file', 'web_search', 'git_branch_create', 'git_checkout'), or if it requires actions not supported, answer directly as a helpful assistant without using the JSON format.\n"
+                    "To request execution of a Python code snippet, use:\n"
+                    "{\n"
+                    "  \"action\": \"execute_python_code\",\n"
+                    "  \"code\": \"<python_code_snippet_as_a_string>\",\n"
+                    "  \"reasoning\": \"<why_this_code_should_be_run>\"\n"
+                    "}\n"
+                    "Details for 'execute_python_code':\n"
+                    "- The 'code' MUST be a self-contained Python 3 snippet. It will be executed in a restricted environment.\n"
+                    "- DO NOT attempt direct file I/O (e.g., `open()`) or network requests in the code. Use `read_file`, `write_file`, or `web_search` tools for those purposes.\n"
+                    "- DO NOT use `import os`, `import sys`, `import subprocess`, or other system-level imports.\n"
+                    "- Only a limited set of safe built-in functions and potentially a few safe standard library modules (like `math`, `json`, `datetime`, `random`, `re` if explicitly allowed by admin) can be used. Assume imports are disallowed unless told otherwise for specific safe modules.\n"
+                    "- All code execution requires explicit user confirmation. The user will see the exact code you provide.\n"
+                    "- Output (stdout, stderr) and exceptions from the code will be returned to you in the next turn.\n"
+                    "- Example: {\"action\": \"execute_python_code\", \"code\": \"data = [1, 2, 3, 4, 5]\\nprint(sum(data))\\nprint('Max value:', max(data))\", \"reasoning\": \"To calculate and print the sum and max of a list as requested.\"}\n"
+                    "\n"
+                    "General Guidelines for Tool Use and Error Handling:\n"
+                    "- If you request a tool action (e.g., read_file, run_shell, execute_python_code) and the system informs you in the next turn that the action failed (e.g., file not found, command error, code execution exception, search failed), you MUST acknowledge this failure in your response to the user.\n"
+                    "- Explain the problem clearly and concisely based on the feedback provided by the system.\n"
+                    "- If appropriate, ask the user for clarification (e.g., \"The file you specified was not found, could you please check the path?\" or \"The command resulted in an error, perhaps try a different approach?\").\n"
+                    "- If a user's request is too ambiguous for you to confidently choose a tool or its parameters, ask for clarification BEFORE attempting to use a tool.\n"
+                    "- Your primary goal is to be a helpful and coherent assistant. Use the information from tool outcomes (both success and failure) to inform your final response to the user for that turn.\n"
+                    "\n"
+                    "If the query cannot be answered with one of these tools ('run_shell', 'read_file', 'write_file', 'web_search', 'git_branch_create', 'git_checkout', 'execute_python_code'), or if it requires actions not supported, answer directly as a helpful assistant without using the JSON format.\n"
                     "Choose only ONE action per turn if you decide to use a tool. Do not combine them in one JSON response.\n"
                 )
                 full_prompt = f"{current_context_str}\n\nTool Instructions:\n{tool_instruction}\n\nUser Query:\n{task_prefix}{prompt}"
@@ -1461,6 +1483,71 @@ def main():
 
                             console.print(f"[info]Git checkout attempt for '{branch_name}' processed. Outcome: {outcome_summary_for_agi}. Re-prompting AGI...[/info]")
                             with console.status("[yellow]AGI is processing git checkout outcome...[/yellow]", spinner="dots"):
+                                agi_secondary_raw_response = agi_interface.generate_response(subsequent_prompt_for_agi)
+
+                            tool_interaction_log_entry["agi_secondary_raw_response"] = agi_secondary_raw_response
+                            final_text_for_user_display = agi_secondary_raw_response
+                            action_taken_by_tool_framework = True
+
+                        current_turn_interaction_data["tool_interactions"].append(tool_interaction_log_entry)
+
+                    elif isinstance(data, dict) and data.get("action") == "execute_python_code":
+                        tool_request_start_time = datetime.now().isoformat()
+                        code_snippet = data.get("code")
+                        reasoning = data.get("reasoning", "No reasoning provided for code execution.")
+
+                        tool_interaction_log_entry = {
+                            "tool_request_timestamp": tool_request_start_time,
+                            "action_type": "execute_python_code",
+                            "action_details": {"code": code_snippet}, # Log the actual code
+                            "reasoning": reasoning,
+                        }
+
+                        if not isinstance(code_snippet, str) or not code_snippet.strip():
+                            error_msg = f"AGI 'execute_python_code' request missing or invalid 'code' field (must be non-empty string). Payload: {data}"
+                            console.print(f"[warning]{error_msg}[/warning]")
+                            final_text_for_user_display = f"Your 'execute_python_code' request was malformed ({error_msg})."
+                            action_taken_by_tool_framework = False
+                            tool_interaction_log_entry["user_confirmation"] = "n/a_malformed_request"
+                            tool_interaction_log_entry["tool_outcome_summary"] = "Malformed request: missing or invalid 'code'."
+                        else:
+                            # User confirmation happens inside handle_execute_python_code_request
+                            stdout_s, stderr_s, exception_s = handle_execute_python_code_request(code_snippet)
+
+                            # Determine user confirmation from outcome (stdout_s will contain cancel message)
+                            if stdout_s == "Code execution cancelled by user.":
+                                tool_interaction_log_entry["user_confirmation"] = "cancelled"
+                            else:
+                                tool_interaction_log_entry["user_confirmation"] = "confirmed" # Assumed if not cancelled
+
+                            tool_interaction_log_entry["tool_outcome_timestamp"] = datetime.now().isoformat()
+
+                            outcome_parts = []
+                            if stdout_s: outcome_parts.append(f"Stdout:\n{stdout_s.strip()}")
+                            if stderr_s: outcome_parts.append(f"Stderr:\n{stderr_s.strip()}")
+                            if exception_s: outcome_parts.append(f"Exception:\n{exception_s.strip()}")
+
+                            tool_outcome_for_log = "\n---\n".join(outcome_parts) if outcome_parts else "No output or exception."
+                            if stdout_s == "Code execution cancelled by user.": # Override for cleaner log if cancelled
+                                tool_outcome_for_log = "Code execution cancelled by user."
+
+                            tool_interaction_log_entry["tool_outcome_summary"] = tool_outcome_for_log
+
+                            # Prepare summary for AGI (might be slightly different from full log, e.g., more concise)
+                            outcome_summary_for_agi = tool_outcome_for_log
+                            if len(outcome_summary_for_agi) > 1000: # Truncate very long outputs for AGI prompt
+                                outcome_summary_for_agi = outcome_summary_for_agi[:1000] + "\n[...output truncated for AGI prompt...]"
+
+                            subsequent_prompt_for_agi = (
+                                f"{context_analyzer.get_full_context_string()}\n\n"
+                                f"Outcome of your 'execute_python_code' request:\n```python\n{code_snippet}\n```\nExecution Result:\n{outcome_summary_for_agi}\n\n"
+                                f"Original User Query: \"{user_input}\"\n\n"
+                                "Based on this outcome, please formulate your response to the user or decide on the next step."
+                            )
+                            tool_interaction_log_entry["context_for_next_agi_step"] = subsequent_prompt_for_agi
+
+                            console.print(f"[info]Python code execution processed. Outcome logged. Re-prompting AGI...[/info]")
+                            with console.status("[yellow]AGI is processing code execution outcome...[/yellow]", spinner="dots"):
                                 agi_secondary_raw_response = agi_interface.generate_response(subsequent_prompt_for_agi)
 
                             tool_interaction_log_entry["agi_secondary_raw_response"] = agi_secondary_raw_response
@@ -2719,6 +2806,177 @@ def handle_git_checkout_request(branch_name: str, create_new: bool) -> tuple[Opt
         console.print(f"[bold red]Unexpected error in handle_git_checkout_request: {type(e).__name__} - {e}[/bold red]")
         return None, f"An unexpected error occurred during git checkout: {type(e).__name__}"
 
+import io # For capturing stdout/stderr from exec
+import contextlib # For redirect_stdout/stderr
+import traceback # For formatting exceptions
+
+def handle_execute_python_code_request(code_snippet: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Handles an AGI's request to execute a Python code snippet in a restricted environment.
+
+    Returns:
+        A tuple (stdout_str, stderr_str, exception_str_or_none).
+        If user cancels, stdout_str might contain a cancellation message.
+    """
+    console.print(Panel(Syntax(code_snippet, "python", theme=APP_CONFIG.get("display",{}).get("syntax_theme","monokai"), line_numbers=True, word_wrap=True),
+                        title="[bold yellow]AGI suggests executing this Python code snippet:[/bold yellow]", border_style="yellow"))
+
+    warning_text = Text.assemble(
+        ("WARNING:", "bold red"),
+        " Executing code suggested by an AGI carries risks. ",
+        ("Although efforts are made to restrict its capabilities, review the code carefully.\n", "yellow"),
+        "Ensure it does not perform unintended actions, access sensitive data, or harm your system.\n",
+        ("Do you want to execute this code?", "bold white")
+    )
+    console.print(Panel(warning_text, title="[bold red]Security Warning[/bold red]", border_style="red", expand=False))
+
+    if RICH_AVAILABLE:
+        from rich.prompt import Confirm
+        confirmed = Confirm.ask("Execute this Python code snippet?", default=False, console=console)
+    else:
+        confirmed = input("Execute this Python code snippet? (yes/NO): ").lower() == "yes"
+
+    if not confirmed:
+        return "Code execution cancelled by user.", None, None
+
+    # --- Prepare Restricted Execution Environment ---
+    # Whitelist of safe built-ins
+    # (Based on https://docs.python.org/3/library/builtins.html and general safety)
+    allowed_builtins = {
+        'print': print, 'len': len, 'sum': sum, 'min': min, 'max': max, 'abs': abs, 'round': round,
+        'range': range, 'zip': zip, 'enumerate': enumerate, 'map': map, 'filter': filter,
+        'sorted': sorted, 'reversed': reversed, 'all': all, 'any': any,
+        'isinstance': isinstance, 'issubclass': issubclass, 'callable': callable, 'hasattr': hasattr,
+        'str': str, 'int': int, 'float': float, 'bool': bool, 'list': list, 'dict': dict,
+        'set': set, 'tuple': tuple, 'bytes': bytes, 'bytearray': bytearray, 'complex': complex,
+        'frozenset': frozenset, 'memoryview': memoryview, 'object': object, 'slice': slice, 'type': type,
+        # Common Exception types are generally safe to allow raising/catching
+        'Exception': Exception, 'ValueError': ValueError, 'TypeError': TypeError, 'AttributeError': AttributeError,
+        'NameError': NameError, 'IndexError': IndexError, 'KeyError': KeyError, 'ZeroDivisionError': ZeroDivisionError,
+        'StopIteration': StopIteration, 'ArithmeticError': ArithmeticError, 'AssertionError': AssertionError,
+        'BufferError': BufferError, 'EOFError': EOFError, 'ImportError': ImportError, # Will fail anyway due to no __import__
+        'LookupError': LookupError, 'MemoryError': MemoryError, 'OSError': OSError, # Will fail if os module not available
+        'OverflowError': OverflowError, 'ReferenceError': ReferenceError, 'RuntimeError': RuntimeError,
+        'SyntaxError': SyntaxError, 'SystemError': SystemError, # Unlikely to be useful for AGI
+        'NotImplementedError': NotImplementedError,
+        # Math functions that don't require 'import math'
+        # 'pow': pow, # Already available via operator or built-in
+        # 'divmod': divmod, # Already available
+        # 'True': True, 'False': False, 'None': None # These are keywords but good to ensure they are standard
+    }
+    # No modules like 'os', 'sys', 'subprocess', 'shutil', 'socket', 'requests', 'pathlib' etc.
+    # No file access: 'open', 'file'
+    # No dynamic execution/import: 'eval', 'exec' (within the snippet), 'compile', '__import__', 'getattr', 'setattr', 'delattr'
+
+    restricted_globals = {"__builtins__": allowed_builtins}
+    # Potentially add a few safe modules here if ever needed, e.g.:
+    # import math
+    # restricted_globals['math'] = math
+
+    restricted_locals = {}
+
+    stdout_buffer = io.StringIO()
+    stderr_buffer = io.StringIO()
+    exception_str = None
+
+    console.print("[info]Executing code snippet...[/info]")
+    try:
+        with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(stderr_buffer):
+            exec(code_snippet, restricted_globals, restricted_locals)
+    except Exception:
+        exception_str = traceback.format_exc()
+
+    stdout_val = stdout_buffer.getvalue()
+    stderr_val = stderr_buffer.getvalue()
+
+    # Log captured output for debugging/visibility by the system admin (not AGI directly yet)
+    if stdout_val: console.print(Panel(stdout_val, title="[dim]Captured stdout from snippet[/dim]", border_style="dim cyan", expand=False))
+    if stderr_val: console.print(Panel(stderr_val, title="[dim]Captured stderr from snippet[/dim]", border_style="dim yellow", expand=False))
+    if exception_str: console.print(Panel(exception_str, title="[dim]Captured exception from snippet[/dim]", border_style="dim red", expand=False))
+
+    return stdout_val, stderr_val, exception_str
+
+
+# --- Conceptual Design for Secure Code Execution Environment ---
+#
+# GOAL: Allow the AGI to request the execution of Python code snippets in a way that
+# minimizes risk to the underlying system. True sandboxing is complex and
+# often OS-dependent. For this project, we will implement a basic restricted
+# execution environment, heavily relying on user confirmation and strict limitations
+# on what the code can do.
+#
+# PRINCIPLES & CONSTRAINTS:
+#
+# 1.  USER CONFIRMATION IS MANDATORY:
+#     -   The exact code snippet proposed by the AGI MUST be displayed to the user.
+#     -   Explicit user confirmation (e.g., "yes/no") MUST be obtained before any
+#         execution attempt.
+#     -   The user should be warned about the potential risks of running code, even
+#         if it appears simple.
+#
+# 2.  SUPPORTED LANGUAGES:
+#     -   Initially, only Python 3 snippets will be supported.
+#     -   The Python interpreter will be the one running this `interactive_agi.py` script.
+#
+# 3.  EXECUTION MECHANISM (Basic Restriction):
+#     -   The primary mechanism will be Python's `exec()` function.
+#     -   A heavily restricted `globals` and `locals` dictionary will be provided to `exec()`.
+#         -   `globals['__builtins__']` will be a carefully curated dictionary containing
+#             only safe built-in functions and types.
+#         -   Disallowed builtins: `open`, `eval`, `exec`, `compile`, `getattr`, `setattr`,
+#           `delattr`, `importlib`, `__import__` (direct use).
+#         -   Allowed builtins (example list, needs careful review): `print`, `len`, `sum`,
+#           `min`, `max`, `abs`, `round`, `range`, `zip`, `enumerate`, `map`, `filter`,
+#           `sorted`, `reversed`, `all`, `any`, `isinstance`, `issubclass`,
+#           `str`, `int`, `float`, `bool`, `list`, `dict`, `set`, `tuple`, `bytes`,
+#           `bytearray`, `complex`, `frozenset`, `memoryview`, `object`, `slice`, `type`,
+#           `Exception`, `ValueError`, `TypeError`, `AttributeError`, `NameError`, etc.
+#           (standard error types are generally safe to allow to be raised).
+#         -   No access to modules like `os`, `sys`, `subprocess`, `socket`, `requests`,
+#           `pathlib` (for direct manipulation), `shutil`, `ctypes`, etc., unless a
+#           specific, safe subset is explicitly exposed via the globals. For now, assume none.
+#
+# 4.  NO DIRECT FILESYSTEM ACCESS:
+#     -   Code snippets executed via this tool SHOULD NOT attempt to read or write files directly.
+#     -   If file content is needed as input, the AGI should use the `read_file` tool first.
+#     -   If output needs to be saved, the AGI should generate the content and then use
+#         the `write_file` tool.
+#
+# 5.  NO DIRECT NETWORK ACCESS:
+#     -   Code snippets SHOULD NOT attempt to make network requests.
+#     -   If web content is needed, the AGI should use the `web_search` tool.
+#
+# 6.  RESOURCE LIMITS (Conceptual - Not Implemented in Basic Version):
+#     -   Timeout: Execution should be time-limited (e.g., a few seconds). This is hard
+#       to enforce reliably with `exec()` alone in a single thread without more complex
+#       subprocess/threading logic, which is out of scope for the basic version.
+#       *Initial implementation might not have a strict timeout for simplicity, relying on user to kill if hangs.*
+#     -   Memory/CPU: True limits require OS-level sandboxing (e.g., containers), which
+#       is out of scope. Code should be assumed to be small and efficient.
+#
+# 7.  STDOUT/STDERR CAPTURING:
+#     -   `sys.stdout` and `sys.stderr` will be redirected during the `exec()` call to
+#         capture any output or error messages generated by the snippet.
+#     -   This captured output will be returned to the AGI.
+#
+# 8.  EXCEPTION HANDLING:
+#     -   Any Python exceptions raised by the snippet during `exec()` will be caught.
+#     -   A string representation of the exception will be returned to the AGI.
+#
+# 9.  IMPORTS:
+#     -   `import` statements within the executed code will be subject to the restricted
+#         environment. If `__import__` is removed from builtins and no import-related
+#         modules are in globals, imports will fail or be severely limited.
+#     -   A small, safe list of standard library modules could potentially be whitelisted
+#         and pre-imported into the globals (e.g., `math`, `json`, `datetime`, `random`, `re`).
+#         *Initial decision: No `import` statements allowed in the snippet for simplicity and max safety.
+#          If specific modules are needed, they must be pre-approved and added to the restricted globals.*
+#
+# This design prioritizes user awareness and control, and basic restriction of capabilities,
+# over foolproof sandboxing, acknowledging the limitations of implementing a true sandbox
+# within this project's current scope and architecture. The risk is mitigated by the
+# AGI's nature (not inherently malicious) and mandatory user confirmation for all executions.
+#
 
 # --- Help Command ---
 def display_help_command():
