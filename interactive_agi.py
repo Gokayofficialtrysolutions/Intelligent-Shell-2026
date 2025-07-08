@@ -1376,7 +1376,10 @@ def process_single_input_turn(user_input_str: str,
                                 if len(tool_outcome_summary) > 500:
                                     tool_outcome_summary = tool_outcome_summary[:497] + "..."
                                 tool_interaction_log_entry["tool_outcome_summary"] = tool_outcome_summary
-                                final_text_for_user_display = f"System: Executed command '{command_to_display}'. Output was printed above."
+                                if retcode == 0:
+                                    final_text_for_user_display = f"System: Executed command '{command_to_display}'. Output was printed above."
+                                else:
+                                    final_text_for_user_display = f"System: Command '{command_to_display}' failed or produced errors. See output above."
                             else:
                                 console.print("Command execution cancelled by user.", style="yellow")
                                 if session_logger: session_logger.log_entry("System", f"Cancelled execution of: {command_to_display}")
@@ -3628,13 +3631,20 @@ def handle_execute_python_code_request(code_snippet: str) -> tuple[Optional[str]
 # --- Help Command ---
 def display_help_command():
     """Displays a list of available slash commands and their descriptions."""
-    help_table = Table(title="[bold green]AGI Terminal Help - Available Commands[/bold green]", show_lines=True)
-    help_table.add_column("Command", style="bold cyan", min_width=20)
-    help_table.add_column("Parameters", style="yellow", min_width=25)
-    help_table.add_column("Description", style="white", max_width=70)
+    intro_text = Text.assemble(
+        "Type a command directly, or chat with the AGI. Most other input is sent to the AGI.\n",
+        "AGI has access to tools (file ops, Git, web search, code execution) and will ask for confirmation for sensitive actions.\n"
+        "Use ", ("'/set parameter'", "bold yellow"), " and ", ("'/show parameters'", "bold yellow"), " to manage AGI's response generation."
+    )
+    console.print(Panel(intro_text, title="[bold green]AGI Terminal Usage[/bold green]", border_style="green", expand=False))
+
+    help_table = Table(title="[bold blue]Available User Slash Commands[/bold blue]", show_lines=True, expand=False)
+    help_table.add_column("Command", style="bold cyan", min_width=25)
+    help_table.add_column("Parameters", style="yellow", min_width=30)
+    help_table.add_column("Description", style="white", min_width=50, max_width=70) # Max width to help with wrapping
 
     commands = [
-        ("/help", "", "Displays this help message."),
+        ("/help", "", "Displays this help message listing available user commands."),
         ("/ls", "[path]", "Lists directory contents. Defaults to current directory."),
         ("/cd", "<path>", "Changes the current working directory."),
         ("/cwd", "", "Shows the current working directory."),
