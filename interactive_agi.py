@@ -800,7 +800,8 @@ class MergedAGI:
             return f"[green]Set[/green] {param_name_upper} to {new_value} (was {original_value if original_value is not None else 'default'})"
 
         except ValueError:
-            return f"[bold red]Error:[/bold red] Invalid value '{param_value_str}' for {param_name_upper}. Expected numeric type."
+            expected_type = "integer" if actual_param_name in ["max_new_tokens", "top_k"] else "float"
+            return f"[bold red]Error:[/bold red] Invalid value '{param_value_str}' for {param_name_upper}. Expected an {expected_type}."
         except Exception as e:
             return f"[bold red]Error setting parameter {param_name_upper}:[/bold red] {e}"
 
@@ -1129,6 +1130,12 @@ def main():
                 # For simplicity in this step, we'll focus on interactions that go to the AGI.
                 # So, if a command is handled here, it bypasses the main AGI JSONL logging for the turn.
                 # This could be refined later if needed. A simple log_interaction_to_jsonl call could be made here too.
+            elif user_input.lower().startswith("/suggest_code_change "): # New handler
+                file_path_to_suggest = user_input[len("/suggest_code_change "):].strip()
+                if file_path_to_suggest:
+                    suggest_code_change_command(file_path_to_suggest, agi_interface)
+                else:
+                    console.print("[red]Usage: /suggest_code_change <file_path>[/red]")
             else: # Default: AGI generates a response or suggests a command
                 # Capture context before AGI call
                 current_turn_interaction_data["context_at_query_time"] = context_analyzer.get_full_context_dict()
@@ -1152,8 +1159,10 @@ def main():
                 # It starts as the AGI's initial response, but can be updated by tool processing outcomes.
                 final_text_for_user_display = agi_initial_raw_response # Default if no tool or tool fails early
 
+                # --- Try to process AGI response as a potential tool request ---
                 try:
                     # Attempt to parse for tool use first
+                    # AGI might return JSON directly or within ```json ... ``` markdown.
                     json_match = re.search(r"```json\n(.*?)\n```", agi_initial_raw_response, re.DOTALL)
                     json_str_to_parse = json_match.group(1) if json_match else agi_response_text
 
@@ -2334,7 +2343,10 @@ def config_command_handler(args_str: Optional[str]):
         except TypeError:
             console.print(f"[red]Error: Invalid key path '{key_path}'. Part of it is not a section.[/red]")
 
-    elif subcommand == "set" and len(parts) > 2:
+    elif subcommand == "set":
+        if len(parts) < 3:
+            console.print("[red]Usage: /config set <section.key> <value>[/red]")
+            return
         key_path = parts[1]
         new_value_str = parts[2]
 
@@ -2622,15 +2634,21 @@ AGI_READ_FILE_MAX_CHARS = 10000     # Absolute max characters to return to AGI f
 
 def handle_read_file_request(filepath_str: str, max_lines_from_agi: Optional[int]) -> tuple[Optional[str], Optional[str]]:
     """
-    Handles an AGI's request to read a file.
+    Handles an AGI's request to read a file after validating the path and user permissions.
+
+    Reads the file content, applying limits on lines and characters.
+    Ensures the path is relative and within the defined project root.
 
     Args:
         filepath_str: The relative path to the file, as requested by AGI.
-        max_lines_from_agi: Optional maximum lines AGI wants to read.
+        max_lines_from_agi: Optional integer specifying the maximum number of lines
+                            the AGI prefers to read. System defaults and caps apply.
 
     Returns:
-        A tuple (file_content_string, None) on success,
-        or (None, error_message_string) on failure.
+        A tuple `(file_content_string, None)` on successful read, where
+        `file_content_string` contains the file content (possibly truncated with a message).
+        A tuple `(None, error_message_string)` on failure (e.g., file not found,
+        access denied, decoding error).
     """
     try:
         requested_path = Path(filepath_str)
@@ -2721,15 +2739,22 @@ import difflib # For generating diffs in handle_write_file_request
 
 def handle_write_file_request(filepath_str: str, content_to_write: str) -> tuple[Optional[str], Optional[str]]:
     """
-    Handles an AGI's request to write content to a file.
+    Handles an AGI's request to write content to a file, subject to path validation and user confirmation.
+
+    If the file exists, a diff of changes is shown to the user for confirmation.
+    If the file is new, its full proposed content is shown for confirmation.
+    Ensures the path is relative, within the project root, and the parent directory exists.
+    Standardizes newlines to '\n' and ensures non-empty files end with a newline.
 
     Args:
-        filepath_str: The relative path to the file (within project root).
-        content_to_write: The full string content to write to the file.
+        filepath_str: The relative path to the file (within project root) where content should be written.
+        content_to_write: The full string content intended for the file.
 
     Returns:
-        A tuple (success_message, None) on success,
-        or (None, error_message_string) on failure.
+        A tuple `(success_message, None)` if the file is written successfully or if the operation
+        is cancelled by the user (message will indicate cancellation).
+        A tuple `(None, error_message_string)` if a validation error, I/O error, or other
+        exception occurs during the process.
     """
     try:
         if PROJECT_ROOT_PATH is None: # Should have been initialized in main()
@@ -2838,7 +2863,26 @@ def handle_write_file_request(filepath_str: str, content_to_write: str) -> tuple
         return None, f"An unexpected error occurred processing the write request: {type(e).__name__}"
 
 def handle_git_branch_create_request(branch_name: str, base_branch: Optional[str]) -> tuple[Optional[str], Optional[str]]:
-    """Handles AGI request to create a new git branch."""
+    """
+    Handles an AGI's request to create a new Git branch, after user confirmation.
+
+    Validates the proposed branch name for common invalid patterns.
+    Constructs and executes the `git branch` command. Interprets Git's output
+    to determine success, including cases where the branch might already exist
+    (which Git sometimes reports via stderr with a zero exit code).
+
+    Args:
+        branch_name: The name for the new branch.
+        base_branch: Optional name of an existing branch from which to start the new branch.
+                     If None or empty, the new branch starts from the current HEAD.
+
+    Returns:
+        A tuple `(success_message, None)` on successful operation (including messages
+        from Git like "Branch 'X' set up to track 'Y'.") or if the operation was
+        cancelled by the user.
+        A tuple `(None, error_message_string)` if validation fails, Git command fails,
+        or an unexpected error occurs.
+    """
     if not branch_name:
         return None, "Branch name cannot be empty."
 
@@ -2890,7 +2934,26 @@ def handle_git_branch_create_request(branch_name: str, base_branch: Optional[str
         return None, f"An unexpected error occurred: {type(e).__name__}"
 
 def handle_git_checkout_request(branch_name: str, create_new: bool) -> tuple[Optional[str], Optional[str]]:
-    """Handles AGI request to checkout a git branch, optionally creating it."""
+    """
+    Handles an AGI's request to checkout a Git branch, potentially creating it if specified.
+
+    Validates the branch name if `create_new` is true.
+    Constructs and executes `git checkout <branch>` or `git checkout -b <branch>`
+    after user confirmation. Interprets Git's output for success or failure.
+    Git often prints informational messages (e.g., "Switched to branch '...'") to
+    stderr on success, so stderr is checked.
+
+    Args:
+        branch_name: The name of the branch to checkout or create.
+        create_new: If True, attempts to create the branch and check it out (`-b` flag).
+                    If False, attempts to checkout an existing branch.
+
+    Returns:
+        A tuple `(success_message, None)` on successful operation (often Git's output)
+        or if the operation was cancelled by the user.
+        A tuple `(None, error_message_string)` if validation fails, Git command fails,
+        or an unexpected error occurs.
+    """
     if not branch_name:
         return None, "Branch name cannot be empty for checkout."
 
@@ -2940,7 +3003,25 @@ def handle_git_checkout_request(branch_name: str, create_new: bool) -> tuple[Opt
         return None, f"An unexpected error occurred during git checkout: {type(e).__name__}"
 
 def handle_git_commit_request(commit_message: str, stage_all: bool) -> tuple[Optional[str], Optional[str]]:
-    """Handles AGI request to make a git commit."""
+    """
+    Handles an AGI's request to make a Git commit, after user confirmation.
+
+    Validates that the commit message is not empty.
+    Constructs `git commit -m "<message>"` or `git commit -a -m "<message>"`
+    based on the `stage_all` flag. Displays the command and full message for confirmation.
+    Interprets Git's output, including handling the "nothing to commit" case as
+    an informational success rather than an error.
+
+    Args:
+        commit_message: The commit message string.
+        stage_all: If True, stages all tracked and modified files before committing (`-a` flag).
+
+    Returns:
+        A tuple `(success_message, None)` on successful commit (including "nothing to commit")
+        or if the operation was cancelled by the user.
+        A tuple `(None, error_message_string)` if validation fails, Git command execution
+        results in an error (other than "nothing to commit"), or an unexpected error occurs.
+    """
     if not commit_message or not commit_message.strip():
         return None, "Commit message cannot be empty."
 
@@ -2993,7 +3074,25 @@ def handle_git_commit_request(commit_message: str, stage_all: bool) -> tuple[Opt
         return None, f"An unexpected error occurred during git commit: {type(e).__name__}"
 
 def handle_git_push_request(remote_name: Optional[str], branch_name_to_push: Optional[str]) -> tuple[Optional[str], Optional[str]]:
-    """Handles AGI request to push a git branch to a remote."""
+    """
+    Handles an AGI's request to push a Git branch to a remote repository, after user confirmation.
+
+    Determines the effective remote (defaults to 'origin') and branch (defaults to current
+    checked-out branch if not specified). Constructs and executes the `git push` command.
+    Interprets Git's output (often from stderr) for success or failure, as push
+    operations can have various outcomes (success, auth failure, remote errors, etc.).
+    Force pushing is not permitted by this handler.
+
+    Args:
+        remote_name: Optional name of the remote repository (e.g., 'origin').
+        branch_name_to_push: Optional name of the branch to push.
+
+    Returns:
+        A tuple `(success_message, None)` on successful push (including messages like
+        "Everything up-to-date") or if the operation was cancelled by the user.
+        A tuple `(None, error_message_string)` if determining defaults fails, the Git command
+        execution results in an error, or an unexpected error occurs (e.g., timeout).
+    """
 
     effective_remote = remote_name.strip() if remote_name and remote_name.strip() else "origin"
     effective_branch = branch_name_to_push.strip() if branch_name_to_push and branch_name_to_push.strip() else None
@@ -3067,10 +3166,55 @@ def handle_execute_python_code_request(code_snippet: str) -> tuple[Optional[str]
     """
     Handles an AGI's request to execute a Python code snippet in a restricted environment.
 
+    IMPORTANT SECURITY CONSIDERATIONS:
+    This function uses `exec()` which is inherently risky if not handled carefully.
+    It attempts to mitigate risks by:
+    1.  **Mandatory User Confirmation:** The exact code is shown, and the user must explicitly approve.
+    2.  **Pre-execution Static Analysis:** Basic regex checks for obviously dangerous patterns
+        (e.g., `import os`, `open(`). If found, execution is rejected before user confirmation.
+    3.  **Restricted Builtins:** A whitelist of `__builtins__` is provided to `exec()`,
+        excluding functions like `open`, `eval`, `exec`, `__import__`, `getattr`, `setattr`.
+    4.  **No Direct Module Imports:** The restricted environment aims to prevent arbitrary `import` statements.
+        Safe modules (like `math`, `json`) would need to be explicitly added to globals if desired.
+
+    This is NOT a foolproof sandbox. It aims to prevent common accidental or naive malicious attempts.
+    Resource limits (CPU, memory, timeout) are not strictly enforced by this basic implementation.
+
+    Args:
+        code_snippet: The Python code string provided by the AGI.
+
     Returns:
-        A tuple (stdout_str, stderr_str, exception_str_or_none).
-        If user cancels, stdout_str might contain a cancellation message.
+        A tuple `(stdout_str, stderr_str, exception_str_or_none)`:
+        - `stdout_str`: Captured standard output from the executed code. Contains a
+                        cancellation message if the user denied execution.
+        - `stderr_str`: Captured standard error output from the executed code.
+        - `exception_str`: A string representation of any Python exception that occurred
+                           during `exec()`, or the special marker "StaticAnalysisReject"
+                           if pre-execution checks failed. None if no exception.
     """
+    # --- Pre-execution Static Analysis (Basic Heuristic Checks) ---
+    # AGI should be prompted NOT to use these. This is a fallback check.
+    dangerous_patterns = [
+        r"import\s+(os|sys|subprocess|shutil|socket|requests|pathlib|ctypes|pty|fcntl|resource|select|signal|termios|tty|asyncio|multiprocessing|threading)", # Common dangerous imports
+        r"from\s+(os|sys|subprocess|shutil|socket|requests|pathlib|ctypes|pty|fcntl|resource|select|signal|termios|tty|asyncio|multiprocessing|threading)\s+import",
+        r"open\s*\(",      # File system access
+        r"eval\s*\(",      # Dynamic execution
+        r"exec\s*\(",      # Dynamic execution (exec within exec)
+        r"getattr\s*\(",   # Potential attribute snooping/calling
+        r"setattr\s*\(",   # Potential attribute modification
+        r"delattr\s*\(",   # Potential attribute deletion
+        r"__\w+__",      # Access to dunder methods/attributes (broad, might have false positives but good for caution)
+        r"socket\s*\(",   # Network access
+        r"subprocess\s*\.", # Subprocess module usage
+        r"ctypes\s*\."      # CTypes usage
+    ]
+    for pattern in dangerous_patterns:
+        if re.search(pattern, code_snippet, re.IGNORECASE):
+            error_msg = f"Execution rejected by system: Code snippet contains potentially unsafe pattern: '{pattern}'. Please use provided tools for I/O, system, or network operations, or simplify the code."
+            console.print(f"[bold red]{error_msg}[/bold red]")
+            return error_msg, None, "StaticAnalysisReject" # Special marker for exception type
+
+    # If static analysis passes, then proceed to user confirmation
     console.print(Panel(Syntax(code_snippet, "python", theme=APP_CONFIG.get("display",{}).get("syntax_theme","monokai"), line_numbers=True, word_wrap=True),
                         title="[bold yellow]AGI suggests executing this Python code snippet:[/bold yellow]", border_style="yellow"))
 
@@ -3095,37 +3239,62 @@ def handle_execute_python_code_request(code_snippet: str) -> tuple[Optional[str]
     # --- Prepare Restricted Execution Environment ---
     # Whitelist of safe built-ins
     # (Based on https://docs.python.org/3/library/builtins.html and general safety)
-    allowed_builtins = {
+    # Default-deny approach: only allow what's explicitly listed.
+    # Keep this list as minimal as possible for safety.
+    # AGI should be prompted that only these are available.
+    _ALLOWED_BUILTINS_DICT = {
+        # Safe data types & constructors
+        'str': str, 'int': int, 'float': float, 'bool': bool,
+        'list': list, 'dict': dict, 'set': set, 'tuple': tuple,
+        'bytes': bytes, 'bytearray': bytearray, 'complex': complex,
+        'frozenset': frozenset, 'memoryview': memoryview,
+        'object': object, 'slice': slice, 'type': type, # type() is powerful but hard to exploit without more.
+        # Safe functions for data manipulation & iteration
         'print': print, 'len': len, 'sum': sum, 'min': min, 'max': max, 'abs': abs, 'round': round,
-        'range': range, 'zip': zip, 'enumerate': enumerate, 'map': map, 'filter': filter,
-        'sorted': sorted, 'reversed': reversed, 'all': all, 'any': any,
-        'isinstance': isinstance, 'issubclass': issubclass, 'callable': callable, 'hasattr': hasattr,
-        'str': str, 'int': int, 'float': float, 'bool': bool, 'list': list, 'dict': dict,
-        'set': set, 'tuple': tuple, 'bytes': bytes, 'bytearray': bytearray, 'complex': complex,
-        'frozenset': frozenset, 'memoryview': memoryview, 'object': object, 'slice': slice, 'type': type,
-        # Common Exception types are generally safe to allow raising/catching
-        'Exception': Exception, 'ValueError': ValueError, 'TypeError': TypeError, 'AttributeError': AttributeError,
-        'NameError': NameError, 'IndexError': IndexError, 'KeyError': KeyError, 'ZeroDivisionError': ZeroDivisionError,
-        'StopIteration': StopIteration, 'ArithmeticError': ArithmeticError, 'AssertionError': AssertionError,
-        'BufferError': BufferError, 'EOFError': EOFError, 'ImportError': ImportError, # Will fail anyway due to no __import__
-        'LookupError': LookupError, 'MemoryError': MemoryError, 'OSError': OSError, # Will fail if os module not available
-        'OverflowError': OverflowError, 'ReferenceError': ReferenceError, 'RuntimeError': RuntimeError,
-        'SyntaxError': SyntaxError, 'SystemError': SystemError, # Unlikely to be useful for AGI
+        'range': range, 'zip': zip, 'enumerate': enumerate,
+        'map': map, 'filter': filter, 'sorted': sorted, 'reversed': reversed,
+        'all': all, 'any': any, 'isinstance': isinstance, 'issubclass': issubclass,
+        # Common, relatively safe Exception types (primarily for `isinstance` or `except` clauses)
+        'Exception': Exception, 'ValueError': ValueError, 'TypeError': TypeError,
+        'AttributeError': AttributeError, 'NameError': NameError, 'IndexError': IndexError,
+        'KeyError': KeyError, 'ZeroDivisionError': ZeroDivisionError, 'StopIteration': StopIteration,
+        'ArithmeticError': ArithmeticError, 'AssertionError': AssertionError,
         'NotImplementedError': NotImplementedError,
-        # Math functions that don't require 'import math'
-        # 'pow': pow, # Already available via operator or built-in
-        # 'divmod': divmod, # Already available
-        # 'True': True, 'False': False, 'None': None # These are keywords but good to ensure they are standard
+        # Constants (already part of Python syntax, but explicitly listing for clarity of intent)
+        'True': True, 'False': False, 'None': None,
     }
-    # No modules like 'os', 'sys', 'subprocess', 'shutil', 'socket', 'requests', 'pathlib' etc.
-    # No file access: 'open', 'file'
-    # No dynamic execution/import: 'eval', 'exec' (within the snippet), 'compile', '__import__', 'getattr', 'setattr', 'delattr'
+    # Explicitly disallowed (even if some are not in __builtins__ by default, good to document intent)
+    # 'open', 'file', 'eval', 'exec', 'compile', '__import__', 'globals', 'locals', 'vars',
+    # 'getattr', 'setattr', 'delattr', 'dir', 'input', 'help', 'breakpoint', 'memoryview.tobytes' (example)
+    # 'classmethod', 'staticmethod', 'property', 'super' (less risky, but for simple snippets, likely not needed)
 
-    restricted_globals = {"__builtins__": allowed_builtins}
-    # Potentially add a few safe modules here if ever needed, e.g.:
+    # --- Pre-execution Static Analysis (Basic Heuristic Checks) ---
+    # AGI should be prompted NOT to use these. This is a fallback check.
+    dangerous_patterns = [
+        r"import\s+(os|sys|subprocess|shutil|socket|requests|pathlib|ctypes|pty|fcntl|resource|select|signal|termios|tty|asyncio|multiprocessing|threading)", # Common dangerous imports
+        r"from\s+(os|sys|subprocess|shutil|socket|requests|pathlib|ctypes|pty|fcntl|resource|select|signal|termios|tty|asyncio|multiprocessing|threading)\s+import",
+        r"open\s*\(",      # File system access
+        r"eval\s*\(",      # Dynamic execution
+        r"exec\s*\(",      # Dynamic execution (exec within exec)
+        r"getattr\s*\(",   # Potential attribute snooping/calling
+        r"setattr\s*\(",   # Potential attribute modification
+        r"delattr\s*\(",   # Potential attribute deletion
+        r"__\w+__",      # Access to dunder methods/attributes (broad, might have false positives but good for caution)
+        r"socket\s*\(",   # Network access
+        r"subprocess\s*\.", # Subprocess module usage
+        r"ctypes\s*\."      # CTypes usage
+    ]
+    for pattern in dangerous_patterns:
+        if re.search(pattern, code_snippet, re.IGNORECASE):
+            error_msg = f"Execution rejected: Code snippet contains potentially unsafe pattern: '{pattern}'. Please use provided tools for I/O, system, or network operations."
+            console.print(f"[bold red]{error_msg}[/bold red]")
+            return error_msg, None, "StaticAnalysisReject" # Special marker for exception type
+
+    # User has already confirmed, proceed with restricted execution
+    restricted_globals = {"__builtins__": _ALLOWED_BUILTINS_DICT.copy()} # Use a copy
+    # Example of adding safe modules (if decided later):
     # import math
     # restricted_globals['math'] = math
-
     restricted_locals = {}
 
     stdout_buffer = io.StringIO()
@@ -3704,8 +3873,20 @@ def perform_internet_search(query: str):
 
 def handle_web_search_request(query: str) -> tuple[Optional[str], Optional[str]]:
     """
-    Handles an AGI's request to search the web.
-    Fetches results, formats them into a single string for AGI context.
+    Handles an AGI's request to search the web using DuckDuckGo (HTML version).
+
+    This function calls `fetch_and_parse_search_results` to get raw search data,
+    then formats a limited number of results (titles, snippets, URLs) into a
+    single string suitable for providing as context to the AGI.
+    Snippets are truncated to manage context length.
+
+    Args:
+        query: The search query string provided by the AGI.
+
+    Returns:
+        A tuple `(formatted_results_string, None)` on success. `formatted_results_string`
+        will contain the summarized search results, or a message like "No search results found."
+        A tuple `(None, error_message_string)` if the search fetch or parsing failed.
     """
     console.print(f"[dim info]AGI requested web search for: \"{query}\"[/dim info]")
     parsed_results, error = fetch_and_parse_search_results(query)

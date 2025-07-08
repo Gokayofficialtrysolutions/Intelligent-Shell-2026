@@ -51,6 +51,14 @@ DEFAULT_OUTPUT_DIR = "./merged_model_adapters" # Save adapters here
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Adaptive fine-tuning script for the merged AGI model using JSONL interaction logs.")
     parser.add_argument(
+        "--analyze_jsonl_logs",
+        nargs='?',
+        const=-1, # Default value if flag is present without a number (e.g. analyze all, or a default like 5)
+        type=int,
+        metavar='N',
+        help="Analyze JSONL logs and print statistics. Optionally print N random formatted training examples. If N is not given, prints stats only or a default number of examples (e.g., 5). If N is 0, prints stats only. If N is -1 (flag only), prints stats and a default number of examples."
+    )
+    parser.add_argument(
         "--model_path",
         type=str,
         default=DEFAULT_MODEL_PATH,
@@ -106,8 +114,12 @@ def parse_arguments():
 
 # --- Helper functions for formatting JSONL data for prompt ---
 def format_context_for_prompt(context_dict: dict) -> str:
+    """
+    Formats the context dictionary from a JSONL log entry into a string for the training prompt.
+    Includes CWD, Project Root, Git info, top file types, and names of key file snippets.
+    """
     if not context_dict:
-        return "CONTEXT: None"
+        return "CONTEXT: None" # Should ideally not happen if context is always logged
 
     parts = []
     if "cwd" in context_dict: # Check if key exists
@@ -147,10 +159,17 @@ def format_context_for_prompt(context_dict: dict) -> str:
     return "SYSTEM_CONTEXT:\n" + "\n".join(f"  {p}" for p in parts)
 
 def format_tool_interactions_for_prompt(tool_interactions: list, max_outcome_chars: int = 200) -> str:
+    """
+    Formats the list of tool interactions from a JSONL log entry into a structured
+    string dialogue for the training prompt.
+    Includes details of AGI's tool request, system's response (confirmation, outcome),
+    and any AGI response after the tool use. Outcomes and secondary AGI responses
+    are truncated to `max_outcome_chars` and `max_outcome_chars*2` respectively.
+    """
     if not tool_interactions:
-        return ""
+        return "" # Return empty string if no tool interactions
 
-    turn_dialogue = ["\nINTERMEDIATE_STEPS:"]
+    turn_dialogue = ["\nINTERMEDIATE_STEPS:"] # Start with a clear section header
     for i, tool_call in enumerate(tool_interactions):
         turn_dialogue.append(f"  --- TOOL CALL {i+1} ---")
         action_type = tool_call.get('action_type', 'unknown_action')
@@ -199,13 +218,22 @@ def format_tool_interactions_for_prompt(tool_interactions: list, max_outcome_cha
     return "\n".join(turn_dialogue)
 
 # --- Log Parsing ---
-def load_interaction_logs(jsonl_log_path: str, tokenizer: AutoTokenizer, max_seq_length: int):
+def load_raw_interaction_logs(jsonl_log_path: str) -> list[dict]:
     """
-    Loads interaction logs from a JSONL file, formats them, and tokenizes them.
-    """
-    formatted_texts = []
-    raw_interactions = []
+    Loads raw interaction logs from a specified JSONL file.
 
+    Each line in the JSONL file is expected to be a valid JSON object representing
+    a single interaction turn. Malformed JSON lines are skipped with a warning.
+
+    Args:
+        jsonl_log_path: The path to the JSONL file containing interaction logs.
+
+    Returns:
+        A list of dictionaries, where each dictionary is a parsed JSON object
+        from a line in the log file. Returns an empty list if the file is not found,
+        empty, or contains no valid JSON lines.
+    """
+    raw_interactions = []
     log_file = Path(jsonl_log_path)
     if not log_file.exists():
         console.print(f"[yellow]JSONL log file not found at {jsonl_log_path}. Nothing to train on.[/yellow]")
@@ -278,31 +306,112 @@ def load_interaction_logs(jsonl_log_path: str, tokenizer: AutoTokenizer, max_seq
         formatted_texts.append(text)
 
     if RICH_AVAILABLE:
-        progress_bar.stop()
+        progress_bar.stop() # Stop formatting progress bar
 
+    return raw_interactions # Return list of dicts
+
+def format_interaction_for_training(interaction_entry: dict, tokenizer_eos_token: str) -> Optional[str]:
+    """
+    Formats a single raw interaction dictionary (from JSONL) into a complete
+    string suitable for language model training.
+
+    The format typically includes system context, user query, a summary of any
+    intermediate tool interactions, and finally the AGI's response, followed by
+    an EOS token. This structure helps the model learn instruction-following
+    and tool use patterns within a conversational context.
+
+    Args:
+        interaction_entry: A dictionary representing one interaction turn, parsed
+                           from the JSONL log.
+        tokenizer_eos_token: The End-Of-Sequence token string from the tokenizer,
+                             to be appended to the final formatted string.
+
+    Returns:
+        A formatted string ready for tokenization, or None if essential fields
+        (user_query, agi_final_response_to_user) are missing from the entry.
+    """
+    user_query = interaction_entry.get("user_query", "")
+    agi_final_response = interaction_entry.get("agi_final_response_to_user", "")
+    context_dict = interaction_entry.get("context_at_query_time", {})
+    tool_interactions_list = interaction_entry.get("tool_interactions", [])
+
+    if not user_query or not agi_final_response: # Skip entries without essential I/O
+        return None
+
+    context_str = format_context_for_prompt(context_dict)
+    tool_summary_str = format_tool_interactions_for_prompt(tool_interactions_list)
+
+    # Using the USER: ... ASSISTANT: ... format
+    # This structure helps the model learn instruction following.
+    # The AGI needs to learn to generate the text after "ASSISTANT: "
+    prompt_part = f"{context_str}\nUSER: {user_query}{tool_summary_str}\nASSISTANT: "
+    completion_part = f"{agi_final_response}{tokenizer_eos_token if tokenizer_eos_token else ''}"
+
+    return prompt_part + completion_part
+
+def prepare_training_dataset(jsonl_log_path: str, tokenizer: AutoTokenizer, max_seq_length: int) -> list[dict]:
+    """
+    Loads raw interaction logs from the specified JSONL file, formats each valid
+    interaction into a training string, and then tokenizes these strings.
+
+    This function orchestrates the data preparation pipeline for training,
+    including handling of empty or small datasets and progress reporting.
+
+    Args:
+        jsonl_log_path: Path to the JSONL file containing interaction logs.
+        tokenizer: The Hugging Face AutoTokenizer instance to use for tokenization
+                   and for obtaining the EOS token.
+        max_seq_length: The maximum sequence length for tokenized inputs.
+
+    Returns:
+        A list of dictionaries, where each dictionary represents a tokenized
+        training instance (containing 'input_ids', 'attention_mask', 'labels').
+        Returns an empty list if no suitable data can be prepared.
+    """
+    raw_interactions = load_raw_interaction_logs(jsonl_log_path)
+    if not raw_interactions:
+        return []
+
+    formatted_texts = []
+    console.print(f"[info]Formatting {len(raw_interactions)} raw interactions for training...[/info]")
+    if RICH_AVAILABLE:
+        progress_bar = Progress(
+            TextColumn("[progress.description]{task.description}"), BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TimeRemainingColumn(), TimeElapsedColumn(), console=console
+        )
+        format_task = progress_bar.add_task("Formatting data", total=len(raw_interactions))
+        progress_bar.start()
+
+    for entry in raw_interactions:
+        if RICH_AVAILABLE: progress_bar.update(format_task, advance=1)
+        formatted_text = format_interaction_for_training(entry, tokenizer.eos_token)
+        if formatted_text:
+            formatted_texts.append(formatted_text)
+
+    if RICH_AVAILABLE: progress_bar.stop()
 
     if not formatted_texts:
         console.print("[yellow]No valid interactions formatted for training after processing.[/yellow]")
         return []
 
-    min_dataset_size = 10 # Arbitrary minimum, can be adjusted
+    min_dataset_size = 10
     if len(formatted_texts) < min_dataset_size:
         console.print(f"[warning]Warning: The number of formatted interactions ({len(formatted_texts)}) is very small (less than {min_dataset_size}). Fine-tuning may not be effective or could lead to overfitting.[/warning]")
         if input(f"Continue with {len(formatted_texts)} interactions? (yes/NO): ").lower() != "yes":
             console.print("[info]Training aborted by user due to small dataset size.[/info]")
             return []
-
-    console.print(f"[success]Successfully formatted {len(formatted_texts)} interactions from JSONL.[/success]")
+    console.print(f"[success]Successfully formatted {len(formatted_texts)} interactions.[/success]")
 
     # Tokenize the formatted texts
     tokenized_dataset = []
+    console.print(f"[info]Tokenizing {len(formatted_texts)} formatted interactions...[/info]")
     if RICH_AVAILABLE:
-        task_id_tokenize = progress_bar.add_task("Tokenizing data", total=len(formatted_texts)) # Re-add task for progress
-        progress_bar.start() # Re-start if stopped
+        tokenize_task = progress_bar.add_task("Tokenizing data", total=len(formatted_texts))
+        progress_bar.start()
 
     for text in formatted_texts:
-        if RICH_AVAILABLE:
-            progress_bar.update(task_id_tokenize, advance=1) # Use the new task_id
+        if RICH_AVAILABLE: progress_bar.update(tokenize_task, advance=1)
         tokenized_input = tokenizer(
             text,
             truncation=True,
@@ -328,6 +437,34 @@ def load_interaction_logs(jsonl_log_path: str, tokenizer: AutoTokenizer, max_seq
 # --- Main Training Logic ---
 def main():
     args = parse_arguments()
+
+    if args.analyze_jsonl_logs is not None:
+        console.print(f"[bold cyan]--- JSONL Log Analysis Mode ---[/bold cyan]")
+        console.print(f"[info]Analyzing log file: {args.jsonl_log_path}[/info]")
+
+        raw_logs = load_raw_interaction_logs(args.jsonl_log_path)
+        if not raw_logs:
+            console.print("[error]No logs loaded for analysis. Exiting.[/error]")
+            return
+
+        num_examples_to_show = args.analyze_jsonl_logs
+        if args.analyze_jsonl_logs == -1: # Default if only flag is present
+            num_examples_to_show = 5
+
+        example_eos_token = "<|eos|>" # Default if tokenizer fails
+        if num_examples_to_show > 0:
+            try:
+                # Try to load tokenizer just for eos_token, lighter than full model
+                tokenizer_for_examples = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+                if tokenizer_for_examples.eos_token:
+                    example_eos_token = tokenizer_for_examples.eos_token
+                console.print(f"[info]Using EOS token '{example_eos_token}' for example formatting.[/info]")
+            except Exception as e:
+                console.print(f"[warning]Could not load tokenizer from '{args.model_path}' for example formatting: {e}. Using default EOS token.[/warning]")
+
+        analyze_and_print_stats(raw_logs, num_examples_to_show, example_eos_token)
+        console.print("[info]Log analysis complete.[/info]")
+        return # Exit after analysis, do not proceed to training
 
     console.print("[bold blue]Starting Adaptive Training Script...[/bold blue]")
     console.print(f"[info]Configuration: {args}[/info]")
@@ -514,6 +651,117 @@ if __name__ == "__main__":
     # This is a placeholder for how the script would be run.
     # Actual execution with training will be done by the user in their environment.
     # For development purposes, one might add a --dry_run flag to skip actual training.
+
+def analyze_and_print_stats(raw_interactions: list[dict], num_examples_to_print: int, tokenizer_eos_for_examples: str):
+    """
+    Calculates and prints various statistics about the loaded JSONL interaction logs.
+    Optionally, it also prints a sample of formatted training prompt examples.
+
+    Statistics include:
+    - Total number of interaction turns.
+    - Number and percentage of turns involving tool use.
+    - Breakdown of tool usage by action type.
+    - Summary of tool outcomes (success, error, cancelled) per tool type.
+    - Average lengths of user queries and AGI final responses.
+
+    Args:
+        raw_interactions: A list of dictionaries, each representing a parsed JSONL entry.
+        num_examples_to_print: The number of random formatted training examples to print.
+                               If 0, no examples are printed.
+        tokenizer_eos_for_examples: The EOS token string to use when formatting examples.
+    """
+    if not raw_interactions:
+        console.print("[yellow]No interactions to analyze.[/yellow]")
+        return
+
+    total_turns = len(raw_interactions)
+    turns_with_tools = 0
+    tool_type_counts = {} # e.g., {"run_shell": 10, "read_file": 5}
+    tool_outcomes = {} # e.g., {"run_shell": {"success": 8, "error": 1, "cancelled": 1}}
+
+    total_user_query_len = 0
+    total_agi_response_len = 0
+
+    for entry in raw_interactions:
+        total_user_query_len += len(entry.get("user_query", ""))
+        total_agi_response_len += len(entry.get("agi_final_response_to_user", ""))
+
+        tool_interactions_list = entry.get("tool_interactions", [])
+        if tool_interactions_list:
+            turns_with_tools += 1
+            for tool_call in tool_interactions_list:
+                action = tool_call.get("action_type", "unknown_action")
+                tool_type_counts[action] = tool_type_counts.get(action, 0) + 1
+
+                if action not in tool_outcomes:
+                    tool_outcomes[action] = {"success": 0, "error": 0, "cancelled": 0, "other": 0}
+
+                outcome_summary = tool_call.get("tool_outcome_summary", "").lower()
+                user_confirmation = tool_call.get("user_confirmation", "").lower()
+
+                if "error:" in outcome_summary or "failed" in outcome_summary or "malformed" in outcome_summary or "staticanalysisreject" in outcome_summary:
+                    tool_outcomes[action]["error"] += 1
+                elif user_confirmation == "cancelled":
+                    tool_outcomes[action]["cancelled"] += 1
+                elif "success" in outcome_summary or "processed" in outcome_summary or "executed" in outcome_summary or "identical" in outcome_summary or "up-to-date" in outcome_summary or "no output" in outcome_summary or "nothing to commit" in outcome_summary:
+                     tool_outcomes[action]["success"] += 1
+                else: # Catch-all for outcomes not clearly error/cancelled/success based on simple string checks
+                    tool_outcomes[action]["other"] += 1
+
+
+    console.print(f"\n[bold underline]Interaction Log Analysis[/bold underline]")
+    console.print(f"Total Interaction Turns: {total_turns}")
+    console.print(f"Turns with Tool Use: {turns_with_tools} ({turns_with_tools/total_turns:.1%} of total if total_turns > 0 else 0.0)")
+
+    avg_user_query_len = total_user_query_len / total_turns if total_turns > 0 else 0
+    avg_agi_response_len = total_agi_response_len / total_turns if total_turns > 0 else 0
+    console.print(f"Average User Query Length: {avg_user_query_len:.0f} chars")
+    console.print(f"Average AGI Final Response Length: {avg_agi_response_len:.0f} chars")
+
+    if tool_type_counts:
+        console.print("\n[bold]Tool Usage Breakdown:[/bold]")
+        tool_table = Table(title="Tool Type Counts")
+        tool_table.add_column("Tool Action", style="cyan")
+        tool_table.add_column("Count", style="magenta", justify="right")
+        for tool, count in sorted(tool_type_counts.items()):
+            tool_table.add_row(tool, str(count))
+        console.print(tool_table)
+
+        console.print("\n[bold]Tool Outcome Summary:[/bold]")
+        outcome_table = Table(title="Tool Outcome Details")
+        outcome_table.add_column("Tool Action", style="cyan")
+        outcome_table.add_column("Success", style="green", justify="right")
+        outcome_table.add_column("Error/Reject", style="red", justify="right")
+        outcome_table.add_column("Cancelled", style="yellow", justify="right")
+        outcome_table.add_column("Other/Unknown", style="dim", justify="right")
+        for tool, outcomes_map in sorted(tool_outcomes.items()):
+            outcome_table.add_row(
+                tool,
+                str(outcomes_map.get("success",0)),
+                str(outcomes_map.get("error",0)),
+                str(outcomes_map.get("cancelled",0)),
+                str(outcomes_map.get("other",0))
+            )
+        console.print(outcome_table)
+    else:
+        console.print("No tool usage found in logs.")
+
+    if num_examples_to_print > 0 and raw_interactions:
+        console.print(f"\n[bold underline]Random Formatted Training Examples (N={num_examples_to_print}):[/bold underline]")
+
+        # Ensure num_examples_to_print is not greater than available interactions
+        actual_num_to_print = min(num_examples_to_print, len(raw_interactions))
+        selected_examples = random.sample(raw_interactions, actual_num_to_print)
+
+        for i, entry in enumerate(selected_examples):
+            formatted_prompt = format_interaction_for_training(entry, tokenizer_eos_for_examples)
+            if formatted_prompt:
+                console.print(f"\n--- Example {i+1} ---")
+                console.print(Text(formatted_prompt, overflow="fold")) # Allow folding for long lines
+            else:
+                console.print(f"\n--- Example {i+1} (Skipped due to missing essential fields) ---")
+        console.print("\n--- End of Examples ---")
+
 
     # Example of what would happen if this script is run:
     # 1. Parses arguments (defaults or from command line).
