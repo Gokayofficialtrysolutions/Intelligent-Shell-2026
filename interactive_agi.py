@@ -138,10 +138,10 @@ class ContextAnalyzer:
         common_text_exts = ['.txt', '.sh', '.js', '.json', '.yml', '.toml', '.css', '.html']
 
         for item_path in Path(".").iterdir():
-            if item_path.is_file():
+            if item_path.is_file() and item_path.name: # Ensure name is not empty for suffix to be meaningful
                 if item_path.suffix == '.py' and item_path.name != "interactive_agi.py" and item_path.name != "setup_agi_terminal.py": # Exclude self
                     py_files.append(item_path)
-                elif item_path.suffix.lower() in common_text_exts and item_path.name.lower() != "readme.md": # Avoid re-adding README
+                elif item_path.name.lower() != "readme.md" and item_path.suffix.lower() in common_text_exts: # Avoid re-adding README, check suffix after name
                     other_candidates.append(item_path)
 
         # Sort by modification time, most recent first
@@ -692,6 +692,32 @@ class MergedAGI:
                     "- Output (stdout, stderr) and exceptions from the code will be returned to you in the next turn.\n"
                     "- Example: {\"action\": \"execute_python_code\", \"code\": \"data = [1, 2, 3, 4, 5]\\nprint(sum(data))\\nprint('Max value:', max(data))\", \"reasoning\": \"To calculate and print the sum and max of a list as requested.\"}\n"
                     "\n"
+                    "To suggest a Git commit, use:\n"
+                    "{\n"
+                    "  \"action\": \"git_commit\",\n"
+                    "  \"commit_message\": \"<your_commit_message>\",\n"
+                    "  \"stage_all\": <true_or_false>, \n"
+                    "  \"reasoning\": \"<why_this_commit_is_needed>\"\n"
+                    "}\n"
+                    "Details for 'git_commit':\n"
+                    "- 'commit_message' is required. 'stage_all' is a boolean (defaults to false); if true, it's like `git commit -a -m \"message\"` (stages all tracked, modified files).\n"
+                    "- If 'stage_all' is false, ensure files are already staged by the user or through prior operations.\n"
+                    "- User confirmation will be required.\n"
+                    "- Example: {\"action\": \"git_commit\", \"commit_message\": \"Fix: Correct typo in README\", \"stage_all\": true, \"reasoning\": \"To commit the typo correction in the README file.\"}\n"
+                    "\n"
+                    "To suggest a Git push, use:\n"
+                    "{\n"
+                    "  \"action\": \"git_push\",\n"
+                    "  \"remote_name\": \"<optional_remote_name>\",\n"
+                    "  \"branch_name\": \"<optional_branch_to_push>\",\n"
+                    "  \"reasoning\": \"<why_push_is_needed>\"\n"
+                    "}\n"
+                    "Details for 'git_push':\n"
+                    "- 'remote_name' is optional (defaults to 'origin'). 'branch_name' is optional (defaults to the current Git HEAD branch).\n"
+                    "- Force pushing is NOT supported via this tool for safety.\n"
+                    "- User confirmation will be required.\n"
+                    "- Example: {\"action\": \"git_push\", \"remote_name\": \"origin\", \"branch_name\": \"feature/login\", \"reasoning\": \"To push the completed login feature to the remote repository.\"}\n"
+                    "\n"
                     "General Guidelines for Tool Use and Error Handling:\n"
                     "- If you request a tool action (e.g., read_file, run_shell, execute_python_code) and the system informs you in the next turn that the action failed (e.g., file not found, command error, code execution exception, search failed), you MUST acknowledge this failure in your response to the user.\n"
                     "- Explain the problem clearly and concisely based on the feedback provided by the system.\n"
@@ -699,7 +725,7 @@ class MergedAGI:
                     "- If a user's request is too ambiguous for you to confidently choose a tool or its parameters, ask for clarification BEFORE attempting to use a tool.\n"
                     "- Your primary goal is to be a helpful and coherent assistant. Use the information from tool outcomes (both success and failure) to inform your final response to the user for that turn.\n"
                     "\n"
-                    "If the query cannot be answered with one of these tools ('run_shell', 'read_file', 'write_file', 'web_search', 'git_branch_create', 'git_checkout', 'execute_python_code'), or if it requires actions not supported, answer directly as a helpful assistant without using the JSON format.\n"
+                    "If the query cannot be answered with one of these tools ('run_shell', 'read_file', 'write_file', 'web_search', 'git_branch_create', 'git_checkout', 'execute_python_code', 'git_commit', 'git_push'), or if it requires actions not supported, answer directly as a helpful assistant without using the JSON format.\n"
                     "Choose only ONE action per turn if you decide to use a tool. Do not combine them in one JSON response.\n"
                 )
                 full_prompt = f"{current_context_str}\n\nTool Instructions:\n{tool_instruction}\n\nUser Query:\n{task_prefix}{prompt}"
@@ -1124,7 +1150,7 @@ def main():
 
                 # This variable will hold the final text displayed to the user for this turn.
                 # It starts as the AGI's initial response, but can be updated by tool processing outcomes.
-                final_text_for_user_display = agi_initial_raw_response
+                final_text_for_user_display = agi_initial_raw_response # Default if no tool or tool fails early
 
                 try:
                     # Attempt to parse for tool use first
@@ -1264,11 +1290,8 @@ def main():
                             # Log the AGI's initial request to read the file
                             if session_logger:
                                 session_logger.log_entry("AGI_Request_ReadFile", f"File: {filepath_str}, MaxLines: {max_lines}, Reason: {reasoning}, Error: {read_error}")
-                            conversation_history.append({
-                                "role": "assistant_tool_request", # Special role for tool intermediate step
-                                "content": f"Requested to read file: {filepath_str}. Reason: {reasoning}. Error: {read_error}",
-                                "timestamp": datetime.now().isoformat()
-                            })
+                            # Removed redundant conversation_history.append for "assistant_tool_request"
+                            # The full details are in tool_interaction_log_entry for JSONL.
                             # The final AGI response (after getting file content or error) will be logged by the generic handler below.
 
                     elif isinstance(data, dict) and data.get("action") == "write_file":
@@ -1556,6 +1579,112 @@ def main():
 
                         current_turn_interaction_data["tool_interactions"].append(tool_interaction_log_entry)
 
+                    elif isinstance(data, dict) and data.get("action") == "git_commit":
+                        tool_request_start_time = datetime.now().isoformat()
+                        commit_message = data.get("commit_message")
+                        stage_all = data.get("stage_all", False) # Default to False
+                        reasoning = data.get("reasoning", "No reasoning provided for git commit.")
+
+                        tool_interaction_log_entry = {
+                            "tool_request_timestamp": tool_request_start_time,
+                            "action_type": "git_commit",
+                            "action_details": {"commit_message": commit_message, "stage_all": stage_all},
+                            "reasoning": reasoning,
+                        }
+
+                        if not commit_message or not commit_message.strip():
+                            error_msg = f"AGI 'git_commit' request missing or empty 'commit_message' field. Payload: {data}"
+                            console.print(f"[warning]{error_msg}[/warning]")
+                            final_text_for_user_display = f"Your 'git_commit' request was malformed ({error_msg})."
+                            action_taken_by_tool_framework = False
+                            tool_interaction_log_entry["user_confirmation"] = "n/a_malformed_request"
+                            tool_interaction_log_entry["tool_outcome_summary"] = "Malformed request: missing or empty 'commit_message'."
+                        else:
+                            # User confirmation happens inside handle_git_commit_request
+                            outcome_message, outcome_error = handle_git_commit_request(commit_message, stage_all)
+
+                            tool_interaction_log_entry["user_confirmation"] = "confirmed" if outcome_message and ("successfully" in outcome_message.lower() or "nothing to commit" in outcome_message.lower()) else \
+                                                                           ("cancelled" if outcome_message and "cancelled" in outcome_message.lower() else "n/a_error_or_not_applicable")
+                            tool_interaction_log_entry["tool_outcome_timestamp"] = datetime.now().isoformat()
+
+                            if outcome_error:
+                                tool_interaction_log_entry["tool_outcome_summary"] = f"Error: {outcome_error}"
+                                outcome_summary_for_agi = f"An attempt to commit with message '{commit_message}' failed. Error: {outcome_error}"
+                            else: # outcome_message is not None
+                                tool_interaction_log_entry["tool_outcome_summary"] = outcome_message
+                                outcome_summary_for_agi = f"Git commit operation with message '{commit_message}': {outcome_message}"
+
+                            subsequent_prompt_for_agi = (
+                                f"{context_analyzer.get_full_context_string()}\n\n"
+                                f"Outcome of your 'git_commit' request (stage_all={stage_all}):\nMessage: \"{commit_message}\"\nResult: {outcome_summary_for_agi}\n\n"
+                                f"Original User Query: \"{user_input}\"\n\n"
+                                "Based on this outcome, please formulate your response to the user or decide on the next step."
+                            )
+                            tool_interaction_log_entry["context_for_next_agi_step"] = subsequent_prompt_for_agi
+
+                            console.print(f"[info]Git commit attempt processed. Outcome: {outcome_summary_for_agi}. Re-prompting AGI...[/info]")
+                            with console.status("[yellow]AGI is processing git commit outcome...[/yellow]", spinner="dots"):
+                                agi_secondary_raw_response = agi_interface.generate_response(subsequent_prompt_for_agi)
+
+                            tool_interaction_log_entry["agi_secondary_raw_response"] = agi_secondary_raw_response
+                            final_text_for_user_display = agi_secondary_raw_response
+                            action_taken_by_tool_framework = True
+
+                        current_turn_interaction_data["tool_interactions"].append(tool_interaction_log_entry)
+
+                    elif isinstance(data, dict) and data.get("action") == "git_push":
+                        tool_request_start_time = datetime.now().isoformat()
+                        remote_name = data.get("remote_name") # Optional
+                        branch_name = data.get("branch_name") # Optional
+                        reasoning = data.get("reasoning", "No reasoning provided for git push.")
+
+                        tool_interaction_log_entry = {
+                            "tool_request_timestamp": tool_request_start_time,
+                            "action_type": "git_push",
+                            "action_details": {"remote_name": remote_name, "branch_name": branch_name},
+                            "reasoning": reasoning,
+                        }
+
+                        # No specific fields to pre-validate here other than their existence, which .get handles.
+                        # handle_git_push_request will determine defaults if they are None.
+
+                        # User confirmation happens inside handle_git_push_request
+                        outcome_message, outcome_error = handle_git_push_request(remote_name, branch_name)
+
+                        tool_interaction_log_entry["user_confirmation"] = "confirmed" if outcome_message and "successfully" in outcome_message.lower() or "processed" in outcome_message.lower() or "up-to-date" in outcome_message.lower() else \
+                                                                       ("cancelled" if outcome_message and "cancelled" in outcome_message.lower() else "n/a_error_or_not_applicable")
+                        tool_interaction_log_entry["tool_outcome_timestamp"] = datetime.now().isoformat()
+
+                        if outcome_error:
+                            tool_interaction_log_entry["tool_outcome_summary"] = f"Error: {outcome_error}"
+                            outcome_summary_for_agi = f"An attempt to push to remote '{remote_name or 'default'}' for branch '{branch_name or 'current'}' failed. Error: {outcome_error}"
+                        else: # outcome_message is not None
+                            tool_interaction_log_entry["tool_outcome_summary"] = outcome_message
+                            outcome_summary_for_agi = f"Git push operation to remote '{remote_name or 'default'}' for branch '{branch_name or 'current'}': {outcome_message}"
+
+                        subsequent_prompt_for_agi = (
+                            f"{context_analyzer.get_full_context_string()}\n\n"
+                            f"Outcome of your 'git_push' request:\n{outcome_summary_for_agi}\n\n"
+                            f"Original User Query: \"{user_input}\"\n\n"
+                            "Based on this outcome, please formulate your response to the user or decide on the next step."
+                        )
+                        tool_interaction_log_entry["context_for_next_agi_step"] = subsequent_prompt_for_agi
+
+                        console.print(f"[info]Git push attempt processed. Outcome: {outcome_summary_for_agi}. Re-prompting AGI...[/info]")
+                        with console.status("[yellow]AGI is processing git push outcome...[/yellow]", spinner="dots"):
+                            agi_secondary_raw_response = agi_interface.generate_response(subsequent_prompt_for_agi)
+
+                        tool_interaction_log_entry["agi_secondary_raw_response"] = agi_secondary_raw_response
+                        final_text_for_user_display = agi_secondary_raw_response
+                        action_taken_by_tool_framework = True
+
+                        current_turn_interaction_data["tool_interactions"].append(tool_interaction_log_entry)
+
+                # If an action was successfully processed by a tool handler above (which involves re-prompting AGI)
+                # action_taken_by_tool_framework would be True, and final_text_for_user_display is AGI's secondary response.
+                # If JSON was malformed or action unknown, action_taken_by_tool_framework is False,
+                # and final_text_for_user_display is AGI's initial (problematic) response or a system error message.
+
                 except json.JSONDecodeError:
                     # Not a JSON response for tool use, treat as normal chat
                     action_taken_by_tool_framework = False # No tool action was completed or properly initiated
@@ -1563,7 +1692,11 @@ def main():
                 except Exception as e: # Catch-all for other errors during tool processing
                     console.print(f"[warning]Could not fully process AGI response for potential tool use: {type(e).__name__} - {e}[/warning]")
                     action_taken_by_tool_framework = False # Tool processing failed
-                    # final_text_for_user_display remains agi_initial_raw_response or an error message assigned by tool block
+                    # final_text_for_user_display may have been updated by the failing tool block to an error message,
+                    # or it remains agi_initial_raw_response.
+                else: # Parsed JSON was not a dictionary or had no "action" key
+                    action_taken_by_tool_framework = False
+                    # final_text_for_user_display remains agi_initial_raw_response
 
                 # Display the final response to the user (either direct AGI response or AGI response after tool use)
                 # The variable `final_text_for_user_display` holds what needs to be shown.
@@ -2805,6 +2938,126 @@ def handle_git_checkout_request(branch_name: str, create_new: bool) -> tuple[Opt
     except Exception as e:
         console.print(f"[bold red]Unexpected error in handle_git_checkout_request: {type(e).__name__} - {e}[/bold red]")
         return None, f"An unexpected error occurred during git checkout: {type(e).__name__}"
+
+def handle_git_commit_request(commit_message: str, stage_all: bool) -> tuple[Optional[str], Optional[str]]:
+    """Handles AGI request to make a git commit."""
+    if not commit_message or not commit_message.strip():
+        return None, "Commit message cannot be empty."
+
+    git_command_list = ["git", "commit"]
+    if stage_all:
+        git_command_list.append("-a")
+    git_command_list.extend(["-m", commit_message])
+
+    command_str_display = " ".join(git_command_list) # For display only, not for execution
+
+    # Display the proposed command and message clearly to the user
+    commit_panel_content = Text.assemble(
+        "AGI suggests the following Git commit:\n\n",
+        (f"{command_str_display}", "bold cyan"),
+        "\n\nCommit Message:\n",
+        (f"{commit_message}", "italic")
+    )
+    console.print(Panel(commit_panel_content,
+                        title="[bold blue]Git Commit Request[/bold blue]", border_style="blue", expand=False))
+
+    if RICH_AVAILABLE:
+        from rich.prompt import Confirm
+        confirmed = Confirm.ask("Proceed with this commit?", default=False, console=console)
+    else:
+        confirmed = input(f"Proceed with commit: (yes/NO): ").lower() == "yes" # Simplified prompt for non-rich
+
+    if not confirmed:
+        return "Commit operation cancelled by user.", None
+
+    try:
+        process = subprocess.run(git_command_list, shell=False, capture_output=True, text=True, check=False)
+
+        if process.returncode == 0:
+            output = process.stdout.strip() if process.stdout.strip() else "Commit successful (no detailed output from git)."
+            if process.stderr.strip():
+                output += f"\nGit Stderr (info/warnings): {process.stderr.strip()}"
+            return output, None
+        else:
+            error_msg = process.stderr.strip() if process.stderr.strip() else process.stdout.strip()
+            if not error_msg: error_msg = f"Git commit command failed with return code {process.returncode} but no specific error message."
+            # Common case: nothing to commit
+            if "nothing to commit" in error_msg.lower() or "no changes added to commit" in error_msg.lower():
+                return f"Nothing to commit. {error_msg}", None # Return as success message with Git's info
+            return None, f"Git commit error: {error_msg}"
+
+    except FileNotFoundError:
+        return None, "Git command not found. Is Git installed and in PATH?"
+    except Exception as e:
+        console.print(f"[bold red]Unexpected error in handle_git_commit_request: {type(e).__name__} - {e}[/bold red]")
+        return None, f"An unexpected error occurred during git commit: {type(e).__name__}"
+
+def handle_git_push_request(remote_name: Optional[str], branch_name_to_push: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """Handles AGI request to push a git branch to a remote."""
+
+    effective_remote = remote_name.strip() if remote_name and remote_name.strip() else "origin"
+    effective_branch = branch_name_to_push.strip() if branch_name_to_push and branch_name_to_push.strip() else None
+
+    if not effective_branch:
+        try:
+            # Get current branch if not specified
+            proc = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True, check=True)
+            effective_branch = proc.stdout.strip()
+            if not effective_branch or effective_branch == "HEAD": # Detached HEAD or other issue
+                return None, "Could not determine current branch, or in detached HEAD state. Please specify branch to push."
+        except FileNotFoundError:
+            return None, "Git command not found. Is Git installed and in PATH?"
+        except subprocess.CalledProcessError as e:
+            return None, f"Failed to determine current branch: {e.stderr.strip()}"
+        except Exception as e:
+            return None, f"Unexpected error determining current branch: {e}"
+
+    git_command_list = ["git", "push", effective_remote, effective_branch]
+    command_str_display = " ".join(git_command_list)
+
+    console.print(Panel(Text(f"AGI suggests the following Git push command:\n\n[bold cyan]{command_str_display}[/bold cyan]", justify="left"),
+                        title="[bold blue]Git Push Request[/bold blue]", border_style="blue"))
+
+    if RICH_AVAILABLE:
+        from rich.prompt import Confirm
+        confirmed = Confirm.ask(f"Proceed with push: {command_str_display}?", default=False, console=console)
+    else:
+        confirmed = input(f"Proceed with push: {command_str_display}? (yes/NO): ").lower() == "yes"
+
+    if not confirmed:
+        return "Push operation cancelled by user.", None
+
+    try:
+        # Git push often requires credentials; this subprocess call won't handle interactive prompts for them.
+        # It assumes credentials are cached or handled by a credential helper.
+        # Output often goes to stderr, even for success.
+        console.print(f"[info]Attempting to execute: {command_str_display} (This might take a moment...)[/info]")
+        process = subprocess.run(git_command_list, shell=False, capture_output=True, text=True, check=False, timeout=60) # Increased timeout for network op
+
+        # Success/failure for push is complex. Return code 0 is good, but stderr can still have info.
+        # Non-zero often means clear failure.
+        if process.returncode == 0:
+            output = process.stderr.strip() if process.stderr.strip() else process.stdout.strip() # Prefer stderr for push status messages
+            if not output: output = "Push command executed, no detailed output from git."
+            # Check for common success phrases if output is ambiguous
+            if "everything up-to-date" in output.lower() or "->" in output or "branch" in output.lower() and "pushed" in output.lower():
+                 return f"Push successful: {output}", None
+            # If return code 0 but output looks like an error, treat as error
+            elif "error:" in output.lower() or "fatal:" in output.lower() or "rejected" in output.lower():
+                 return None, f"Git push error (despite return code 0): {output}"
+            return f"Push command processed: {output}", None # General success
+        else:
+            error_msg = process.stderr.strip() if process.stderr.strip() else process.stdout.strip()
+            if not error_msg: error_msg = f"Git push command failed with return code {process.returncode} but no specific error message."
+            return None, f"Git push error: {error_msg}"
+
+    except FileNotFoundError:
+        return None, "Git command not found. Is Git installed and in PATH?"
+    except subprocess.TimeoutExpired:
+        return None, "Git push command timed out after 60 seconds."
+    except Exception as e:
+        console.print(f"[bold red]Unexpected error in handle_git_push_request: {type(e).__name__} - {e}[/bold red]")
+        return None, f"An unexpected error occurred during git push: {type(e).__name__}"
 
 import io # For capturing stdout/stderr from exec
 import contextlib # For redirect_stdout/stderr
