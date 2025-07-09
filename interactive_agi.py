@@ -747,20 +747,37 @@ class MergedAGI:
                     "- User confirmation will be required.\n"
                     "- Example: {\"action\": \"git_push\", \"remote_name\": \"origin\", \"branch_name\": \"feature/login\", \"reasoning\": \"To push the completed login feature to the remote repository.\"}\n"
                     "\n"
-                    "General Guidelines for Tool Use and Error Handling:\n"
-                    "- If you request a tool action (e.g., read_file, run_shell, execute_python_code) and the system informs you in the next turn that the action failed (e.g., file not found, command error, code execution exception, search failed), you MUST acknowledge this failure in your response to the user.\n"
-                    "- Explain the problem clearly and concisely based on the feedback provided by the system.\n"
-                    "- If appropriate, ask the user for clarification (e.g., \"The file you specified was not found, could you please check the path?\" or \"The command resulted in an error, perhaps try a different approach?\").\n"
-                    "- If a user's request is too ambiguous for you to confidently choose a tool or its parameters, ask for clarification BEFORE attempting to use a tool.\n"
-                    "- Your primary goal is to be a helpful and coherent assistant. Use the information from tool outcomes (both success and failure) to inform your final response to the user for that turn.\n"
-                    "- For complex user requests that require multiple operations (e.g., reading several files, processing data, then writing a result):\n"
-                    "    - Briefly outline your plan in your reasoning for the first tool call, or in a natural language response if you need to clarify the overall goal with the user first.\n"
-                    "    - Request tools one at a time.\n"
-                    "    - After the system provides the outcome of a tool action, carefully consider that outcome to decide your next step. This might be another tool call (the next part of your plan) or generating the final answer.\n"
-                    "    - If a step in your plan fails, inform the user about the failure and why your overall plan might be affected or needs to change.\n"
+                    "For tasks requiring a sequence of tool operations, you can use the 'execute_plan' action:\n"
+                    "{\n"
+                    "  \"action\": \"execute_plan\",\n"
+                    "  \"plan_reasoning\": \"<Overall rationale for the entire plan>\",\n"
+                    "  \"steps\": [\n"
+                    "    { \"action\": \"<tool_1>\", ..., \"reasoning\": \"<step_1_reasoning>\" },\n"
+                    "    { \"action\": \"<tool_2>\", ..., \"reasoning\": \"<step_2_reasoning>\" },\n"
+                    "    ...\n"
+                    "  ]\n"
+                    "}\n"
+                    "Details for 'execute_plan':\n"
+                    "- 'plan_reasoning' (optional but recommended) explains the overall goal of the sequence.\n"
+                    "- 'steps' is a list, where each item is a complete JSON object for a single tool call (e.g., a full `run_shell` request, a `read_file` request, etc.), including its own 'action' and 'reasoning'.\n"
+                    "- The system will attempt to execute these steps sequentially. User confirmation will be sought for each sensitive operation within the plan (like `write_file`, `execute_python_code`, git modifications).\n"
+                    "- If any step is cancelled by the user or results in an error, the entire plan execution halts immediately.\n"
+                    "- After the plan attempts execution (fully or partially), you will be re-prompted once with a summary of all attempted steps and their outcomes.\n"
+                    "- Example: {\"action\": \"execute_plan\", \"plan_reasoning\": \"To create a script, make it executable, and then run it.\", \"steps\": [ \n"
+                    "    { \"action\": \"write_file\", \"filepath\": \"temp_script.py\", \"content\": \"print('Hello from plan!')\", \"reasoning\": \"Create the temporary script.\" },\n"
+                    "    { \"action\": \"run_shell\", \"command\": \"chmod\", \"args\": [\"+x\", \"temp_script.py\"], \"reasoning\": \"Make the script executable.\" },\n"
+                    "    { \"action\": \"run_shell\", \"command\": \"./temp_script.py\", \"args\": [], \"reasoning\": \"Run the script.\" }\n"
+                    "  ]}\n"
                     "\n"
-                    "If the query cannot be answered with one of these tools ('run_shell', 'read_file', 'write_file', 'web_search', 'git_branch_create', 'git_checkout', 'execute_python_code', 'git_commit', 'git_push'), or if it requires actions not supported, answer directly as a helpful assistant without using the JSON format.\n"
-                    "Choose only ONE action per turn if you decide to use a tool. Do not combine them in one JSON response.\n"
+                    "General Guidelines for Tool Use and Error Handling:\n"
+                    "- If you request a tool action (single or as part of a plan) and the system informs you that it failed, you MUST acknowledge this failure in your response to the user.\n"
+                    "- Explain the problem clearly based on the system's feedback.\n"
+                    "- If appropriate, ask the user for clarification or suggest alternatives.\n"
+                    "- If a user's request is too ambiguous, ask for clarification BEFORE attempting tool use or formulating a plan.\n"
+                    "- For complex requests not suitable for a single tool, consider using 'execute_plan'. If using single tools iteratively for a complex task, outline your plan in your reasoning and use each tool's outcome to inform your next step.\n"
+                    "\n"
+                    "If the query cannot be answered with one of these tools (single actions or `execute_plan`), or if it requires actions not supported, answer directly as a helpful assistant without using the JSON format.\n"
+                    "Choose only ONE top-level action per turn (e.g., one `run_shell` OR one `read_file` OR one `execute_plan`).\n"
                 )
                 full_prompt = f"{current_context_str}\n\nTool Instructions:\n{tool_instruction}\n\nUser Query:\n{task_prefix}{prompt}"
             else:
@@ -1012,9 +1029,316 @@ def main():
     console.print("-" * console.width)
 
     # --- Main Input Processing Function ---
+
+# Helper function to process a single tool call, used by process_agi_tool_request
+# This is a new internal helper for Stage 11's execute_plan
+def _execute_single_tool_step(
+    tool_step_data: dict, # The JSON data for the single tool step
+    raw_user_input_for_turn: str, # The original user input for the whole turn
+    agi_interface_instance: Union[MergedAGI, AGIPPlaceholder],
+    turn_log_data_ref: dict, # The main log data for the entire turn
+    plan_step_index: Optional[int] = None # If part of a plan, its index
+    ) -> tuple[str, bool, dict]: # Returns (outcome_summary_for_agi, success_bool, tool_interaction_log_entry_for_this_step)
+    """
+    Processes a single tool call, either standalone or as part of a plan.
+    Handles interaction, logging for this step, and preparing outcome for AGI.
+    Does NOT perform the AGI re-prompt itself if it's part of a plan.
+    """
+    action = tool_step_data.get("action")
+    # Initialize common fields for the log entry of this specific tool step
+    tool_interaction_log_entry = {
+        "tool_request_timestamp": datetime.now().isoformat(),
+        "action_type": action,
+        "action_details": tool_step_data, # Log the full step data as details
+        "reasoning": tool_step_data.get("reasoning", f"Reasoning not provided for {action} step."),
+        "part_of_plan_step": plan_step_index if plan_step_index is not None else None,
+        # user_confirmation, tool_outcome_summary, tool_outcome_timestamp will be added below
+    }
+
+    step_outcome_summary_for_agi = ""
+    step_succeeded = False # Tracks if this specific tool step was successful (or cancelled cleanly)
+
+    # --- Actual Tool Handling Logic (adapted from existing process_agi_tool_request) ---
+    # Note: This section will become very long, mirroring the previous if/elif structure.
+    # For brevity in this diff, I'll only show the structure and one example (run_shell).
+    # The actual implementation will move all tool handlers here.
+
+    if action == "run_shell":
+        command_executable = tool_step_data.get("command")
+        command_args_list = tool_step_data.get("args", [])
+        # ... (validation for command_executable, command_args_list as before) ...
+        if not isinstance(command_args_list, list) or not all(isinstance(arg, str) for arg in command_args_list) or not command_executable:
+            error_msg = f"Malformed '{action}' data: {tool_step_data}"
+            console.print(f"[warning]{error_msg}[/warning]")
+            step_outcome_summary_for_agi = f"Tool call '{action}' was malformed: {error_msg}"
+            tool_interaction_log_entry["user_confirmation"] = "n/a_malformed_request"
+            tool_interaction_log_entry["tool_outcome_summary"] = step_outcome_summary_for_agi
+            step_succeeded = False
+        elif command_executable not in SHELL_COMMAND_WHITELIST:
+            error_msg = f"Command '{command_executable}' is not whitelisted."
+            console.print(f"[warning]AGI suggested non-whitelisted command: '{command_executable}'. Denied.[/warning]")
+            step_outcome_summary_for_agi = f"Tool call '{action}' denied: {error_msg}"
+            tool_interaction_log_entry["user_confirmation"] = "denied_by_system_whitelist"
+            tool_interaction_log_entry["tool_outcome_summary"] = step_outcome_summary_for_agi
+            step_succeeded = False # System rejection is a form of step failure
+        else:
+            command_to_display = f"{command_executable} {' '.join(command_args_list)}"
+            console.print(Panel(Text(f"AGI tool step: [bold cyan]{command_to_display}[/bold cyan]\nReason: {tool_interaction_log_entry['reasoning']}", style="yellow"), title=f"[bold blue]Plan Step: Shell Command[/bold blue]"))
+            confirmed = Confirm.ask("Execute this shell command step?", default=False, console=console) if RICH_AVAILABLE else input("Execute? (yes/NO):").lower() == "yes"
+            tool_interaction_log_entry["user_confirmation"] = "confirmed" if confirmed else "cancelled"
+
+            if confirmed:
+                stdout_s, stderr_s, retcode = execute_shell_command(command_executable, command_args_list)
+                outcome_parts = []
+                if stdout_s and stdout_s.strip(): outcome_parts.append(f"Stdout: {stdout_s.strip()}")
+                if stderr_s and stderr_s.strip(): outcome_parts.append(f"Stderr: {stderr_s.strip()}")
+
+                log_summary = f"ReturnCode: {retcode}\n" + "\n".join(outcome_parts)
+                if not outcome_parts and retcode == 0 : log_summary = f"ReturnCode: {retcode}\nCommand executed with no output."
+                elif not outcome_parts and retcode !=0 : log_summary = f"ReturnCode: {retcode}\nCommand failed with no output."
+
+                if len(log_summary) > 500: log_summary = log_summary[:497] + "..."
+                tool_interaction_log_entry["tool_outcome_summary"] = log_summary
+                step_outcome_summary_for_agi = log_summary # For plan summary
+                step_succeeded = (retcode == 0) # Shell command success is usually retcode 0
+            else:
+                msg = f"Command '{command_to_display}' execution cancelled by user."
+                console.print(f"[yellow]{msg}[/yellow]")
+                tool_interaction_log_entry["tool_outcome_summary"] = msg
+                step_outcome_summary_for_agi = msg
+                step_succeeded = False # Cancellation is a form of step failure for plan progression
+
+    elif action == "read_file":
+        filepath_str = tool_step_data.get("filepath")
+        max_lines = tool_step_data.get("max_lines")
+        reasoning = tool_step_data.get("reasoning", "No reasoning for read_file.") # Already in main log entry
+        tool_interaction_log_entry["action_details"] = {"filepath": filepath_str, "max_lines": max_lines}
+
+        if not filepath_str:
+            error_msg = f"Malformed '{action}' data: missing 'filepath'. Payload: {tool_step_data}"
+            console.print(f"[warning]{error_msg}[/warning]")
+            step_outcome_summary_for_agi = error_msg
+            tool_interaction_log_entry["user_confirmation"] = "n/a_malformed_request"
+            tool_interaction_log_entry["tool_outcome_summary"] = error_msg
+            step_succeeded = False
+        else:
+            # User confirmation for read_file is implicit (AGI decides to read)
+            tool_interaction_log_entry["user_confirmation"] = "not_applicable"
+            file_content_for_agi, read_error = handle_read_file_request(filepath_str, max_lines)
+            if read_error:
+                step_outcome_summary_for_agi = f"Attempt to read file '{filepath_str}' failed. Error: {read_error}"
+                tool_interaction_log_entry["tool_outcome_summary"] = f"Error: {read_error}"
+                step_succeeded = False
+            else:
+                step_outcome_summary_for_agi = file_content_for_agi # This is the "data" for AGI
+                tool_interaction_log_entry["tool_outcome_summary"] = f"File '{filepath_str}' read successfully (snippet provided to AGI)."
+                step_succeeded = True
+
+    # ... (Implement similar blocks for write_file, execute_python_code, all git_ actions, web_search)
+
+    # Example for write_file (needs full implementation for all tools)
+    elif action == "write_file":
+        filepath_str = tool_step_data.get("filepath")
+        content_to_write = tool_step_data.get("content")
+        tool_interaction_log_entry["action_details"] = {"filepath": filepath_str, "content_length": len(content_to_write or "")}
+
+        if filepath_str is None or content_to_write is None:
+            error_msg = f"Malformed '{action}' data: missing fields. Payload: {tool_step_data}"
+            console.print(f"[warning]{error_msg}[/warning]")
+            step_outcome_summary_for_agi = error_msg
+            tool_interaction_log_entry["user_confirmation"] = "n/a_malformed_request"
+            tool_interaction_log_entry["tool_outcome_summary"] = error_msg
+            step_succeeded = False
+        else:
+            # handle_write_file_request includes user confirmation
+            outcome_message, outcome_error = handle_write_file_request(filepath_str, content_to_write)
+            if outcome_error:
+                step_outcome_summary_for_agi = f"Attempt to write file '{filepath_str}' failed. Error: {outcome_error}"
+                tool_interaction_log_entry["tool_outcome_summary"] = f"Error: {outcome_error}"
+                tool_interaction_log_entry["user_confirmation"] = "n/a_error_occurred" # Or based on outcome_message if it indicates prior cancel
+                step_succeeded = False
+            else: # outcome_message is not None
+                step_outcome_summary_for_agi = outcome_message
+                tool_interaction_log_entry["tool_outcome_summary"] = outcome_message
+                if "cancelled by user" in outcome_message.lower():
+                    tool_interaction_log_entry["user_confirmation"] = "cancelled"
+                    step_succeeded = False # Plan should halt on user cancel
+                else:
+                    tool_interaction_log_entry["user_confirmation"] = "confirmed"
+                    step_succeeded = True # File written or "no changes"
+
+    elif action == "execute_python_code":
+        code_snippet = tool_step_data.get("code")
+        tool_interaction_log_entry["action_details"] = {"code_snippet_length": len(code_snippet or "")} # Log length, not full code for brevity here
+
+        if not isinstance(code_snippet, str) or not code_snippet.strip():
+            error_msg = f"Malformed '{action}' data: missing or invalid 'code'. Payload: {tool_step_data}"
+            console.print(f"[warning]{error_msg}[/warning]")
+            step_outcome_summary_for_agi = error_msg
+            tool_interaction_log_entry["user_confirmation"] = "n/a_malformed_request"
+            tool_interaction_log_entry["tool_outcome_summary"] = error_msg
+            step_succeeded = False
+        else:
+            stdout_s, stderr_s, exception_s = handle_execute_python_code_request(code_snippet)
+            # handle_execute_python_code_request includes user confirmation and prints snippet/warning
+            # It now also prints the panel title using the prefix
+            stdout_s, stderr_s, exception_s = handle_execute_python_code_request(code_snippet, panel_title_prefix)
+
+            tool_outcome_parts = []
+            if stdout_s == "Code execution cancelled by user.":
+                tool_interaction_log_entry["user_confirmation"] = "cancelled"
+                step_succeeded = False
+                tool_outcome_parts.append(stdout_s)
+            elif exception_s == "StaticAnalysisReject":
+                tool_interaction_log_entry["user_confirmation"] = "denied_by_system_static_analysis"
+                step_succeeded = False
+                tool_outcome_parts.append(stdout_s) # stdout_s contains the rejection message here
+            else:
+                tool_interaction_log_entry["user_confirmation"] = "confirmed"
+                step_succeeded = not bool(exception_s) # Success if no Python exception during exec
+                if stdout_s and stdout_s.strip(): tool_outcome_parts.append(f"Stdout:\n{stdout_s.strip()}")
+                if stderr_s and stderr_s.strip(): tool_outcome_parts.append(f"Stderr:\n{stderr_s.strip()}")
+                if exception_s and exception_s.strip(): tool_outcome_parts.append(f"Exception:\n{exception_s.strip()}")
+
+            tool_outcome_summary_for_log = "\n---\n".join(tool_outcome_parts) if tool_outcome_parts else "No output or exception."
+            tool_interaction_log_entry["tool_outcome_summary"] = tool_outcome_summary_for_log
+            step_outcome_summary_for_agi = tool_outcome_summary_for_log # Full outcome for AGI
+
+            # If standalone execute_python_code, re-prompt AGI
+            if plan_step_index is None:
+                subsequent_prompt_for_agi = (
+                    f"{context_analyzer.get_full_context_string()}\n\n"
+                    f"Outcome of your 'execute_python_code' request:\n```python\n{code_snippet}\n```\nExecution Result:\n{step_outcome_summary_for_agi}\n\n"
+                    f"Original User Query: \"{raw_user_input_for_turn}\"\n\n"
+                    "Based on this outcome, please formulate your response to the user or decide on the next step."
+                )
+                tool_interaction_log_entry["context_for_next_agi_step"] = subsequent_prompt_for_agi
+                console.print(f"[info]Python code execution outcome processed. Re-prompting AGI...[/info]")
+                with console.status("[yellow]AGI is processing code execution outcome...[/yellow]", spinner="dots"):
+                    agi_secondary_raw_response = agi_interface_instance.generate_response(subsequent_prompt_for_agi)
+                tool_interaction_log_entry["agi_secondary_raw_response"] = agi_secondary_raw_response
+                step_outcome_summary_for_agi = agi_secondary_raw_response
+
+    elif action == "git_branch_create":
+        branch_name = tool_step_data.get("branch_name")
+        base_branch = tool_step_data.get("base_branch")
+        tool_interaction_log_entry["action_details"] = {"branch_name": branch_name, "base_branch": base_branch}
+        if not branch_name:
+            error_msg = f"Malformed '{action}' data: missing 'branch_name'. Payload: {tool_step_data}"
+            step_outcome_summary_for_agi = error_msg
+            tool_interaction_log_entry.update({"user_confirmation": "n/a_malformed_request", "tool_outcome_summary": error_msg})
+            step_succeeded = False
+        else:
+            # handle_git_branch_create_request includes user confirmation
+            outcome_message, outcome_error = handle_git_branch_create_request(branch_name, base_branch, panel_title_prefix)
+            tool_interaction_log_entry["user_confirmation"] = "confirmed" if outcome_message and ("successfully" in outcome_message.lower() or "processed" in outcome_message.lower()) else \
+                                                           ("cancelled" if outcome_message and "cancelled" in outcome_message.lower() else "n/a_error")
+            if outcome_error:
+                step_outcome_summary_for_agi = f"Git branch create failed: {outcome_error}"
+                tool_interaction_log_entry["tool_outcome_summary"] = f"Error: {outcome_error}"
+                step_succeeded = False
+            else:
+                step_outcome_summary_for_agi = outcome_message
+                tool_interaction_log_entry["tool_outcome_summary"] = outcome_message
+                step_succeeded = True
+
+    elif action == "git_checkout":
+        branch_name = tool_step_data.get("branch_name")
+        create_new = tool_step_data.get("create_new", False)
+        tool_interaction_log_entry["action_details"] = {"branch_name": branch_name, "create_new": create_new}
+        if not branch_name:
+            error_msg = f"Malformed '{action}' data: missing 'branch_name'. Payload: {tool_step_data}"
+            step_outcome_summary_for_agi = error_msg
+            tool_interaction_log_entry.update({"user_confirmation": "n/a_malformed_request", "tool_outcome_summary": error_msg})
+            step_succeeded = False
+        else:
+            outcome_message, outcome_error = handle_git_checkout_request(branch_name, create_new)
+            tool_interaction_log_entry["user_confirmation"] = "confirmed" if outcome_message and "Successfully" in outcome_message else \
+                                                           ("cancelled" if outcome_message and "cancelled" in outcome_message else "n/a_error")
+            if outcome_error:
+                step_outcome_summary_for_agi = f"Git checkout failed: {outcome_error}"
+                tool_interaction_log_entry["tool_outcome_summary"] = f"Error: {outcome_error}"
+                step_succeeded = False
+            else:
+                step_outcome_summary_for_agi = outcome_message
+                tool_interaction_log_entry["tool_outcome_summary"] = outcome_message
+                step_succeeded = True
+
+    elif action == "git_commit":
+        commit_message = tool_step_data.get("commit_message")
+        stage_all = tool_step_data.get("stage_all", False)
+        tool_interaction_log_entry["action_details"] = {"commit_message_length": len(commit_message or ""), "stage_all": stage_all}
+        if not commit_message or not commit_message.strip():
+            error_msg = f"Malformed '{action}' data: missing 'commit_message'. Payload: {tool_step_data}"
+            step_outcome_summary_for_agi = error_msg
+            tool_interaction_log_entry.update({"user_confirmation": "n/a_malformed_request", "tool_outcome_summary": error_msg})
+            step_succeeded = False
+        else:
+            outcome_message, outcome_error = handle_git_commit_request(commit_message, stage_all)
+            tool_interaction_log_entry["user_confirmation"] = "confirmed" if outcome_message and ("successfully" in outcome_message.lower() or "nothing to commit" in outcome_message.lower()) else \
+                                                           ("cancelled" if outcome_message and "cancelled" in outcome_message.lower() else "n/a_error")
+            if outcome_error:
+                step_outcome_summary_for_agi = f"Git commit failed: {outcome_error}"
+                tool_interaction_log_entry["tool_outcome_summary"] = f"Error: {outcome_error}"
+                step_succeeded = False
+            else:
+                step_outcome_summary_for_agi = outcome_message
+                tool_interaction_log_entry["tool_outcome_summary"] = outcome_message
+                step_succeeded = True # "nothing to commit" is also a success for the step
+
+    elif action == "git_push":
+        remote_name = tool_step_data.get("remote_name")
+        branch_name = tool_step_data.get("branch_name")
+        tool_interaction_log_entry["action_details"] = {"remote_name": remote_name, "branch_name": branch_name}
+        # No specific validation for missing optional fields here, handler defaults them
+        outcome_message, outcome_error = handle_git_push_request(remote_name, branch_name)
+        tool_interaction_log_entry["user_confirmation"] = "confirmed" if outcome_message and ("successfully" in outcome_message.lower() or "up-to-date" in outcome_message.lower()) else \
+                                                       ("cancelled" if outcome_message and "cancelled" in outcome_message.lower() else "n/a_error")
+        if outcome_error:
+            step_outcome_summary_for_agi = f"Git push failed: {outcome_error}"
+            tool_interaction_log_entry["tool_outcome_summary"] = f"Error: {outcome_error}"
+            step_succeeded = False
+        else:
+            step_outcome_summary_for_agi = outcome_message
+            tool_interaction_log_entry["tool_outcome_summary"] = outcome_message
+            step_succeeded = True
+
+    elif action == "web_search":
+        search_query = tool_step_data.get("query")
+        tool_interaction_log_entry["action_details"] = {"query": search_query}
+        if not search_query:
+            error_msg = f"Malformed '{action}' data: missing 'query'. Payload: {tool_step_data}"
+            step_outcome_summary_for_agi = error_msg
+            tool_interaction_log_entry.update({"user_confirmation": "n/a_malformed_request", "tool_outcome_summary": error_msg})
+            step_succeeded = False
+        else:
+            tool_interaction_log_entry["user_confirmation"] = "not_applicable"
+            search_results_str, search_error = handle_web_search_request(search_query)
+            if search_error:
+                step_outcome_summary_for_agi = f"Web search failed: {search_error}"
+                tool_interaction_log_entry["tool_outcome_summary"] = f"Error: {search_error}"
+                step_succeeded = False
+            else:
+                step_outcome_summary_for_agi = search_results_str # This is the data for AGI
+                tool_interaction_log_entry["tool_outcome_summary"] = "Search results provided to AGI." if search_results_str and "No search results found" not in search_results_str else search_results_str
+                step_succeeded = True
+    else: # Unknown action
+        error_msg = f"Unknown tool action '{action}' requested in plan step or standalone."
+        console.print(f"[red]{error_msg}[/red]")
+        step_outcome_summary_for_agi = error_msg
+        tool_interaction_log_entry["user_confirmation"] = "n/a_unknown_action"
+        tool_interaction_log_entry["tool_outcome_summary"] = error_msg
+        step_succeeded = False
+
+    tool_interaction_log_entry["tool_outcome_timestamp"] = datetime.now().isoformat()
+    turn_log_data_ref["tool_interactions"].append(tool_interaction_log_entry) # Append this step's log
+
+    return step_outcome_summary_for_agi, step_succeeded, tool_interaction_log_entry
+
+
 def process_single_input_turn(user_input_str: str,
                               agi_interface_instance: Union[MergedAGI, AGIPPlaceholder],
-                              turn_log_data_ref: dict,
+                              turn_log_data_ref: dict, # This is current_turn_interaction_data from the main loop
                               is_scripted_input: bool = False) -> str: # Returns "CONTINUE" or "EXIT"
     """
     Processes a single input string as one turn of interaction.
@@ -1035,928 +1359,556 @@ def process_single_input_turn(user_input_str: str,
     global final_text_for_user_display # To ensure it's assigned if an early exit happens
     final_text_for_user_display = "" # Reset for the turn
 
-    # Log the raw user query for this turn (already set by main loop or /run_script)
-    # turn_log_data_ref["user_query"] = user_input_str
-    # turn_log_data_ref["timestamp_user_query"] = datetime.now().isoformat() (also set by caller)
-
     if user_input_str.strip().lower() in ["exit", "quit"]:
         console.print("Exiting AGI session.", style="info")
-        # For JSONL logging, we might want to log this exit action.
         turn_log_data_ref["agi_final_response_to_user"] = "User initiated exit."
         turn_log_data_ref["timestamp_final_response"] = datetime.now().isoformat()
         log_interaction_to_jsonl(turn_log_data_ref)
         return "EXIT"
 
     if not user_input_str.strip():
-        return "CONTINUE" # Skip empty inputs
+        return "CONTINUE"
 
-    # Add user input to internal conversation history and plain text session log
-    # This happens regardless of whether it's a command or AGI query.
     conversation_history.append({"role": "user", "content": user_input_str, "timestamp": datetime.now().isoformat()})
-    if session_logger and not is_scripted_input: # Avoid double logging from /run_script's own print
+    if session_logger and not is_scripted_input:
         session_logger.log_entry("User", user_input_str)
 
-    # Default assumption: action_taken_by_tool_framework will be false unless a tool is successfully parsed and handled.
-    action_taken_by_tool_framework = False
+    action_taken_by_tool_framework = False # This will be true if a tool framework path is taken (single tool or plan)
 
     # --- User Command Processing ---
-    # This large if/elif block handles slash commands.
-    # If a command is handled, it typically prints its own output and this function will return "CONTINUE".
-    # If no slash command matches, it falls through to the 'else' which processes input via AGI.
-
     if user_input_str.lower().startswith("/set parameter "):
         parts = user_input_str.strip().split(maxsplit=3)
         if len(parts) == 4:
-                    _, _, param_name, param_value = parts
-                    response = agi_interface.set_parameter(param_name, param_value)
-                    console.print(f"AGI System: {response}")
-                    # No specific logging for system responses to desktop log, but they are in internal history.
+            _, _, param_name, param_value = parts
+            response = agi_interface_instance.set_parameter(param_name, param_value)
+            console.print(f"AGI System: {response}")
+        else:
+            console.print("AGI System: [red]Invalid command.[/red] Usage: /set parameter <NAME> <VALUE>")
+        turn_log_data_ref["is_user_command"] = True
+        turn_log_data_ref["command_details"] = {"command": "/set parameter", "args": user_input_str[len("/set parameter "):].strip()}
+        final_text_for_user_display = f"System: Parameter command processed."
+    elif user_input_str.lower() == "/show parameters":
+        response = agi_interface_instance.show_parameters()
+        console.print(Panel(response, title="[bold blue]AGI Parameters[/bold blue]", border_style="blue"))
+        turn_log_data_ref["is_user_command"] = True
+        turn_log_data_ref["command_details"] = {"command": "/show parameters"}
+        final_text_for_user_display = "System: /show parameters command processed."
+    elif user_input_str.lower().startswith("/ls"):
+        parts = user_input_str.strip().split(maxsplit=1)
+        path_to_list = parts[1] if len(parts) > 1 else "."
+        list_directory_contents(path_to_list)
+        turn_log_data_ref["is_user_command"] = True
+        turn_log_data_ref["command_details"] = {"command": "/ls", "path": path_to_list}
+        final_text_for_user_display = f"System: /ls command processed for path '{path_to_list}'."
+    elif user_input_str.lower() == "/cwd":
+        console.print(Panel(os.getcwd(), title="[bold blue]Current Working Directory[/bold blue]", border_style="blue"))
+        turn_log_data_ref["is_user_command"] = True
+        turn_log_data_ref["command_details"] = {"command": "/cwd"}
+        final_text_for_user_display = "System: /cwd command processed."
+    elif user_input_str.lower().startswith("/cd "):
+        parts = user_input_str.strip().split(maxsplit=1)
+        path_to_change = ""
+        if len(parts) > 1:
+            path_to_change = parts[1]
+            change_directory(path_to_change)
+        else:
+            console.print("[red]Usage: /cd <path>[/red]")
+        turn_log_data_ref["is_user_command"] = True
+        turn_log_data_ref["command_details"] = {"command": "/cd", "path": path_to_change}
+        final_text_for_user_display = f"System: /cd command processed for path '{path_to_change}'."
+    elif user_input_str.lower() == "/clear":
+        console.clear()
+        display_startup_banner()
+        turn_log_data_ref["is_user_command"] = True
+        turn_log_data_ref["command_details"] = {"command": "/clear"}
+        final_text_for_user_display = "System: /clear command processed."
+    elif user_input_str.lower() == "/history":
+        display_conversation_history()
+        turn_log_data_ref["is_user_command"] = True
+        turn_log_data_ref["command_details"] = {"command": "/history"}
+        final_text_for_user_display = "System: /history command processed."
+    elif user_input_str.lower() == "/sysinfo":
+        display_system_info()
+        turn_log_data_ref["is_user_command"] = True
+        turn_log_data_ref["command_details"] = {"command": "/sysinfo"}
+        final_text_for_user_display = "System: /sysinfo command processed."
+    elif user_input_str.lower().startswith("/search "):
+        query = user_input_str[len("/search "):].strip()
+        if query:
+            perform_internet_search(query)
+        else:
+            console.print("[red]Usage: /search <your query>[/red]")
+        turn_log_data_ref["is_user_command"] = True
+        turn_log_data_ref["command_details"] = {"command": "/search", "query": query}
+        final_text_for_user_display = f"System: /search command processed for query '{query}'."
+    elif user_input_str.lower().startswith("/mkdir "):
+        path_to_create = user_input_str[len("/mkdir "):].strip()
+        if path_to_create:
+            create_directory_command(path_to_create)
+        else:
+            console.print("[red]Usage: /mkdir <directory_name>[/red]")
+        turn_log_data_ref["is_user_command"] = True
+        turn_log_data_ref["command_details"] = {"command": "/mkdir", "path": path_to_create}
+        final_text_for_user_display = f"System: /mkdir command processed for path '{path_to_create}'."
+    elif user_input_str.lower().startswith("/rm "):
+        path_to_remove = user_input_str[len("/rm "):].strip()
+        if path_to_remove:
+            remove_path_command(path_to_remove)
+        else:
+            console.print("[red]Usage: /rm <file_or_directory_path>[/red]")
+        turn_log_data_ref["is_user_command"] = True
+        turn_log_data_ref["command_details"] = {"command": "/rm", "path": path_to_remove}
+        final_text_for_user_display = f"System: /rm command processed for path '{path_to_remove}'."
+    elif user_input_str.lower().startswith("/cp "):
+        parts = user_input_str.strip().split()
+        source, dest = "", ""
+        if len(parts) == 3:
+            source, dest = parts[1], parts[2]
+            copy_path_command(source, dest)
+        else:
+            console.print("[red]Usage: /cp <source> <destination>[/red]")
+        turn_log_data_ref["is_user_command"] = True
+        turn_log_data_ref["command_details"] = {"command": "/cp", "source": source, "destination": dest}
+        final_text_for_user_display = f"System: /cp command processed for source '{source}', destination '{dest}'."
+    elif user_input_str.lower().startswith("/mv "):
+        parts = user_input_str.strip().split()
+        source, dest = "", ""
+        if len(parts) == 3:
+            source, dest = parts[1], parts[2]
+            move_path_command(source, dest)
+        else:
+            console.print("[red]Usage: /mv <source> <destination>[/red]")
+        turn_log_data_ref["is_user_command"] = True
+        turn_log_data_ref["command_details"] = {"command": "/mv", "source": source, "destination": dest}
+        final_text_for_user_display = f"System: /mv command processed for source '{source}', destination '{dest}'."
+    elif user_input_str.lower().startswith("/cat "):
+        file_path_to_cat = user_input_str[len("/cat "):].strip()
+        if file_path_to_cat:
+            cat_file_command(file_path_to_cat, agi_interface_instance)
+        else:
+            console.print("[red]Usage: /cat <file_path>[/red]")
+        turn_log_data_ref["is_user_command"] = True # Still a user command, even if AGI is used for summary
+        turn_log_data_ref["command_details"] = {"command": "/cat", "path": file_path_to_cat}
+        final_text_for_user_display = f"System: /cat command processed for '{file_path_to_cat}'."
+    elif user_input_str.lower().startswith("/edit "):
+        file_path_to_edit = user_input_str[len("/edit "):].strip()
+        if file_path_to_edit:
+            edit_file_command(file_path_to_edit)
+        else:
+            console.print("[red]Usage: /edit <file_path>[/red]")
+        turn_log_data_ref["is_user_command"] = True
+        turn_log_data_ref["command_details"] = {"command": "/edit", "path": file_path_to_edit}
+        final_text_for_user_display = f"System: /edit command processed for '{file_path_to_edit}'."
+    elif user_input_str.lower().startswith("/read_script "):
+        script_name_to_read = user_input_str[len("/read_script "):].strip()
+        allowed_scripts = ["interactive_agi.py", "setup_agi_terminal.py", "adaptive_train.py", "download_models.sh", "train_on_interaction.sh", "merge_config.yml"]
+        if script_name_to_read and script_name_to_read in allowed_scripts:
+            script_path = Path(script_name_to_read)
+            if not script_path.exists(): script_path = Path("..") / script_name_to_read
+            if script_path.exists() and script_path.is_file():
+                 cat_file_command(str(script_path), agi_interface_instance)
+            else: console.print(f"[red]Error: Script '{script_name_to_read}' not found.[/red]")
+        elif script_name_to_read: console.print(f"[red]Error: Reading script '{script_name_to_read}' is not allowed.[/red]")
+        else: console.print("[red]Usage: /read_script <script_filename>[/red]")
+        turn_log_data_ref["is_user_command"] = True
+        turn_log_data_ref["command_details"] = {"command": "/read_script", "script_name": script_name_to_read}
+        final_text_for_user_display = f"System: /read_script command processed for '{script_name_to_read}'."
+    elif user_input_str.lower().startswith("/config"):
+        config_args = user_input_str.strip()[len("/config"):].strip()
+        config_command_handler(config_args)
+        turn_log_data_ref["is_user_command"] = True
+        turn_log_data_ref["command_details"] = {"command": "/config", "args": config_args}
+        final_text_for_user_display = f"System: /config command processed with args '{config_args}'."
+    elif user_input_str.lower().startswith("/git "):
+        git_command_parts = user_input_str.strip().split(maxsplit=2)
+        git_subcommand = git_command_parts[1].lower() if len(git_command_parts) > 1 else None
+        git_args = git_command_parts[2] if len(git_command_parts) > 2 else None
+        if git_subcommand == "status": git_status_command()
+        elif git_subcommand == "diff": git_diff_command(git_args)
+        elif git_subcommand == "log": git_log_command(git_args)
+        else: console.print(f"[red]Unknown git subcommand: {git_subcommand}[/red]")
+        turn_log_data_ref["is_user_command"] = True
+        turn_log_data_ref["command_details"] = {"command": "/git", "args": user_input_str[len("/git "):].strip()}
+        final_text_for_user_display = f"System: /git command processed."
+    elif user_input_str.lower() == "/help":
+        display_help_command()
+        turn_log_data_ref["is_user_command"] = True
+        turn_log_data_ref["command_details"] = {"command": "/help"}
+        final_text_for_user_display = "System: /help command processed."
+    elif user_input_str.lower().startswith("/save_script "):
+        parts = user_input_str.strip().split(maxsplit=2)
+        script_name, commands_str = "", ""
+        if len(parts) < 3: console.print("[red]Usage: /save_script <script_name> <command1> ; ...[/red]")
+        else:
+            script_name = parts[1]
+            commands_str = parts[2]
+            if not re.match(r"^[a-zA-Z0-9_-]+$", script_name): console.print(f"[red]Invalid script name: '{script_name}'.[/red]")
+            elif not commands_str.strip(): console.print(f"[red]Cannot save an empty script for '{script_name}'.[/red]")
+            else:
+                commands_list = [cmd.strip() for cmd in commands_str.split(';') if cmd.strip()]
+                if not commands_list: console.print(f"[red]No valid commands in script for '{script_name}'.[/red]")
                 else:
-                    console.print("AGI System: [red]Invalid command.[/red] Usage: /set parameter <NAME> <VALUE>")
-            elif user_input.lower() == "/show parameters":
-                response = agi_interface.show_parameters()
-                console.print(Panel(response, title="[bold blue]AGI Parameters[/bold blue]", border_style="blue"))
-            elif user_input.lower().startswith("/ls"):
-                parts = user_input.strip().split(maxsplit=1)
-                path_to_list = parts[1] if len(parts) > 1 else "."
-                list_directory_contents(path_to_list)
-            elif user_input.lower() == "/cwd":
-                console.print(Panel(os.getcwd(), title="[bold blue]Current Working Directory[/bold blue]", border_style="blue"))
-            elif user_input.lower().startswith("/cd "):
-                parts = user_input.strip().split(maxsplit=1)
-                if len(parts) > 1:
-                    change_directory(parts[1])
-                else:
-                    console.print("[red]Usage: /cd <path>[/red]")
-            elif user_input.lower() == "/clear":
-                console.clear()
-                display_startup_banner() # Re-display banner after clearing
-            elif user_input.lower() == "/history":
-                display_conversation_history()
-            elif user_input.lower() == "/sysinfo":
-                display_system_info()
-            elif user_input.lower().startswith("/search "):
-                query = user_input[len("/search "):].strip()
-                if query:
-                    perform_internet_search(query)
-                else:
-                    console.print("[red]Usage: /search <your query>[/red]")
-            elif user_input.lower().startswith("/mkdir "):
-                path_to_create = user_input[len("/mkdir "):].strip()
-                if path_to_create:
-                    create_directory_command(path_to_create)
-                else:
-                    console.print("[red]Usage: /mkdir <directory_name>[/red]")
-            elif user_input.lower().startswith("/rm "):
-                path_to_remove = user_input[len("/rm "):].strip()
-                if path_to_remove:
-                    remove_path_command(path_to_remove)
-                else:
-                    console.print("[red]Usage: /rm <file_or_directory_path>[/red]")
-            elif user_input.lower().startswith("/cp "):
-                parts = user_input.strip().split()
-                if len(parts) == 3:
-                    source, destination = parts[1], parts[2]
-                    copy_path_command(source, destination)
-                else:
-                    console.print("[red]Usage: /cp <source> <destination>[/red]")
-            elif user_input.lower().startswith("/mv "):
-                parts = user_input.strip().split()
-                if len(parts) == 3:
-                    source, destination = parts[1], parts[2]
-                    move_path_command(source, destination)
-                else:
-                    console.print("[red]Usage: /mv <source> <destination>[/red]")
-            elif user_input.lower().startswith("/cat "):
-                file_path_to_cat = user_input[len("/cat "):].strip()
-                if file_path_to_cat:
-                    cat_file_command(file_path_to_cat, agi_interface) # Pass agi_interface for summarization
-                else:
-                    console.print("[red]Usage: /cat <file_path>[/red]")
-            elif user_input.lower().startswith("/edit "):
-                file_path_to_edit = user_input[len("/edit "):].strip()
-                if file_path_to_edit:
-                    edit_file_command(file_path_to_edit)
-                else:
-                    console.print("[red]Usage: /edit <file_path>[/red]")
-            elif user_input.lower().startswith("/read_script "):
-                script_name_to_read = user_input[len("/read_script "):].strip()
-                allowed_scripts = ["interactive_agi.py", "setup_agi_terminal.py", "adaptive_train.py", "download_models.sh", "train_on_interaction.sh", "merge_config.yml"]
-                if script_name_to_read and script_name_to_read in allowed_scripts:
-                    # Check if file exists in current dir or one level up (common for dev setups)
-                    script_path = Path(script_name_to_read)
-                    if not script_path.exists():
-                        script_path = Path("..") / script_name_to_read # Check parent if not in CWD
-
-                    if script_path.exists() and script_path.is_file():
-                         cat_file_command(str(script_path), agi_interface)
-                    else:
-                         console.print(f"[red]Error: Script '{script_name_to_read}' not found at expected locations.[/red]")
-                elif script_name_to_read:
-                    console.print(f"[red]Error: Reading script '{script_name_to_read}' is not allowed. Allowed scripts: {', '.join(allowed_scripts)}[/red]")
-                else:
-                    console.print("[red]Usage: /read_script <script_filename>[/red]")
-            elif user_input.lower().startswith("/config"):
-                config_args = user_input.strip()[len("/config"):].strip() # Get args after /config
-                config_command_handler(config_args)
-            elif user_input.lower().startswith("/git "):
-                git_command_parts = user_input.strip().split(maxsplit=2) # /git <subcommand> [args]
-                git_subcommand = git_command_parts[1].lower() if len(git_command_parts) > 1 else None
-                git_args = git_command_parts[2] if len(git_command_parts) > 2 else None
-
-                if git_subcommand == "status":
-                    git_status_command()
-                elif git_subcommand == "diff":
-                    git_diff_command(git_args) # git_args might be None or a file path
-                elif git_subcommand == "log":
-                    # Args for log could be -n <count> or other git log options.
-                    # For simplicity, we'll just pass them along or parse -n.
-                    git_log_command(git_args) # git_args might be like "-n 5" or None
-                else:
-                    console.print(f"[red]Unknown git subcommand: {git_subcommand}[/red]")
-                    console.print("[info]Available git commands: status, diff [file], log [-n count][/info]")
-            elif user_input.lower() == "/help":
-                display_help_command()
-                # For /help and other user commands that don't involve AGI, we might log them differently or skip full AGI log
-                # For now, let's assume they might have a minimal log entry or are handled outside the main AGI interaction logging path
-                # For simplicity in this step, we'll focus on interactions that go to the AGI.
-                # So, if a command is handled here, it bypasses the main AGI JSONL logging for the turn.
-                # This could be refined later if needed. A simple log_interaction_to_jsonl call could be made here too.
-            elif user_input.lower().startswith("/save_script "):
-                parts = user_input.strip().split(maxsplit=2)
-                if len(parts) < 3:
-                    console.print("[red]Usage: /save_script <script_name> <command1> ; <command2> ; ...[/red]")
-                else:
-                    script_name = parts[1]
-                    commands_str = parts[2]
-                    # Basic script name validation
-                    if not re.match(r"^[a-zA-Z0-9_-]+$", script_name):
-                        console.print(f"[red]Invalid script name: '{script_name}'. Use alphanumeric characters, underscores, or hyphens.[/red]")
-                    elif not commands_str.strip():
-                        console.print(f"[red]Cannot save an empty script for '{script_name}'.[/red]")
-                    else:
-                        commands_list = [cmd.strip() for cmd in commands_str.split(';') if cmd.strip()]
-                        if not commands_list:
-                             console.print(f"[red]No valid commands found in script string for '{script_name}'. Use ';' to separate commands.[/red]")
-                        else:
-                            scripts = load_user_scripts()
-                            scripts[script_name] = commands_list
-                            save_user_scripts(scripts)
-                            console.print(f"[green]Script '{script_name}' saved with {len(commands_list)} command(s).[/green]")
-            elif user_input_str.lower() == "/list_models": # New command
-                display_list_models_command()
-            elif user_input_str.lower().startswith("/run_script "):
-                parts = user_input_str.strip().split(maxsplit=1)
-                if len(parts) < 2 or not parts[1].strip():
-                    console.print("[red]Usage: /run_script <script_name>[/red]")
-                else:
-                    script_name_to_run = parts[1].strip()
                     scripts = load_user_scripts()
-                    if script_name_to_run not in scripts:
-                        console.print(f"[yellow]Script '{script_name_to_run}' not found.[/yellow]")
+                    scripts[script_name] = commands_list
+                    save_user_scripts(scripts)
+                    console.print(f"[green]Script '{script_name}' saved.[/green]")
+        turn_log_data_ref["is_user_command"] = True
+        turn_log_data_ref["command_details"] = {"command": "/save_script", "name": script_name, "commands_str_len": len(commands_str)}
+        final_text_for_user_display = "System: /save_script command processed."
+    elif user_input_str.lower() == "/list_models":
+        display_list_models_command()
+        turn_log_data_ref["is_user_command"] = True
+        turn_log_data_ref["command_details"] = {"command": "/list_models"}
+        final_text_for_user_display = "System: /list_models command processed."
+    elif user_input_str.lower().startswith("/run_script "):
+        parts = user_input_str.strip().split(maxsplit=1)
+        script_name_to_run = ""
+        if len(parts) < 2 or not parts[1].strip(): console.print("[red]Usage: /run_script <script_name>[/red]")
+        else:
+            script_name_to_run = parts[1].strip()
+            scripts = load_user_scripts()
+            if script_name_to_run not in scripts: console.print(f"[yellow]Script '{script_name_to_run}' not found.[/yellow]")
+            else:
+                console.print(f"[info]Running script: '{script_name_to_run}'...[/info]")
+                script_commands = scripts[script_name_to_run]
+                for i, command_str in enumerate(script_commands):
+                    console.print(f"\n[magenta]--- Script '{script_name_to_run}' Command {i+1}/{len(script_commands)} ---[/magenta]")
+                    console.print(f"[dim]Executing: [/dim][bold cyan]{command_str}[/bold cyan]")
+                    action_prompt = Text.assemble(("Press ", "magenta"), ("ENTER", "bold white"), (" to execute, ", "magenta"), ("S", "bold white"), (" to skip, ", "magenta"), ("A", "bold white"), (" to abort script: ", "magenta"))
+                    user_choice = console.input(action_prompt).lower().strip() if RICH_AVAILABLE else input("Press ENTER to execute, S to skip, A to abort script: ").lower().strip()
+                    if user_choice == 's': console.print("[yellow]Skipped.[/yellow]"); continue
+                    if user_choice == 'a': console.print("[yellow]Script aborted by user.[/yellow]"); break
+                    if user_choice == "":
+                        global TURN_ID_COUNTER
+                        TURN_ID_COUNTER +=1
+                        script_turn_data = {"session_id": SESSION_ID, "turn_id": TURN_ID_COUNTER, "timestamp_user_query": datetime.now().isoformat(), "user_query": command_str, "tool_interactions": [], "script_info": {"parent_script": script_name_to_run, "command_index": i}}
+                        status = process_single_input_turn(command_str, agi_interface_instance, script_turn_data, is_scripted_input=True)
+                        if status == "EXIT": console.print(f"[yellow]Script '{script_name_to_run}' encountered exit. Script terminated.[/yellow]"); break
+                    else: console.print("[yellow]Invalid choice. Skipping command.[/yellow]"); continue
+                else: console.print(f"[info]Script '{script_name_to_run}' finished.[/info]")
+        turn_log_data_ref["is_user_command"] = True
+        turn_log_data_ref["command_details"] = {"command": "/run_script", "script_name": script_name_to_run}
+        final_text_for_user_display = f"System: /run_script '{script_name_to_run}' execution sequence initiated/completed."
+    elif user_input_str.lower() == "/list_scripts":
+        scripts = load_user_scripts()
+        if not scripts: console.print("[yellow]No user scripts saved.[/yellow]")
+        else:
+            table = Table(title="[bold blue]Saved User Scripts[/bold blue]")
+            table.add_column("Script Name", style="cyan", no_wrap=True); table.add_column("# Commands", style="magenta", justify="right"); table.add_column("Commands (first few shown)", style="white")
+            for name, cmds in sorted(scripts.items()):
+                cmds_preview = " ; ".join(cmds[:3]);
+                if len(cmds) > 3: cmds_preview += " ; ..."
+                table.add_row(name, str(len(cmds)), cmds_preview)
+            console.print(table)
+        turn_log_data_ref["is_user_command"] = True
+        turn_log_data_ref["command_details"] = {"command": "/list_scripts"}
+        final_text_for_user_display = "System: /list_scripts command processed."
+    elif user_input_str.lower().startswith("/delete_script "):
+        parts = user_input_str.strip().split(maxsplit=1)
+        script_name_to_delete = ""
+        if len(parts) < 2 or not parts[1].strip(): console.print("[red]Usage: /delete_script <script_name>[/red]")
+        else:
+            script_name_to_delete = parts[1].strip()
+            scripts = load_user_scripts()
+            if script_name_to_delete in scripts: del scripts[script_name_to_delete]; save_user_scripts(scripts); console.print(f"[green]Script '{script_name_to_delete}' deleted.[/green]")
+            else: console.print(f"[yellow]Script '{script_name_to_delete}' not found.[/yellow]")
+        turn_log_data_ref["is_user_command"] = True
+        turn_log_data_ref["command_details"] = {"command": "/delete_script", "script_name": script_name_to_delete}
+        final_text_for_user_display = f"System: /delete_script command processed for '{script_name_to_delete}'."
+    elif user_input_str.lower().startswith("/suggest_code_change "):
+        file_path_to_suggest = user_input_str[len("/suggest_code_change "):].strip()
+        if file_path_to_suggest:
+            suggest_code_change_command(file_path_to_suggest, agi_interface_instance)
+        else:
+            console.print("[red]Usage: /suggest_code_change <file_path>[/red]")
+        turn_log_data_ref["is_user_command"] = True
+        turn_log_data_ref["command_details"] = {"command": "/suggest_code_change", "path": file_path_to_suggest}
+        final_text_for_user_display = f"System: /suggest_code_change processed for '{file_path_to_suggest}' (AGI interaction handled within)."
+    # --- End of User Command Block ---
+
+    else: # Default: Input goes to AGI
+        turn_log_data_ref["is_user_command"] = False # This is an AGI query
+        turn_log_data_ref["context_at_query_time"] = context_analyzer.get_full_context_dict()
+        turn_log_data_ref["agi_initial_processing_details"] = {
+            "generation_params_used": agi_interface_instance.generation_params.copy(),
+            "detected_task_type": agi_interface_instance.last_detected_task_type
+        }
+
+        with console.status("[yellow]AGI is thinking...[/yellow]", spinner="dots"):
+            agi_initial_raw_response = agi_interface_instance.generate_response(user_input_str)
+
+        turn_log_data_ref["agi_initial_raw_response"] = agi_initial_raw_response
+        final_text_for_user_display = agi_initial_raw_response # Default if no tool or tool fails early
+
+        # --- Try to process AGI response as a potential tool request (single or plan) ---
+        try:
+            json_match = re.search(r"```json\n(.*?)\n```", agi_initial_raw_response, re.DOTALL)
+            json_str_to_parse = json_match.group(1) if json_match else agi_initial_raw_response
+            first_brace = json_str_to_parse.find('{')
+            last_brace = json_str_to_parse.rfind('}')
+            if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+                json_str_to_parse = json_str_to_parse[first_brace : last_brace+1]
+
+            parsed_tool_request_data = json.loads(json_str_to_parse)
+            action_type_from_agi = parsed_tool_request_data.get("action")
+
+            if isinstance(parsed_tool_request_data, dict) and action_type_from_agi:
+                action_taken_by_tool_framework = True # A tool path is being taken
+
+                if action_type_from_agi == "execute_plan":
+                    plan_steps_data = parsed_tool_request_data.get("steps", [])
+                    plan_reasoning = parsed_tool_request_data.get("plan_reasoning", "No overall plan reasoning provided.")
+
+                    # Initialize plan_execution_details in the main turn log
+                    turn_log_data_ref["plan_execution_details"] = {
+                        "action_type": "execute_plan", # Explicitly log that this was a plan
+                        "plan_reasoning": plan_reasoning,
+                        "requested_steps_count": len(plan_steps_data),
+                        "executed_steps_count": 0, # Will be incremented
+                        "plan_outcome": "Pending", # Will be updated: "Completed", "Halted", "Malformed"
+                        "context_for_final_agi_step": None, # Will be populated before re-prompt
+                        "agi_final_response_after_plan": None # Will be populated after re-prompt
+                    }
+
+                    if not isinstance(plan_steps_data, list) or not plan_steps_data:
+                        final_text_for_user_display = "AGI suggested a plan with no steps or invalid format. Please try again."
+                        turn_log_data_ref["plan_execution_details"]["plan_outcome"] = "Malformed Plan (no steps)"
+                        action_taken_by_tool_framework = False
                     else:
-                        console.print(f"[info]Running script: '{script_name_to_run}'...[/info]")
-                        script_commands = scripts[script_name_to_run]
-                        for i, command_str in enumerate(script_commands):
-                            console.print(f"\n[magenta]--- Script '{script_name_to_run}' Command {i+1}/{len(script_commands)} ---[/magenta]")
-                            console.print(f"[dim]Executing: [/dim][bold cyan]{command_str}[/bold cyan]")
+                        console.print(Panel(Text(f"AGI proposes a multi-step plan:\n[italic]{plan_reasoning}[/italic]", style="yellow"),
+                                            title="[bold blue]AGI Execution Plan[/bold blue]", border_style="blue"))
 
-                            action = ""
-                            if RICH_AVAILABLE: # More controlled input if Rich is available
-                                action_prompt = Text.assemble(
-                                    ("Press ", "magenta"), ("ENTER", "bold white"), (" to execute, ", "magenta"),
-                                    ("S", "bold white"), (" to skip, ", "magenta"),
-                                    ("A", "bold white"), (" to abort script: ", "magenta")
-                                )
-                                user_choice = console.input(action_prompt).lower().strip()
-                            else: # Basic input
-                                user_choice = input("Press ENTER to execute, S to skip, A to abort script: ").lower().strip()
+                        plan_outcome_summaries_for_agi = []
+                        plan_halted = False
+                        executed_step_count = 0
 
-                            if user_choice == 's':
-                                console.print("[yellow]Skipped.[/yellow]")
-                                continue
-                            elif user_choice == 'a':
-                                console.print("[yellow]Script aborted by user.[/yellow]")
+                        for i, step_data in enumerate(plan_steps_data):
+                            console.print(f"\n[magenta]--- Executing Plan Step {i+1}/{len(plan_steps_data)} ---[/magenta]")
+                            step_outcome_summary, step_success, step_tool_log_entry = _execute_single_tool_step(
+                                tool_step_data=step_data,
+                                raw_user_input_for_turn=user_input_str,
+                                agi_interface_instance=agi_interface_instance,
+                                turn_log_data_ref=turn_log_data_ref,
+                                plan_step_index=i
+                            )
+                            # step_tool_log_entry is already appended to turn_log_data_ref["tool_interactions"]
+                            plan_outcome_summaries_for_agi.append(f"Step {i+1} ({step_tool_log_entry.get('action_type', 'unknown_action')} - Status: {'Success' if step_success else 'Failed/Cancelled'}): {step_outcome_summary}")
+                            executed_step_count += 1
+
+                            if not step_success:
+                                console.print(f"[bold red]Plan step {i+1} failed or was cancelled. Halting plan execution.[/bold red]")
+                                plan_halted = True
+                                turn_log_data_ref["plan_execution_details"]["plan_outcome"] = f"Halted at step {i+1} ({step_tool_log_entry.get('action_type')})"
                                 break
-                            elif user_choice == "": # Enter pressed
-                                global TURN_ID_COUNTER # Need to modify global counter
-                                TURN_ID_COUNTER +=1
-                                script_turn_data = {
-                                    "session_id": SESSION_ID, # Use global session ID
-                                    "turn_id": TURN_ID_COUNTER,
-                                    "timestamp_user_query": datetime.now().isoformat(),
-                                    "user_query": command_str, # The command from the script
-                                    "tool_interactions": [],
-                                    "script_info": {"parent_script": script_name_to_run, "command_index": i}
-                                }
-                                # Call the main processing function for this command
-                                # is_scripted_input=True prevents double logging of user input to session_logger
-                                status = process_single_input_turn(command_str, agi_interface_instance, script_turn_data, is_scripted_input=True)
-                                if status == "EXIT": # If the scripted command was 'exit' or 'quit'
-                                    console.print(f"[yellow]Script '{script_name_to_run}' encountered an exit command. Script terminated.[/yellow]")
-                                    # We need to decide if 'exit' in a script exits the whole app or just the script.
-                                    # For now, let's make it terminate the script only. The main loop will continue.
-                                    # If we wanted it to exit the app, this function would need to propagate "EXIT"
-                                    break
-                            else:
-                                console.print("[yellow]Invalid choice. Skipping command.[/yellow]")
-                                continue
-                        else: # For loop completed without break
-                            console.print(f"[info]Script '{script_name_to_run}' finished.[/info]")
-            elif user_input.lower() == "/list_scripts":
-                scripts = load_user_scripts()
-                if not scripts:
-                    console.print("[yellow]No user scripts saved yet. Use /save_script to create one.[/yellow]")
-                else:
-                    table = Table(title="[bold blue]Saved User Scripts[/bold blue]")
-                    table.add_column("Script Name", style="cyan", no_wrap=True)
-                    table.add_column("# Commands", style="magenta", justify="right")
-                    table.add_column("Commands (first few shown)", style="white")
-                    for name, cmds in sorted(scripts.items()):
-                        cmds_preview = " ; ".join(cmds[:3])
-                        if len(cmds) > 3:
-                            cmds_preview += " ; ..."
-                        table.add_row(name, str(len(cmds)), cmds_preview)
-                    console.print(table)
-            elif user_input.lower().startswith("/delete_script "):
-                parts = user_input.strip().split(maxsplit=1)
-                if len(parts) < 2 or not parts[1].strip():
-                    console.print("[red]Usage: /delete_script <script_name>[/red]")
-                else:
-                    script_name_to_delete = parts[1].strip()
-                    scripts = load_user_scripts()
-                    if script_name_to_delete in scripts:
-                        del scripts[script_name_to_delete]
-                        save_user_scripts(scripts)
-                        console.print(f"[green]Script '{script_name_to_delete}' deleted.[/green]")
-                    else:
-                        console.print(f"[yellow]Script '{script_name_to_delete}' not found.[/yellow]")
-            elif user_input.lower().startswith("/suggest_code_change "): # New handler
-                file_path_to_suggest = user_input[len("/suggest_code_change "):].strip()
-                if file_path_to_suggest:
-                    suggest_code_change_command(file_path_to_suggest, agi_interface)
-                else:
-                    console.print("[red]Usage: /suggest_code_change <file_path>[/red]")
-            else: # Default: AGI generates a response or suggests a command
-                # Capture context before AGI call
-                current_turn_interaction_data["context_at_query_time"] = context_analyzer.get_full_context_dict()
-                current_turn_interaction_data["agi_initial_processing_details"] = {
-                    "generation_params_used": agi_interface.generation_params.copy(), # Log a copy
-                    "detected_task_type": agi_interface.last_detected_task_type # This is updated before generation
-                }
 
-                with console.status("[yellow]AGI is thinking...[/yellow]", spinner="dots"):
-                    # Note: generate_response uses context_analyzer internally, so context is applied there.
-                    # The user_input here is the raw one.
-                    agi_initial_raw_response = agi_interface.generate_response(user_input)
+                        turn_log_data_ref["plan_execution_details"]["executed_steps_count"] = executed_step_count
+                        if not plan_halted:
+                             turn_log_data_ref["plan_execution_details"]["plan_outcome"] = "All steps attempted."
 
-                current_turn_interaction_data["agi_initial_raw_response"] = agi_initial_raw_response
-                agi_response_text = agi_initial_raw_response # This might be overwritten if a tool is used and re-prompts AGI
-
-                action_taken_by_tool_framework = False # True if a tool action is successfully initiated
-                                                       # False if it's a direct answer or tool fails before execution.
-
-                # This variable will hold the final text displayed to the user for this turn.
-                # It starts as the AGI's initial response, but can be updated by tool processing outcomes.
-                final_text_for_user_display = agi_initial_raw_response # Default if no tool or tool fails early
-
-                # --- Try to process AGI response as a potential tool request ---
-                try:
-                    # Attempt to parse for tool use first
-                    # AGI might return JSON directly or within ```json ... ``` markdown.
-                    json_match = re.search(r"```json\n(.*?)\n```", agi_initial_raw_response, re.DOTALL)
-                    json_str_to_parse = json_match.group(1) if json_match else agi_response_text
-
-                    first_brace = json_str_to_parse.find('{')
-                    last_brace = json_str_to_parse.rfind('}')
-                    if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
-                        json_str_to_parse = json_str_to_parse[first_brace : last_brace+1]
-
-                    data = json.loads(json_str_to_parse)
-
-                    if isinstance(data, dict) and data.get("action") == "run_shell":
-                        command_executable = data.get("command")
-                        command_args_list = data.get("args", [])
-                        reasoning = data.get("reasoning", "No reasoning provided.")
-
-                        # Ensure command_args_list is actually a list of strings
-                        if not isinstance(command_args_list, list) or not all(isinstance(arg, str) for arg in command_args_list):
-                            console.print(f"[warning]AGI suggested command with invalid 'args' format. Expected a list of strings. Payload: {data}[/warning]")
-                            action_taken_by_tool_framework = False
-                            agi_response_text = f"AGI's suggested command had malformed arguments. Reasoning: {reasoning}"
-                        elif command_executable and command_executable in SHELL_COMMAND_WHITELIST:
-                            command_to_display = f"{command_executable} {' '.join(command_args_list)}"
-                            console.print(Panel(Text(f"AGI suggests running command: [bold cyan]{command_to_display}[/bold cyan]\nReason: {reasoning}", style="yellow"), title="[bold blue]Shell Command Suggestion[/bold blue]"))
-
-                            confirmed = False
-                            if RICH_AVAILABLE:
-                                from rich.prompt import Confirm
-                                confirmed = Confirm.ask("Execute this command?", default=False, console=console)
-                            else:
-                                confirmed = input(f"Execute: {command_to_display}? (yes/NO): ").lower() == "yes"
-
-                            tool_interaction_log_entry = {
-                                "tool_request_timestamp": datetime.now().isoformat(), # Approx time of request processing
-                                "action_type": "run_shell",
-                                "action_details": {"command": command_executable, "args": command_args_list},
-                                "reasoning": reasoning,
-                                "user_confirmation": "confirmed" if confirmed else "cancelled"
-                            }
-
-                            if confirmed:
-                                stdout_s, stderr_s, retcode = execute_shell_command(command_executable, command_args_list)
-                                outcome_parts = []
-                                if stdout_s and stdout_s.strip(): outcome_parts.append(f"Stdout: {stdout_s.strip()}")
-                                if stderr_s and stderr_s.strip(): outcome_parts.append(f"Stderr: {stderr_s.strip()}")
-                                if not outcome_parts and retcode == 0 : outcome_parts.append("Command executed with no output.")
-                                elif not outcome_parts and retcode !=0 : outcome_parts.append(f"Command failed with return code {retcode} and no output.")
-
-                                tool_outcome_summary = f"ReturnCode: {retcode}\n" + "\n".join(outcome_parts)
-                                # Truncate for log if very long
-                                if len(tool_outcome_summary) > 500:
-                                    tool_outcome_summary = tool_outcome_summary[:497] + "..."
-                                tool_interaction_log_entry["tool_outcome_summary"] = tool_outcome_summary
-                                if retcode == 0:
-                                    final_text_for_user_display = f"System: Executed command '{command_to_display}'. Output was printed above."
-                                else:
-                                    final_text_for_user_display = f"System: Command '{command_to_display}' failed or produced errors. See output above."
-                            else:
-                                console.print("Command execution cancelled by user.", style="yellow")
-                                if session_logger: session_logger.log_entry("System", f"Cancelled execution of: {command_to_display}")
-                                tool_interaction_log_entry["tool_outcome_summary"] = f"Command '{command_to_display}' execution cancelled by user."
-                                final_text_for_user_display = "System: Command execution cancelled."
-
-                            tool_interaction_log_entry["tool_outcome_timestamp"] = datetime.now().isoformat()
-                            current_turn_interaction_data["tool_interactions"].append(tool_interaction_log_entry)
-                            action_completed = True
-
-                        elif command_executable: # Command suggested but not whitelisted
-                            command_to_display = f"{command_executable} {' '.join(command_args_list)}"
-                            console.print(f"[warning]AGI suggested a non-whitelisted command: '{command_to_display}'. Execution denied for safety.[/warning]")
-                            if session_logger: session_logger.log_entry("AGI_Suggestion (Denied)", f"Command: {command_to_display}, Reason: {reasoning}")
-
-                            current_turn_interaction_data["tool_interactions"].append({
-                                "tool_request_timestamp": datetime.now().isoformat(),
-                                "action_type": "run_shell",
-                                "action_details": {"command": command_executable, "args": command_args_list},
-                                "reasoning": reasoning,
-                                "user_confirmation": "denied_by_system_whitelist",
-                                "tool_outcome_timestamp": datetime.now().isoformat(),
-                                "tool_outcome_summary": "Command execution denied by system (not whitelisted)."
-                            })
-                            action_taken_by_tool_framework = False # Let the error message display
-                            agi_response_text = f"The AGI suggested a command that is not on the whitelist: '{command_to_display}'. Reasoning: {reasoning} (Displaying as text instead)."
-                        else: # No command_executable provided
-                            console.print(f"[warning]AGI suggestion for 'run_shell' did not include a 'command'. Payload: {data}[/warning]")
-                            current_turn_interaction_data["tool_interactions"].append({
-                                "tool_request_timestamp": datetime.now().isoformat(),
-                                "action_type": "run_shell",
-                                "action_details": data, # Log the malformed data
-                                "reasoning": reasoning,
-                                "user_confirmation": "n/a_malformed_request",
-                                "tool_outcome_timestamp": datetime.now().isoformat(),
-                                "tool_outcome_summary": "Malformed request: missing 'command'."
-                            })
-                            action_taken_by_tool_framework = False # Let the error message display
-                            agi_response_text = f"AGI's suggested command was malformed (missing command). Reasoning: {reasoning}"
-
-                    elif isinstance(data, dict) and data.get("action") == "read_file":
-                        filepath_str = data.get("filepath")
-                        max_lines = data.get("max_lines") # Optional
-                        reasoning = data.get("reasoning", "No reasoning provided for file read.")
-
-                        if not filepath_str:
-                            console.print(f"[warning]AGI 'read_file' request missing 'filepath'. Payload: {data}[/warning]")
-                            agi_response_text = "AGI's file read request was malformed (missing filepath)."
-                            action_taken_by_tool_framework = False # Fall through to display error
-                        else:
-                            console.print(Panel(Text(f"AGI requests to read file: [bold cyan]{filepath_str}[/bold cyan]\nReason: {reasoning}", style="yellow"), title="[bold blue]File Read Request[/bold blue]"))
-
-                            # Execute the read_file tool action
-                            file_content_for_agi, read_error = handle_read_file_request(filepath_str, max_lines)
-
-                            if read_error:
-                                # Inform AGI about the error
-                                error_prompt = (
-                                    f"Context:\nAn attempt to read the file '{filepath_str}' failed.\n"
-                                    f"Error: {read_error}\n\n"
-                                    f"Original User Query: {user_input}\n\n"
-                                    "Please inform the user about the error and proceed based on available information or ask for clarification."
-                                )
-                                with console.status("[yellow]AGI is processing file read error...[/yellow]", spinner="dots"):
-                                    agi_response_text = agi_interface.generate_response(error_prompt)
-                                # Let this response be displayed normally by falling through action_taken_by_tool_framework = False
-                                # (or True if we consider this an action completion)
-                                # For now, let it display the AGI's error-handling response.
-                                action_taken_by_tool_framework = False # To display the AGI's response to the error
-                            else:
-                                # Construct new prompt for AGI with file content
-                                subsequent_prompt = (
-                                    f"{context_analyzer.get_full_context_string()}\n\n"
-                                    f"File Content ('{filepath_str}'):\n```text\n{file_content_for_agi}\n```\n\n"
-                                    f"Original User Query that led to reading this file: \"{user_input}\"\n\n"
-                                    "Based on the provided file content and the original query, please formulate your answer to the user."
-                                )
-                                console.print(f"[info]File '{filepath_str}' read. Sending content to AGI for processing against original query...[/info]")
-                                with console.status("[yellow]AGI is processing file content for the original query...[/yellow]", spinner="dots"):
-                                    agi_response_text = agi_interface.generate_response(subsequent_prompt)
-                                # This agi_response_text is the final one for the user for this turn.
-                                # It will be displayed by the standard mechanism below.
-                                action_taken_by_tool_framework = False # Let the normal display path handle this final response.
-                                                                    # The actual "tool action" was reading the file and re-prompting.
-                                                                    # We're essentially transforming the AGI's output here.
-                            # Log the AGI's initial request to read the file
-                            if session_logger:
-                                session_logger.log_entry("AGI_Request_ReadFile", f"File: {filepath_str}, MaxLines: {max_lines}, Reason: {reasoning}, Error: {read_error}")
-                            # Removed redundant conversation_history.append for "assistant_tool_request"
-                            # The full details are in tool_interaction_log_entry for JSONL.
-                            # The final AGI response (after getting file content or error) will be logged by the generic handler below.
-
-                    elif isinstance(data, dict) and data.get("action") == "write_file":
-                        filepath_str = data.get("filepath")
-                        content_to_write = data.get("content") # Content can be empty string
-                        reasoning = data.get("reasoning", "No reasoning provided for file write.")
-
-                        if filepath_str is None or content_to_write is None: # Check for None, empty string for content is allowed
-                            missing_fields = []
-                            if filepath_str is None: missing_fields.append("'filepath'")
-                            if content_to_write is None: missing_fields.append("'content'")
-                            error_msg = f"AGI 'write_file' request missing required field(s): {', '.join(missing_fields)}. Payload: {data}"
-                            console.print(f"[warning]{error_msg}[/warning]")
-                            agi_response_text = f"Your 'write_file' request was malformed ({error_msg}). Please provide all required fields."
-                            action_taken_by_tool_framework = False # Fall through to display error to user via AGI
-                        else:
-                            console.print(Panel(Text(f"AGI requests to write file: [bold cyan]{filepath_str}[/bold cyan]\nReason: {reasoning}", style="yellow"), title="[bold blue]File Write Request[/bold blue]"))
-
-                            write_message, write_error = handle_write_file_request(filepath_str, content_to_write)
-
-                            # Prepare message for AGI based on write outcome
-                            if write_error:
-                                outcome_summary = f"An attempt to write the file '{filepath_str}' failed. Error: {write_error}"
-                                tool_outcome_for_log = f"Error: {write_error}"
-                            else: # write_message contains success or cancellation message
-                                outcome_summary = f"File write operation for '{filepath_str}': {write_message}"
-                                tool_outcome_for_log = write_message # Success or cancellation message
-
-                            tool_interaction_log_entry = {
-                                "tool_request_timestamp": tool_request_start_time,
-                                "action_type": "write_file",
-                                "action_details": {"filepath": filepath_str, "content_length": len(content_to_write)}, # Not logging full content here
-                                "reasoning": reasoning,
-                                "user_confirmation": "confirmed" if "successfully" in tool_outcome_for_log else ("cancelled" if "cancelled" in tool_outcome_for_log else "n/a"), # Infer from message
-                                "tool_outcome_timestamp": datetime.now().isoformat(),
-                                "tool_outcome_summary": tool_outcome_for_log
-                            }
-
-                            # Re-prompt AGI with the outcome
-                            subsequent_prompt_for_agi = (
-                                f"{context_analyzer.get_full_context_string()}\n\n"
-                                f"Outcome of your 'write_file' request for '{filepath_str}':\n{outcome_summary}\n\n"
-                                f"Original User Query that may have led to this write request: \"{user_input}\"\n\n"
-                                "Based on this outcome, please formulate your response to the user or decide on the next step."
-                            )
-                            tool_interaction_log_entry["context_for_next_agi_step"] = subsequent_prompt_for_agi # Log the prompt
-
-                            console.print(f"[info]File write attempt for '{filepath_str}' processed. Outcome: {outcome_summary}. Re-prompting AGI...[/info]")
-                            with console.status("[yellow]AGI is processing file write outcome...[/yellow]", spinner="dots"):
-                                agi_secondary_raw_response = agi_interface.generate_response(subsequent_prompt_for_agi)
-
-                            tool_interaction_log_entry["agi_secondary_raw_response"] = agi_secondary_raw_response
-                            final_text_for_user_display = agi_secondary_raw_response # This is now the final response
-
-                            current_turn_interaction_data["tool_interactions"].append(tool_interaction_log_entry)
-                            action_taken_by_tool_framework = True # A tool action sequence completed.
-
-                            # Log the AGI's initial request to write the file and the outcome to plain text log
-                            if session_logger:
-                                session_logger.log_entry("AGI_Request_WriteFile", f"File: {filepath_str}, Reason: {reasoning}, Outcome: {tool_outcome_for_log}")
-                            # JSONL log is built in current_turn_interaction_data
-
-                    elif isinstance(data, dict) and data.get("action") == "web_search":
-                        tool_request_start_time = datetime.now().isoformat()
-                        search_query = data.get("query")
-                        reasoning = data.get("reasoning", "No reasoning provided for web search.")
-
-                        if not search_query:
-                            error_msg = f"AGI 'web_search' request missing 'query' field. Payload: {data}"
-                            console.print(f"[warning]{error_msg}[/warning]")
-                            agi_response_text = f"Your 'web_search' request was malformed ({error_msg}). Please provide a query."
-                            action_taken_by_tool_framework = False # Fall through to display error to user via AGI
-                        else:
-                            console.print(Panel(Text(f"AGI requests web search for: [bold cyan]{search_query}[/bold cyan]\nReason: {reasoning}", style="yellow"), title="[bold blue]Web Search Request[/bold blue]"))
-
-                            search_results_str, search_error = handle_web_search_request(search_query)
-
-                            outcome_summary_for_log = "Search successful."
-                            if search_error:
-                                outcome_summary_for_log = f"Search failed: {search_error}"
-                            elif not search_results_str or "No search results found." in search_results_str : # handle_web_search_request can return "No search results found." as non-error
-                                outcome_summary_for_log = "Search returned no results or no usable results."
-
-                            # Content for AGI: either results or an error/status message
-                            content_for_agi = search_results_str if not search_error else f"Web search for '{search_query}' failed. Error: {search_error}"
-                            if not content_for_agi and not search_error: # e.g. "No search results found."
-                                content_for_agi = "No search results were found for your query."
-
-
-                            subsequent_prompt = (
-                                f"{context_analyzer.get_full_context_string()}\n\n"
-                                f"Search Results for your query \"{search_query}\":\n{content_for_agi}\n\n"
-                                f"Original User Query that may have led to this web search: \"{user_input}\"\n\n"
-                                "Based on these search results (or lack thereof), please formulate your response to the user."
-                            )
-                            console.print(f"[info]Web search for '{search_query}' processed. Re-prompting AGI...[/info]")
-                            with console.status("[yellow]AGI is processing web search results...[/yellow]", spinner="dots"):
-                                agi_response_text = agi_interface.generate_response(subsequent_prompt)
-
-                            action_taken_by_tool_framework = False # Let the normal display path handle this final response.
-
-                            if session_logger:
-                                session_logger.log_entry("AGI_Request_WebSearch", f"Query: {search_query}, Reason: {reasoning}, Outcome: {outcome_summary_for_log}")
-                            conversation_history.append({
-                                "role": "assistant_tool_request",
-                                "content": f"Requested web search for: '{search_query}'. Reason: {reasoning}. Outcome: {outcome_summary_for_log}",
-                                "timestamp": datetime.now().isoformat()
-                            })
-                            # Final AGI response logged by generic handler.
-
-                    elif isinstance(data, dict) and data.get("action") == "git_branch_create":
-                        tool_request_start_time = datetime.now().isoformat()
-                        branch_name = data.get("branch_name")
-                        base_branch = data.get("base_branch") # Optional
-                        reasoning = data.get("reasoning", "No reasoning provided for git branch create.")
-
-                        tool_interaction_log_entry = {
-                            "tool_request_timestamp": tool_request_start_time,
-                            "action_type": "git_branch_create",
-                            "action_details": {"branch_name": branch_name, "base_branch": base_branch},
-                            "reasoning": reasoning,
-                        }
-
-                        if not branch_name:
-                            error_msg = f"AGI 'git_branch_create' request missing 'branch_name' field. Payload: {data}"
-                            console.print(f"[warning]{error_msg}[/warning]")
-                            final_text_for_user_display = f"Your 'git_branch_create' request was malformed ({error_msg})."
-                            action_taken_by_tool_framework = False # Let error display
-                            tool_interaction_log_entry["user_confirmation"] = "n/a_malformed_request"
-                            tool_interaction_log_entry["tool_outcome_summary"] = "Malformed request: missing 'branch_name'."
-                        else:
-                            console.print(Panel(Text(f"AGI requests to create git branch: [bold cyan]{branch_name}[/bold cyan]" +
-                                                     (f" from base [bold cyan]{base_branch}[/bold cyan]" if base_branch else "") +
-                                                     f"\nReason: {reasoning}", style="yellow"), title="[bold blue]Git Branch Create Request[/bold blue]"))
-
-                            outcome_message, outcome_error = handle_git_branch_create_request(branch_name, base_branch)
-
-                            tool_interaction_log_entry["user_confirmation"] = "confirmed" if "successfully" in (outcome_message or "") or "processed" in (outcome_message or "") else \
-                                                                           ("cancelled" if "cancelled" in (outcome_message or "") else "n/a_error_or_not_applicable")
-                            tool_interaction_log_entry["tool_outcome_timestamp"] = datetime.now().isoformat()
-
-                            if outcome_error:
-                                tool_interaction_log_entry["tool_outcome_summary"] = f"Error: {outcome_error}"
-                                outcome_summary_for_agi = f"An attempt to create branch '{branch_name}' failed. Error: {outcome_error}"
-                            else:
-                                tool_interaction_log_entry["tool_outcome_summary"] = outcome_message
-                                outcome_summary_for_agi = f"Git branch operation for '{branch_name}': {outcome_message}"
-
-                            subsequent_prompt_for_agi = (
-                                f"{context_analyzer.get_full_context_string()}\n\n"
-                                f"Outcome of your 'git_branch_create' request for '{branch_name}':\n{outcome_summary_for_agi}\n\n"
-                                f"Original User Query: \"{user_input}\"\n\n"
-                                "Based on this outcome, please formulate your response to the user or decide on the next step."
-                            )
-                            tool_interaction_log_entry["context_for_next_agi_step"] = subsequent_prompt_for_agi
-
-                            console.print(f"[info]Git branch create attempt for '{branch_name}' processed. Outcome: {outcome_summary_for_agi}. Re-prompting AGI...[/info]")
-                            with console.status("[yellow]AGI is processing git branch create outcome...[/yellow]", spinner="dots"):
-                                agi_secondary_raw_response = agi_interface.generate_response(subsequent_prompt_for_agi)
-
-                            tool_interaction_log_entry["agi_secondary_raw_response"] = agi_secondary_raw_response
-                            final_text_for_user_display = agi_secondary_raw_response
-                            action_taken_by_tool_framework = True
-
-                        current_turn_interaction_data["tool_interactions"].append(tool_interaction_log_entry)
-
-                    elif isinstance(data, dict) and data.get("action") == "git_checkout":
-                        tool_request_start_time = datetime.now().isoformat()
-                        branch_name = data.get("branch_name")
-                        create_new = data.get("create_new", False) # Default to False if not provided
-                        reasoning = data.get("reasoning", "No reasoning provided for git checkout.")
-
-                        tool_interaction_log_entry = {
-                            "tool_request_timestamp": tool_request_start_time,
-                            "action_type": "git_checkout",
-                            "action_details": {"branch_name": branch_name, "create_new": create_new},
-                            "reasoning": reasoning,
-                        }
-
-                        if not branch_name:
-                            error_msg = f"AGI 'git_checkout' request missing 'branch_name' field. Payload: {data}"
-                            console.print(f"[warning]{error_msg}[/warning]")
-                            final_text_for_user_display = f"Your 'git_checkout' request was malformed ({error_msg})."
-                            action_taken_by_tool_framework = False
-                            tool_interaction_log_entry["user_confirmation"] = "n/a_malformed_request"
-                            tool_interaction_log_entry["tool_outcome_summary"] = "Malformed request: missing 'branch_name'."
-                        else:
-                            action_desc_for_print = "Create and checkout new branch" if create_new else "Checkout branch"
-                            console.print(Panel(Text(f"AGI requests to {action_desc_for_print.lower()}: [bold cyan]{branch_name}[/bold cyan]\nReason: {reasoning}", style="yellow"),
-                                                title="[bold blue]Git Checkout Request[/bold blue]"))
-
-                            outcome_message, outcome_error = handle_git_checkout_request(branch_name, create_new)
-
-                            tool_interaction_log_entry["user_confirmation"] = "confirmed" if outcome_message and "Successfully" in outcome_message else \
-                                                                           ("cancelled" if outcome_message and "cancelled" in outcome_message else "n/a_error_or_not_applicable")
-                            tool_interaction_log_entry["tool_outcome_timestamp"] = datetime.now().isoformat()
-
-                            if outcome_error:
-                                tool_interaction_log_entry["tool_outcome_summary"] = f"Error: {outcome_error}"
-                                outcome_summary_for_agi = f"An attempt to {action_desc_for_print.lower()} '{branch_name}' failed. Error: {outcome_error}"
-                            else:
-                                tool_interaction_log_entry["tool_outcome_summary"] = outcome_message
-                                outcome_summary_for_agi = f"Git checkout operation for '{branch_name}': {outcome_message}"
-
-                            subsequent_prompt_for_agi = (
-                                f"{context_analyzer.get_full_context_string()}\n\n"
-                                f"Outcome of your 'git_checkout' request for '{branch_name}' (create_new={create_new}):\n{outcome_summary_for_agi}\n\n"
-                                f"Original User Query: \"{user_input}\"\n\n"
-                                "Based on this outcome, please formulate your response to the user or decide on the next step."
-                            )
-                            tool_interaction_log_entry["context_for_next_agi_step"] = subsequent_prompt_for_agi
-
-                            console.print(f"[info]Git checkout attempt for '{branch_name}' processed. Outcome: {outcome_summary_for_agi}. Re-prompting AGI...[/info]")
-                            with console.status("[yellow]AGI is processing git checkout outcome...[/yellow]", spinner="dots"):
-                                agi_secondary_raw_response = agi_interface.generate_response(subsequent_prompt_for_agi)
-
-                            tool_interaction_log_entry["agi_secondary_raw_response"] = agi_secondary_raw_response
-                            final_text_for_user_display = agi_secondary_raw_response
-                            action_taken_by_tool_framework = True
-
-                        current_turn_interaction_data["tool_interactions"].append(tool_interaction_log_entry)
-
-                    elif isinstance(data, dict) and data.get("action") == "execute_python_code":
-                        tool_request_start_time = datetime.now().isoformat()
-                        code_snippet = data.get("code")
-                        reasoning = data.get("reasoning", "No reasoning provided for code execution.")
-
-                        tool_interaction_log_entry = {
-                            "tool_request_timestamp": tool_request_start_time,
-                            "action_type": "execute_python_code",
-                            "action_details": {"code": code_snippet}, # Log the actual code
-                            "reasoning": reasoning,
-                        }
-
-                        if not isinstance(code_snippet, str) or not code_snippet.strip():
-                            error_msg = f"AGI 'execute_python_code' request missing or invalid 'code' field (must be non-empty string). Payload: {data}"
-                            console.print(f"[warning]{error_msg}[/warning]")
-                            final_text_for_user_display = f"Your 'execute_python_code' request was malformed ({error_msg})."
-                            action_taken_by_tool_framework = False
-                            tool_interaction_log_entry["user_confirmation"] = "n/a_malformed_request"
-                            tool_interaction_log_entry["tool_outcome_summary"] = "Malformed request: missing or invalid 'code'."
-                        else:
-                            # User confirmation happens inside handle_execute_python_code_request
-                            stdout_s, stderr_s, exception_s = handle_execute_python_code_request(code_snippet)
-
-                            # Determine user confirmation from outcome (stdout_s will contain cancel message)
-                            if stdout_s == "Code execution cancelled by user.":
-                                tool_interaction_log_entry["user_confirmation"] = "cancelled"
-                            else:
-                                tool_interaction_log_entry["user_confirmation"] = "confirmed" # Assumed if not cancelled
-
-                            tool_interaction_log_entry["tool_outcome_timestamp"] = datetime.now().isoformat()
-
-                            outcome_parts = []
-                            if stdout_s: outcome_parts.append(f"Stdout:\n{stdout_s.strip()}")
-                            if stderr_s: outcome_parts.append(f"Stderr:\n{stderr_s.strip()}")
-                            if exception_s: outcome_parts.append(f"Exception:\n{exception_s.strip()}")
-
-                            tool_outcome_for_log = "\n---\n".join(outcome_parts) if outcome_parts else "No output or exception."
-                            if stdout_s == "Code execution cancelled by user.": # Override for cleaner log if cancelled
-                                tool_outcome_for_log = "Code execution cancelled by user."
-
-                            tool_interaction_log_entry["tool_outcome_summary"] = tool_outcome_for_log
-
-                            # Prepare summary for AGI (might be slightly different from full log, e.g., more concise)
-                            outcome_summary_for_agi = tool_outcome_for_log
-                            if len(outcome_summary_for_agi) > 1000: # Truncate very long outputs for AGI prompt
-                                outcome_summary_for_agi = outcome_summary_for_agi[:1000] + "\n[...output truncated for AGI prompt...]"
-
-                            subsequent_prompt_for_agi = (
-                                f"{context_analyzer.get_full_context_string()}\n\n"
-                                f"Outcome of your 'execute_python_code' request:\n```python\n{code_snippet}\n```\nExecution Result:\n{outcome_summary_for_agi}\n\n"
-                                f"Original User Query: \"{user_input}\"\n\n"
-                                "Based on this outcome, please formulate your response to the user or decide on the next step."
-                            )
-                            tool_interaction_log_entry["context_for_next_agi_step"] = subsequent_prompt_for_agi
-
-                            console.print(f"[info]Python code execution processed. Outcome logged. Re-prompting AGI...[/info]")
-                            with console.status("[yellow]AGI is processing code execution outcome...[/yellow]", spinner="dots"):
-                                agi_secondary_raw_response = agi_interface.generate_response(subsequent_prompt_for_agi)
-
-                            tool_interaction_log_entry["agi_secondary_raw_response"] = agi_secondary_raw_response
-                            final_text_for_user_display = agi_secondary_raw_response
-                            action_taken_by_tool_framework = True
-
-                        current_turn_interaction_data["tool_interactions"].append(tool_interaction_log_entry)
-
-                    elif isinstance(data, dict) and data.get("action") == "git_commit":
-                        tool_request_start_time = datetime.now().isoformat()
-                        commit_message = data.get("commit_message")
-                        stage_all = data.get("stage_all", False) # Default to False
-                        reasoning = data.get("reasoning", "No reasoning provided for git commit.")
-
-                        tool_interaction_log_entry = {
-                            "tool_request_timestamp": tool_request_start_time,
-                            "action_type": "git_commit",
-                            "action_details": {"commit_message": commit_message, "stage_all": stage_all},
-                            "reasoning": reasoning,
-                        }
-
-                        if not commit_message or not commit_message.strip():
-                            error_msg = f"AGI 'git_commit' request missing or empty 'commit_message' field. Payload: {data}"
-                            console.print(f"[warning]{error_msg}[/warning]")
-                            final_text_for_user_display = f"Your 'git_commit' request was malformed ({error_msg})."
-                            action_taken_by_tool_framework = False
-                            tool_interaction_log_entry["user_confirmation"] = "n/a_malformed_request"
-                            tool_interaction_log_entry["tool_outcome_summary"] = "Malformed request: missing or empty 'commit_message'."
-                        else:
-                            # User confirmation happens inside handle_git_commit_request
-                            outcome_message, outcome_error = handle_git_commit_request(commit_message, stage_all)
-
-                            tool_interaction_log_entry["user_confirmation"] = "confirmed" if outcome_message and ("successfully" in outcome_message.lower() or "nothing to commit" in outcome_message.lower()) else \
-                                                                           ("cancelled" if outcome_message and "cancelled" in outcome_message.lower() else "n/a_error_or_not_applicable")
-                            tool_interaction_log_entry["tool_outcome_timestamp"] = datetime.now().isoformat()
-
-                            if outcome_error:
-                                tool_interaction_log_entry["tool_outcome_summary"] = f"Error: {outcome_error}"
-                                outcome_summary_for_agi = f"An attempt to commit with message '{commit_message}' failed. Error: {outcome_error}"
-                            else: # outcome_message is not None
-                                tool_interaction_log_entry["tool_outcome_summary"] = outcome_message
-                                outcome_summary_for_agi = f"Git commit operation with message '{commit_message}': {outcome_message}"
-
-                            subsequent_prompt_for_agi = (
-                                f"{context_analyzer.get_full_context_string()}\n\n"
-                                f"Outcome of your 'git_commit' request (stage_all={stage_all}):\nMessage: \"{commit_message}\"\nResult: {outcome_summary_for_agi}\n\n"
-                                f"Original User Query: \"{user_input}\"\n\n"
-                                "Based on this outcome, please formulate your response to the user or decide on the next step."
-                            )
-                            tool_interaction_log_entry["context_for_next_agi_step"] = subsequent_prompt_for_agi
-
-                            console.print(f"[info]Git commit attempt processed. Outcome: {outcome_summary_for_agi}. Re-prompting AGI...[/info]")
-                            with console.status("[yellow]AGI is processing git commit outcome...[/yellow]", spinner="dots"):
-                                agi_secondary_raw_response = agi_interface.generate_response(subsequent_prompt_for_agi)
-
-                            tool_interaction_log_entry["agi_secondary_raw_response"] = agi_secondary_raw_response
-                            final_text_for_user_display = agi_secondary_raw_response
-                            action_taken_by_tool_framework = True
-
-                        current_turn_interaction_data["tool_interactions"].append(tool_interaction_log_entry)
-
-                    elif isinstance(data, dict) and data.get("action") == "git_push":
-                        tool_request_start_time = datetime.now().isoformat()
-                        remote_name = data.get("remote_name") # Optional
-                        branch_name = data.get("branch_name") # Optional
-                        reasoning = data.get("reasoning", "No reasoning provided for git push.")
-
-                        tool_interaction_log_entry = {
-                            "tool_request_timestamp": tool_request_start_time,
-                            "action_type": "git_push",
-                            "action_details": {"remote_name": remote_name, "branch_name": branch_name},
-                            "reasoning": reasoning,
-                        }
-
-                        # No specific fields to pre-validate here other than their existence, which .get handles.
-                        # handle_git_push_request will determine defaults if they are None.
-
-                        # User confirmation happens inside handle_git_push_request
-                        outcome_message, outcome_error = handle_git_push_request(remote_name, branch_name)
-
-                        tool_interaction_log_entry["user_confirmation"] = "confirmed" if outcome_message and "successfully" in outcome_message.lower() or "processed" in outcome_message.lower() or "up-to-date" in outcome_message.lower() else \
-                                                                       ("cancelled" if outcome_message and "cancelled" in outcome_message.lower() else "n/a_error_or_not_applicable")
-                        tool_interaction_log_entry["tool_outcome_timestamp"] = datetime.now().isoformat()
-
-                        if outcome_error:
-                            tool_interaction_log_entry["tool_outcome_summary"] = f"Error: {outcome_error}"
-                            outcome_summary_for_agi = f"An attempt to push to remote '{remote_name or 'default'}' for branch '{branch_name or 'current'}' failed. Error: {outcome_error}"
-                        else: # outcome_message is not None
-                            tool_interaction_log_entry["tool_outcome_summary"] = outcome_message
-                            outcome_summary_for_agi = f"Git push operation to remote '{remote_name or 'default'}' for branch '{branch_name or 'current'}': {outcome_message}"
-
-                        subsequent_prompt_for_agi = (
+                        full_plan_outcome_summary_for_agi = "\n".join(plan_outcome_summaries_for_agi)
+                        prompt_after_plan = (
                             f"{context_analyzer.get_full_context_string()}\n\n"
-                            f"Outcome of your 'git_push' request:\n{outcome_summary_for_agi}\n\n"
-                            f"Original User Query: \"{user_input}\"\n\n"
-                            "Based on this outcome, please formulate your response to the user or decide on the next step."
+                            f"The following multi-step plan was attempted based on your previous suggestion:\n"
+                            f"Overall Plan Reasoning: {plan_reasoning}\n\n"
+                            f"Execution Summary of all steps:\n{full_plan_outcome_summary_for_agi}\n\n"
+                            f"Original User Query: \"{user_input_str}\"\n\n"
+                            "Based on the outcome of this plan, please formulate your final response to the user."
                         )
-                        tool_interaction_log_entry["context_for_next_agi_step"] = subsequent_prompt_for_agi
+                        turn_log_data_ref["plan_execution_details"]["context_for_final_agi_step"] = prompt_after_plan
 
-                        console.print(f"[info]Git push attempt processed. Outcome: {outcome_summary_for_agi}. Re-prompting AGI...[/info]")
-                        with console.status("[yellow]AGI is processing git push outcome...[/yellow]", spinner="dots"):
-                            agi_secondary_raw_response = agi_interface.generate_response(subsequent_prompt_for_agi)
+                        console.print(f"\n[info]Plan execution finished. Re-prompting AGI with summary of all steps...[/info]")
+                        with console.status("[yellow]AGI is processing plan execution summary...[/yellow]", spinner="dots"):
+                            agi_final_response_after_plan = agi_interface_instance.generate_response(prompt_after_plan)
 
-                        tool_interaction_log_entry["agi_secondary_raw_response"] = agi_secondary_raw_response
-                        final_text_for_user_display = agi_secondary_raw_response
-                        action_taken_by_tool_framework = True
+                        turn_log_data_ref["plan_execution_details"]["agi_final_response_after_plan"] = agi_final_response_after_plan
+                        final_text_for_user_display = agi_final_response_after_plan
 
-                        current_turn_interaction_data["tool_interactions"].append(tool_interaction_log_entry)
+                elif action_type_from_agi: # Single tool call (not a plan)
+                    # _execute_single_tool_step will handle the single tool call.
+                    # If it needs to re-prompt AGI (e.g., read_file), it will do so, and its returned
+                    # `outcome_summary_for_agi` will be the AGI's secondary response.
+                    # This secondary response then becomes `final_text_for_user_display`.
+                    # The helper also appends its specific tool interaction log to turn_log_data_ref.
 
-                # If an action was successfully processed by a tool handler above (which involves re-prompting AGI)
-                # action_taken_by_tool_framework would be True, and final_text_for_user_display is AGI's secondary response.
-                # If JSON was malformed or action unknown, action_taken_by_tool_framework is False,
-                # and final_text_for_user_display is AGI's initial (problematic) response or a system error message.
+                    outcome_summary_from_tool_step, step_succeeded, _ = _execute_single_tool_step(
+                        tool_step_data=parsed_tool_request_data,
+                        raw_user_input_for_turn=user_input_str,
+                        agi_interface_instance=agi_interface_instance,
+                        turn_log_data_ref=turn_log_data_ref,
+                        plan_step_index=None
+                    )
+                    final_text_for_user_display = outcome_summary_from_tool_step
+                    # action_taken_by_tool_framework remains True
 
-                except json.JSONDecodeError:
-                    # Not a JSON response for tool use, treat as normal chat
-                    action_taken_by_tool_framework = False # No tool action was completed or properly initiated
-                    # final_text_for_user_display remains agi_initial_raw_response
-                except Exception as e: # Catch-all for other errors during tool processing
-                    console.print(f"[warning]Could not fully process AGI response for potential tool use: {type(e).__name__} - {e}[/warning]")
-                    action_taken_by_tool_framework = False # Tool processing failed
-                    # final_text_for_user_display may have been updated by the failing tool block to an error message,
-                    # or it remains agi_initial_raw_response.
-                else: # Parsed JSON was not a dictionary or had no "action" key
-                    action_taken_by_tool_framework = False
-                    # final_text_for_user_display remains agi_initial_raw_response
+                else: # Should not happen if action_type_from_agi was truthy
+                    action_taken_by_tool_framework = False # No valid tool action
 
-                # Display the final response to the user (either direct AGI response or AGI response after tool use)
-                # The variable `final_text_for_user_display` holds what needs to be shown.
-                # `action_taken_by_tool_framework` helps distinguish if a tool was involved in producing this final text.
-                # If a tool was successfully initiated AND it doesn't re-prompt (like run_shell when confirmed),
-                # final_text_for_user_display might be a system message.
-                # If a tool re-prompts AGI (read_file, write_file, web_search), final_text_for_user_display is AGI's secondary response.
-                # If no tool, it's AGI's initial response.
+            else: # Not a dict or no "action" key
+                action_taken_by_tool_framework = False
 
-                # Log to conversation_history (internal deque)
-                # This should always be the text that was actually displayed or the final synthesis from AGI.
-                conversation_history.append({"role": "assistant", "content": final_text_for_user_display, "timestamp": datetime.now().isoformat()})
-                if session_logger and getattr(session_logger, 'enabled', True): # Check if enabled
-                    session_logger.log_entry("AGI", final_text_for_user_display) # Log final user-facing text
+        except json.JSONDecodeError:
+            action_taken_by_tool_framework = False # Not a JSON response for tool use, treat as normal chat
+        except Exception as e:
+            console.print(f"[warning]Could not fully process AGI response for potential tool use: {type(e).__name__} - {e}[/warning]")
+            action_taken_by_tool_framework = False # Tool processing failed
 
-                response_parts = detect_code_blocks(final_text_for_user_display)
+        # --- Display Final AGI Response / Tool Outcome ---
+        conversation_history.append({"role": "assistant", "content": final_text_for_user_display, "timestamp": datetime.now().isoformat()})
+        if session_logger and getattr(session_logger, 'enabled', True):
+            session_logger.log_entry("AGI", final_text_for_user_display)
 
-                # Determine panel style based on detected task type from the *last* AGI interaction
-                # (could be initial or secondary if a tool was used)
-                panel_title_text = "[agiprompt]AGI Output[/agiprompt]"
-                panel_border_style_color = "blue" # Default
-                task_type_for_style = agi_interface.last_detected_task_type # This reflects the type for the *last* call to generate_response
+        response_parts = detect_code_blocks(final_text_for_user_display)
+        panel_title_text = "[agiprompt]AGI Output[/agiprompt]"
+        panel_border_style_color = "blue"
+        task_type_for_style = agi_interface_instance.last_detected_task_type
 
-                if task_type_for_style == "code_generation":
-                    panel_title_text = "[agiprompt]AGI Code Generation[/agiprompt]"
-                    panel_border_style_color = "green"
-                # ... (other styling rules remain the same) ...
-                elif task_type_for_style == "code_debugging":
-                    panel_title_text = "[agiprompt]AGI Code Debugging[/agiprompt]"
-                    panel_border_style_color = "yellow"
-                elif task_type_for_style == "explanation" or task_type_for_style == "code_explanation":
-                    panel_title_text = "[agiprompt]AGI Explanation[/agiprompt]"
-                    panel_border_style_color = "cyan"
-                elif task_type_for_style == "summarization":
-                    panel_title_text = "[agiprompt]AGI Summary[/agiprompt]"
-                    panel_border_style_color = "magenta"
-                elif task_type_for_style == "git_query":
-                    panel_title_text = "[agiprompt]AGI Git Query Response[/agiprompt]"
-                    panel_border_style_color = "bright_black"
+        if task_type_for_style == "code_generation":
+            panel_title_text = "[agiprompt]AGI Code Generation[/agiprompt]"
+            panel_border_style_color = "green"
+        elif task_type_for_style == "code_debugging":
+            panel_title_text = "[agiprompt]AGI Code Debugging[/agiprompt]"
+            panel_border_style_color = "yellow"
+        elif task_type_for_style == "explanation" or task_type_for_style == "code_explanation":
+            panel_title_text = "[agiprompt]AGI Explanation[/agiprompt]"
+            panel_border_style_color = "cyan"
+        elif task_type_for_style == "summarization":
+            panel_title_text = "[agiprompt]AGI Summary[/agiprompt]"
+            panel_border_style_color = "magenta"
+        elif task_type_for_style == "git_query":
+            panel_title_text = "[agiprompt]AGI Git Query Response[/agiprompt]"
+            panel_border_style_color = "bright_black"
 
-                output_renderable = Text()
-                contains_code_blocks_in_final_output = False
-                for part_idx, part in enumerate(response_parts):
-                    if part["type"] == "text":
-                        output_renderable.append(part["content"])
-                    elif part["type"] == "code":
-                        contains_code_blocks_in_final_output = True
-                        if part_idx > 0 and response_parts[part_idx-1]["type"] == "text" and not response_parts[part_idx-1]["content"].endswith("\n"):
-                            output_renderable.append("\n")
-                        current_theme = APP_CONFIG.get("display", {}).get("syntax_theme", "monokai")
-                        lang_for_syntax = part["lang"] if part["lang"] else "plaintext"
-                        try:
-                            code_syntax = Syntax(part["content"], lang_for_syntax, theme=current_theme, line_numbers=True, word_wrap=True)
-                            output_renderable.append(code_syntax)
-                        except Exception as e_rich_syntax:
-                            console.print(f"[dim warning]Rich Syntax Error for lang '{lang_for_syntax}': {e_rich_syntax}. Falling back to plaintext.[/dim warning]")
-                            code_syntax_fallback = Syntax(part["content"], "plaintext", theme=current_theme, line_numbers=True, word_wrap=True)
-                            output_renderable.append(code_syntax_fallback)
-                    if part_idx < len(response_parts) -1:
-                         output_renderable.append("\n")
+        output_renderable = Text()
+        contains_code_blocks_in_final_output = False
+        for part_idx, part in enumerate(response_parts):
+            if part["type"] == "text":
+                output_renderable.append(part["content"])
+            elif part["type"] == "code":
+                contains_code_blocks_in_final_output = True
+                if part_idx > 0 and response_parts[part_idx-1]["type"] == "text" and not response_parts[part_idx-1]["content"].endswith("\n"):
+                    output_renderable.append("\n")
+                current_theme = APP_CONFIG.get("display", {}).get("syntax_theme", "monokai")
+                lang_for_syntax = part["lang"] if part["lang"] else "plaintext"
+                try:
+                    code_syntax = Syntax(part["content"], lang_for_syntax, theme=current_theme, line_numbers=True, word_wrap=True)
+                    output_renderable.append(code_syntax)
+                except Exception as e_rich_syntax:
+                    console.print(f"[dim warning]Rich Syntax Error for lang '{lang_for_syntax}': {e_rich_syntax}. Falling back to plaintext.[/dim warning]")
+                    code_syntax_fallback = Syntax(part["content"], "plaintext", theme=current_theme, line_numbers=True, word_wrap=True)
+                    output_renderable.append(code_syntax_fallback)
+            if part_idx < len(response_parts) -1:
+                 output_renderable.append("\n")
 
-                console.print(Panel(output_renderable, title=panel_title_text, border_style=panel_border_style_color, expand=False))
+        console.print(Panel(output_renderable, title=panel_title_text, border_style=panel_border_style_color, expand=False))
 
-                current_turn_interaction_data["timestamp_final_response"] = datetime.now().isoformat()
-                current_turn_interaction_data["agi_final_response_to_user"] = final_text_for_user_display
-                current_turn_interaction_data["final_response_formatting_details"] = {
-                    "panel_title": panel_title_text, # Store the actual text used
-                    "panel_border_style": panel_border_style_color,
-                    "contains_code_blocks": contains_code_blocks_in_final_output
-                }
+        turn_log_data_ref["timestamp_final_response"] = datetime.now().isoformat()
+        turn_log_data_ref["agi_final_response_to_user"] = final_text_for_user_display
+        turn_log_data_ref["final_response_formatting_details"] = {
+            "panel_title": panel_title_text,
+            "panel_border_style": panel_border_style_color,
+            "contains_code_blocks": contains_code_blocks_in_final_output
+        }
 
-                if agi_interface.is_model_loaded or isinstance(agi_interface, AGIPPlaceholder):
-                    # Pass the final user-facing AGI text to training script
-                    call_training_script(user_input, final_text_for_user_display)
+        if isinstance(agi_interface_instance, MergedAGI) and agi_interface_instance.is_model_loaded:
+            call_training_script(user_input_str, final_text_for_user_display)
 
-                log_interaction_to_jsonl(current_turn_interaction_data)
+    # Log the completed turn data (this happens regardless of whether it was a user command or AGI query)
+    log_interaction_to_jsonl(turn_log_data_ref)
+    return "CONTINUE"
 
+
+def main():
+    global session_logger, APP_CONFIG, conversation_history, DEFAULT_GENERATION_PARAMS, PROJECT_ROOT_PATH, SESSION_ID, JSONL_LOGGING_ENABLED, TURN_ID_COUNTER
+
+    SESSION_ID = datetime.now().strftime("%Y%m%d_%H%M%S_") + Path(sys.argv[0]).stem
+    TURN_ID_COUNTER = 0 # Initialize turn counter for the session
+
+    PROJECT_ROOT_PATH = find_project_root(Path.cwd())
+    if PROJECT_ROOT_PATH:
+        console.print(f"INFO: Project root detected at: [cyan]{PROJECT_ROOT_PATH}[/cyan]", style="info")
+    else:
+        PROJECT_ROOT_PATH = Path.cwd().resolve()
+        console.print(f"WARNING: No project root marker (.git or .agi_project_root) found. "
+                      f"Using current working directory as project scope: [cyan]{PROJECT_ROOT_PATH}[/cyan]", style="warning")
+
+    load_config()
+
+    desktop_path = get_desktop_path()
+    session_logger = SessionLogger(desktop_path)
+    if APP_CONFIG.get("logging", {}).get("desktop_logging_enabled", True) == False:
+        session_logger.enabled = False
+        console.print("[info]Desktop session logging is disabled via config.[/info]")
+
+    display_startup_banner()
+    console.print("Initializing AGI System (Interactive Mode)...", style="info")
+
+    agi_interface = MergedAGI()
+
+    if not agi_interface.is_model_loaded:
+        console.print("INFO: MergedAGI could not load the model. Falling back to AGIPPlaceholder.", style="warning")
+        model_path_for_error_msg = agi_interface.model_path
+        if not model_path_for_error_msg.exists() or not any(model_path_for_error_msg.iterdir()):
+            msg = Text()
+            msg.append(f"\n---\nIMPORTANT: The model directory '{model_path_for_error_msg}',\n", style="bold yellow")
+            msg.append("expected to contain the AI model, is missing or empty.\n", style="yellow")
+            msg.append("This script will use MOCK responses.\nTo enable actual AI responses:\n", style="yellow")
+            msg.append("  1. Ensure models are downloaded (e.g., via `setup_agi_terminal.py`).\n")
+            msg.append(f"  2. Ensure 'merge_config.yml' (if used) points to correct downloaded models and mergekit output is at '{model_path_for_error_msg}'.\n")
+            msg.append(f"  3. OR, update 'merged_model_path' in '{CONFIG_FILE_PATH.name}' (in {CONFIG_FILE_PATH.parent}) to your model's location.\n---")
+            console.print(Panel(msg, title="[bold red]Model Not Found[/bold red]", border_style="red"))
+
+        agi_interface = AGIPPlaceholder(model_path_str=str(model_path_for_error_msg))
+        terminal_mode = "[bold yellow]Mock Mode[/bold yellow]"
+    else:
+        terminal_mode = "[bold green]Merged Model Mode[/bold green]"
+
+    console.print(f"\nAGI Interactive Terminal ({terminal_mode}) - Model: {agi_interface.model_path}")
+    console.print("Type '/set parameter <NAME> <VALUE>' to change generation settings (e.g., /set parameter MAX_TOKENS 512).")
+    console.print("Type '/show parameters' to see current settings.")
+    console.print("Type 'exit', 'quit', or press Ctrl+D to end.")
+    console.print("Type '/help' for a list of user commands.")
+    console.print("-" * console.width)
+
+    try:
+        while True:
+            user_input = console.input("[bold prompt]You> [/bold prompt]")
+
+            TURN_ID_COUNTER += 1
+            current_turn_interaction_data = {
+                "session_id": SESSION_ID,
+                "turn_id": TURN_ID_COUNTER,
+                "timestamp_user_query": datetime.now().isoformat(),
+                "user_query": user_input,
+                "tool_interactions": [],
+            }
+
+            status = process_single_input_turn(user_input, agi_interface, current_turn_interaction_data)
+            if status == "EXIT":
+                break
 
             console.print("-" * console.width)
 
     except KeyboardInterrupt:
         console.print("\nExiting due to KeyboardInterrupt...", style="info")
+    except EOFError: # Handle Ctrl+D
+        console.print("\nExiting due to EOF (Ctrl+D)...", style="info")
+    finally:
+        save_history()
+        console.print("AGI session terminated. History saved.", style="info")
+
+
+if __name__ == "__main__":
+    load_history()
+    try:
+        main()
+    except SystemExit:
+        pass
+    finally:
+        save_history()
+        # The message below might be redundant if main's finally also prints it.
+        # Consider if only one "session terminated" message is desired.
+        # For now, it's fine.
+        # console.print("AGI session terminated. History saved.", style="info")
     # The main __main__ block's finally clause handles saving history and the final "AGI session terminated" message.
 
 # --- Shell Command Whitelist & Execution ---
