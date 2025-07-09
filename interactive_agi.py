@@ -3593,7 +3593,7 @@ def display_help_command():
     help_table = Table(title="[bold blue]Available User Slash Commands[/bold blue]", show_lines=True, expand=False)
     help_table.add_column("Command", style="bold cyan", min_width=25)
     help_table.add_column("Parameters", style="yellow", min_width=30)
-    help_table.add_column("Description", style="white", min_width=50, max_width=70) # Max width to help with wrapping
+    help_table.add_column("Description", style="white", min_width=50, max_width=70)
 
     commands = [
         ("/help", "", "Displays this help message listing available user commands."),
@@ -3618,11 +3618,16 @@ def display_help_command():
         ("/analyze_dir", "[path]", "Asks AGI to analyze directory structure and provide a JSON summary. Defaults to current directory."),
         ("/suggest_code_change", "<file_path>", "Asks AGI to suggest code changes for a whitelisted file based on user description."),
         ("/list_models", "", "Lists the configured base model path and found local adapter sets."),
+        ("---", "---", "---"), # Separator for non-command info
+        ("Training", "", "Use `python adaptive_train.py --help` in your system terminal to see options for fine-tuning the AGI model on interaction logs. Supports selective training on tool/plan success/failure."),
         ("exit / quit", "", "Exits the AGI terminal session.")
     ]
 
     for cmd, params, desc in commands:
-        help_table.add_row(cmd, params, desc)
+        if cmd == "---": # Handle separator
+            help_table.add_row(Text("─"*20, style="dim"), Text("─"*25, style="dim"), Text("─"*45, style="dim"))
+        else:
+            help_table.add_row(cmd, params, desc)
 
     console.print(help_table)
 

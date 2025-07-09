@@ -132,14 +132,29 @@ This script helps you fine-tune the `./merged_model` using your interaction hist
         ```bash
         python adaptive_train.py --use_qlora --learning_rate 1e-4 --num_train_epochs 1
         ```
-    *   **New**: Filter logs using `--log_count N` (use last N logs) or `--log_days D` (logs from last D days).
-        ```bash
-        python adaptive_train.py --log_count 50
-        python adaptive_train.py --log_days 7 --num_train_epochs 2
-        ```
-    *   Adjust parameters like `--num_train_epochs`, `--per_device_train_batch_size`, `--learning_rate`, `--lora_r`, `--lora_alpha`, and `--max_seq_length` based on your dataset size, available VRAM, and desired training intensity.
     *   The script now uses `rich` for better progress display during data processing and training (if `rich` is installed).
     *   Training can be time-consuming and resource-intensive. Monitor your system resources.
+
+    *   **Selective Training with `adaptive_train.py`**:
+        The script now supports more advanced filtering of the `interaction_logs.jsonl` to create targeted training datasets. This allows focusing the fine-tuning process on specific types of interactions:
+        *   `--train-on-successful-tool-use [tool_name|all]`: Train only on turns where the specified tool (e.g., `read_file`) or any tool (`all`) was used successfully.
+        *   `--train-on-failed-tool-use [tool_name|all]`: Train only on turns where a tool call failed, was cancelled, or denied by the system.
+        *   `--train-on-successful-plans`: Train only on turns involving successfully completed multi-step plans (i.e., `execute_plan` actions that didn't halt).
+        *   `--train-on-halted-plans`: Train only on turns where a multi-step plan was halted.
+        *   `--min-tool-interactions <N>`: Train only on turns that involved at least N tool interactions (useful for complex sequences).
+        *   Example: To fine-tune specifically on successful uses of the `write_file` tool:
+            ```bash
+            python adaptive_train.py --train-on-successful-tool-use write_file
+            ```
+        *   Example: To fine-tune on interactions where complex plans (at least 3 tool steps) were successfully executed:
+            ```bash
+            python adaptive_train.py --train-on-successful-plans --min-tool-interactions 3
+            ```
+        These options can be combined. For example, to train on successful plans that involved at least 2 tool interactions:
+        `python adaptive_train.py --train-on-successful-plans --min-tool-interactions 2`
+        Use `python adaptive_train.py --analyze_jsonl_logs` (optionally with the same filters) to see statistics on what your filters will select before starting a full training run.
+
+    *   Adjust parameters like `--num_train_epochs`, `--per_device_train_batch_size`, `--learning_rate`, `--lora_r`, `--lora_alpha`, and `--max_seq_length` based on your dataset size, available VRAM, and desired training intensity.
 
 4.  **Using the Fine-tuned Adapters**:
     *   The `adaptive_train.py` script saves LoRA adapters. To use them with `interactive_agi.py`, you would typically:
