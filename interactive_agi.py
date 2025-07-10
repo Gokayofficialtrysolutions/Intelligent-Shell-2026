@@ -6,6 +6,8 @@ import sys
 from pathlib import Path
 import re
 
+from typing import Optional, Union
+
 # Rich imports
 try:
     from rich.console import Console
@@ -281,6 +283,140 @@ context_analyzer = ContextAnalyzer()
 
 # Global conversation history - maxlen will be set from config
 conversation_history = deque()
+
+def load_config() -> dict:
+    global APP_CONFIG # Allow modification of global APP_CONFIG
+    config = DEFAULT_CONFIG.copy() # Start with defaults
+
+    if TOML_AVAILABLE and CONFIG_FILE_PATH.exists():
+        try:
+            loaded_toml = toml.load(CONFIG_FILE_PATH)
+            # Simple deep merge for one level of nesting (like 'generation', 'history')
+            for main_key, sub_dict in DEFAULT_CONFIG.items():
+                if main_key in loaded_toml and isinstance(loaded_toml[main_key], dict):
+                    # If the key exists in loaded_toml and is a dictionary, merge its sub-keys
+                    if main_key not in config: config[main_key] = {} # Ensure section exists
+                    for sub_key, default_val in sub_dict.items():
+                        config[main_key][sub_key] = loaded_toml[main_key].get(sub_key, default_val)
+                elif main_key in loaded_toml: # For top-level keys if any added later (not in DEFAULT_CONFIG structure)
+                    config[main_key] = loaded_toml[main_key]
+                # If main_key from DEFAULT_CONFIG is not in loaded_toml, its default sub_dict remains.
+
+            console.print(f"INFO: Configuration loaded from {CONFIG_FILE_PATH}", style="info")
+        except toml.TomlDecodeError as e:
+            console.print(f"ERROR: Invalid TOML in {CONFIG_FILE_PATH}: {e}. Using default configuration and attempting to save a valid one.", style="error")
+            config = DEFAULT_CONFIG.copy() # Reset to pure defaults on decode error
+            save_config(config) # Save a fresh default config
+        except IOError as e:
+            console.print(f"ERROR: Could not read {CONFIG_FILE_PATH}: {e}. Using default configuration.", style="error")
+    else:
+        if TOML_AVAILABLE:
+            console.print(f"INFO: No config file found at {CONFIG_FILE_PATH}. Creating with default values.", style="info")
+            save_config(config) # Create default config file
+        else:
+            console.print("INFO: TOML library not available. Using default internal configuration.", style="info")
+
+    APP_CONFIG = config # Update global APP_CONFIG
+
+    # Apply loaded config to relevant globals
+    global conversation_history, DEFAULT_GENERATION_PARAMS, session_logger
+
+    # Re-initialize deque with new maxlen if it changed
+    current_history_list = list(conversation_history) # Preserve current items if any
+    new_maxlen = APP_CONFIG.get("history", {}).get("max_len", DEFAULT_CONFIG["history"]["max_len"])
+    conversation_history = deque(maxlen=new_maxlen) # Set new max_len from config
+    conversation_history.extend(current_history_list) # Add back items, deque handles overflow
+
+    # Update DEFAULT_GENERATION_PARAMS based on loaded config
+    # MergedAGI instances copy this at their __init__. If an instance exists, it won't get this update
+    # unless we explicitly update it or it re-reads from APP_CONFIG.
+    # For now, new MergedAGI instances will pick this up.
+    gen_config = APP_CONFIG.get("generation", {})
+    DEFAULT_GENERATION_PARAMS["temperature"] = gen_config.get("default_temperature", DEFAULT_GENERATION_PARAMS["temperature"])
+    DEFAULT_GENERATION_PARAMS["max_new_tokens"] = gen_config.get("default_max_tokens", DEFAULT_GENERATION_PARAMS["max_new_tokens"])
+    DEFAULT_GENERATION_PARAMS["top_p"] = gen_config.get("default_top_p", DEFAULT_GENERATION_PARAMS["top_p"])
+    DEFAULT_GENERATION_PARAMS["repetition_penalty"] = gen_config.get("default_repetition_penalty", DEFAULT_GENERATION_PARAMS["repetition_penalty"])
+
+    # Update syntax theme for Rich (used in /cat and AGI code block display)
+    # This requires a mechanism to pass the theme to Syntax objects or re-initialize console if theme affects it globally.
+    # For Syntax objects, they take `theme` as an arg. We can pass APP_CONFIG['display']['syntax_theme']
+
+    # Update desktop logging settings
+    # This needs to happen *before* SessionLogger is initialized if path override is to take effect.
+    # The enabled flag can be set after initialization.
+    # get_desktop_path() now reads APP_CONFIG, so it's fine.
+    # session_logger.enabled is set after its init based on config.
+
+    global JSONL_LOGGING_ENABLED
+    JSONL_LOGGING_ENABLED = APP_CONFIG.get("logging", {}).get("jsonl_logging_enabled", True)
+    if JSONL_LOGGING_ENABLED:
+        console.print(f"INFO: JSONL interaction logging is ENABLED. Logs will be saved to: {JSONL_LOG_FILE_PATH}", style="info")
+    else:
+        console.print("INFO: JSONL interaction logging is DISABLED via config.", style="info")
+
+    # --- Ensure .gitignore for cache directory ---
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        gitignore_path = CACHE_DIR / ".gitignore"
+        ignore_entry = "interaction_logs.jsonl"
+        if gitignore_path.exists():
+            with open(gitignore_path, 'r+', encoding='utf-8') as f:
+                current_ignores = f.read().splitlines()
+                if ignore_entry not in current_ignores:
+                    f.seek(0, os.SEEK_END) # Go to end of file
+                    if f.tell() > 0 and current_ignores and current_ignores[-1]: # If not empty and last line not blank
+                        f.write('\n')
+                    f.write(f"{ignore_entry}\n")
+        else:
+            with open(gitignore_path, 'w', encoding='utf-8') as f:
+                f.write(f"# Ignore cache-specific files\n")
+                f.write("history.json\n") # Good to ignore the regular history too if not already
+                f.write("config.toml\n")  # And the config if it's auto-generated with defaults
+                f.write(f"{ignore_entry}\n")
+        # Also good practice to have a .gitignore in the main project root that ignores .agi_terminal_cache/
+        # but this script manages the .gitignore *inside* the cache dir.
+    except Exception as e:
+        console.print(f"[warning]Could not create or update .gitignore in {CACHE_DIR}: {e}[/warning]")
+
+    return config
+
+def save_config(config_to_save: dict):
+    if not TOML_AVAILABLE:
+        console.print("WARNING: TOML library not available. Cannot save configuration.", style="warning")
+        return
+    try:
+        CONFIG_FILE_PATH.parent.mkdir(parents=True, exist_ok=True) # Ensure .agi_terminal_cache exists
+        with open(CONFIG_FILE_PATH, 'w', encoding='utf-8') as f:
+            toml.dump(config_to_save, f)
+    except IOError as e:
+        console.print(f"ERROR: Could not save configuration to {CONFIG_FILE_PATH}: {e}", style="error")
+    except Exception as e: # Catch other toml errors
+        console.print(f"ERROR: Failed to serialize configuration for saving: {e}", style="error")
+
+# --- History Loading and Saving ---
+def load_history():
+    if HISTORY_FILE_PATH.exists():
+        try:
+            with open(HISTORY_FILE_PATH, 'r', encoding='utf-8') as f:
+                history_list = json.load(f)
+                # Manually extend the deque to respect its maxlen
+                for item in history_list:
+                    conversation_history.append(item) # deque will handle maxlen
+            console.print(f"Loaded {len(conversation_history)} history entries from {HISTORY_FILE_PATH}", style="dim info")
+        except (json.JSONDecodeError, IOError) as e:
+            console.print(f"Error loading history from {HISTORY_FILE_PATH}: {e}", style="warning")
+    else:
+        console.print(f"No history file found at {HISTORY_FILE_PATH}. Starting fresh.", style="dim info")
+
+def save_history():
+    try:
+        HISTORY_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(HISTORY_FILE_PATH, 'w', encoding='utf-8') as f:
+            json.dump(list(conversation_history), f, indent=2) # Convert deque to list for saving
+        # console.print(f"Saved {len(conversation_history)} history entries to {HISTORY_FILE_PATH}", style="dim info") # Optional: too verbose on every save
+    except IOError as e:
+        console.print(f"Error saving history to {HISTORY_FILE_PATH}: {e}", style="warning")
+
 
 # --- Desktop Path for Session Logs ---
 def get_desktop_path() -> Path:
@@ -984,6 +1120,7 @@ def main():
 
     # Load config first, as it affects other initializations
     load_config()
+    load_history() # Load history after config is loaded and conversation_history deque is initialized
 
     # Now that APP_CONFIG is loaded, initialize things that depend on it
     # (conversation_history deque maxlen is handled in load_config)
@@ -1898,7 +2035,7 @@ def main():
 
 
 if __name__ == "__main__":
-    load_history()
+    # load_history() # Moved into main()
     try:
         main()
     except SystemExit:
@@ -1910,6 +2047,32 @@ if __name__ == "__main__":
         # For now, it's fine.
         # console.print("AGI session terminated. History saved.", style="info")
     # The main __main__ block's finally clause handles saving history and the final "AGI session terminated" message.
+
+
+# --- History Loading and Saving ---
+def load_history():
+    if HISTORY_FILE_PATH.exists():
+        try:
+            with open(HISTORY_FILE_PATH, 'r', encoding='utf-8') as f:
+                history_list = json.load(f)
+                # Manually extend the deque to respect its maxlen
+                for item in history_list:
+                    conversation_history.append(item) # deque will handle maxlen
+            console.print(f"Loaded {len(conversation_history)} history entries from {HISTORY_FILE_PATH}", style="dim info")
+        except (json.JSONDecodeError, IOError) as e:
+            console.print(f"Error loading history from {HISTORY_FILE_PATH}: {e}", style="warning")
+    else:
+        console.print(f"No history file found at {HISTORY_FILE_PATH}. Starting fresh.", style="dim info")
+
+def save_history():
+    try:
+        HISTORY_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(HISTORY_FILE_PATH, 'w', encoding='utf-8') as f:
+            json.dump(list(conversation_history), f, indent=2) # Convert deque to list for saving
+        # console.print(f"Saved {len(conversation_history)} history entries to {HISTORY_FILE_PATH}", style="dim info") # Optional: too verbose on every save
+    except IOError as e:
+        console.print(f"Error saving history to {HISTORY_FILE_PATH}: {e}", style="warning")
+
 
 # --- Shell Command Whitelist & Execution ---
 SHELL_COMMAND_WHITELIST = [
@@ -2731,7 +2894,7 @@ def git_status_command():
             elif status_code[0] in "MADRCU": # Staged changes (first char)
                 staged_files.append(f"({status_code[0].strip()}) {filepath}")
             elif status_code[1] in "MD": # Unstaged changes (second char)
-                 unstaged_files.append(f"({status_code[1].strip()}) {filepath}")
+                unstaged_files.append(f"({status_code[1].strip()}) {filepath}")
             # This parsing is simplified; porcelain can be complex.
 
         table = Table(title=f"Git Status: [cyan]{branch_name}[/cyan] [dim]({remote_info})[/dim]", show_lines=False, box=None)
@@ -2746,896 +2909,16 @@ def git_status_command():
             table.add_row("Untracked", "\n".join(untracked_files))
 
         if not staged_files and not unstaged_files and not untracked_files:
-             table.add_row("Status", "[green]Clean working directory.[/green]")
+            table.add_row("Status", "[green]Clean working directory.[/green]")
 
         console.print(table)
 
     except FileNotFoundError:
         console.print("[red]Error: git command not found. Is Git installed and in PATH?[/red]")
     except subprocess.CalledProcessError as e:
-        console.print(f"[red]Error running git log: {e.stderr}[/red]")
-    except ValueError: # For int conversion of count
-        console.print("[red]Invalid count for /git log. Please provide a number (e.g., /git log -n 15).[/red]")
-    except Exception as e:
-        console.print(f"[red]An unexpected error occurred with /git log: {type(e).__name__} - {e}[/red]")
-
-
-# --- AGI Tool Helper Functions ---
-AGI_READ_FILE_DEFAULT_MAX_LINES = 200 # Default max lines for AGI file read if not specified by AGI
-AGI_READ_FILE_MAX_CHARS = 10000     # Absolute max characters to return to AGI from a file read
-
-def handle_read_file_request(filepath_str: str, max_lines_from_agi: Optional[int]) -> tuple[Optional[str], Optional[str]]:
-    """
-    Handles an AGI's request to read a file after validating the path and user permissions.
-
-    Reads the file content, applying limits on lines and characters.
-    Ensures the path is relative and within the defined project root.
-
-    Args:
-        filepath_str: The relative path to the file, as requested by AGI.
-        max_lines_from_agi: Optional integer specifying the maximum number of lines
-                            the AGI prefers to read. System defaults and caps apply.
-
-    Returns:
-        A tuple `(file_content_string, None)` on successful read, where
-        `file_content_string` contains the file content (possibly truncated with a message).
-        A tuple `(None, error_message_string)` on failure (e.g., file not found,
-        access denied, decoding error).
-    """
-    try:
-        requested_path = Path(filepath_str)
-
-        # Security Validation 1: Ensure it's a relative path
-        if requested_path.is_absolute():
-            return None, f"File path must be relative, but got absolute path: {filepath_str}"
-
-        # Resolve the path based on current working directory
-        # Path.resolve() also handles '..' components safely.
-        abs_path = (Path.cwd() / requested_path).resolve()
-        cwd_resolved = Path.cwd().resolve()
-
-        # Security Validation 2: Check if the resolved path is within the defined PROJECT_ROOT_PATH.
-        # PROJECT_ROOT_PATH is resolved at startup, so it's an absolute path.
-        if PROJECT_ROOT_PATH is None: # Should not happen if main() initializes it correctly
-             console.print("[bold red]CRITICAL: PROJECT_ROOT_PATH is not set. File access denied for safety.[/bold red]")
-             return None, "Project scope is not defined. Cannot read file."
-
-        # Ensure abs_path is within the project root.
-        # Using str.startswith for broader Python version compatibility (Path.is_relative_to is Py3.9+)
-        if not str(abs_path).startswith(str(PROJECT_ROOT_PATH)):
-            # Also check if PROJECT_ROOT_PATH itself is a parent of abs_path,
-            # which means abs_path is project_root/some/path.
-            # The check `str(abs_path).startswith(str(PROJECT_ROOT_PATH))` correctly handles this.
-            # However, if abs_path IS PROJECT_ROOT_PATH, it should also be allowed.
-            # The startswith check covers this too.
-            # The only edge case is if PROJECT_ROOT_PATH is /foo and abs_path is /foobar - this would pass.
-            # To be more robust: check that abs_path starts with PROJECT_ROOT_PATH AND the next char is '/' or it's identical.
-            if abs_path != PROJECT_ROOT_PATH and not str(abs_path).startswith(str(PROJECT_ROOT_PATH) + os.sep):
-                 return None, f"Access denied: File path '{filepath_str}' resolves to '{abs_path}', which is outside the defined project root '{PROJECT_ROOT_PATH}'."
-
-        if not abs_path.exists():
-            return None, f"File not found at resolved path: {abs_path}"
-        if not abs_path.is_file():
-            return None, f"Path is not a file: {abs_path}"
-
-        # Determine max lines to read
-        max_lines_to_read = AGI_READ_FILE_DEFAULT_MAX_LINES
-        if max_lines_from_agi is not None:
-            try:
-                agn_max_l = int(max_lines_from_agi)
-                if agn_max_l > 0:
-                    max_lines_to_read = min(agn_max_l, AGI_READ_FILE_DEFAULT_MAX_LINES * 2) # Allow AGI to ask for more, but cap it reasonably
-            except ValueError:
-                pass # Ignore invalid max_lines from AGI, use default
-
-        file_content_lines = []
-        chars_read = 0
-        lines_actually_read = 0
-        truncated_message = ""
-
-        with open(abs_path, 'r', encoding='utf-8') as f:
-            for i, line in enumerate(f):
-                if i >= max_lines_to_read:
-                    truncated_message = f"\n[...content truncated after {max_lines_to_read} lines...]"
-                    break
-                if chars_read + len(line) > AGI_READ_FILE_MAX_CHARS:
-                    # If adding this line exceeds char limit, take a partial line if possible, then break.
-                    remaining_chars = AGI_READ_FILE_MAX_CHARS - chars_read
-                    if remaining_chars > 0:
-                        file_content_lines.append(line[:remaining_chars])
-                    truncated_message = f"\n[...content truncated due to character limit ({AGI_READ_FILE_MAX_CHARS} chars)...]"
-                    break
-
-                file_content_lines.append(line)
-                chars_read += len(line)
-                lines_actually_read = i + 1
-
-        final_content = "".join(file_content_lines).strip() # Strip trailing newlines from the snippet itself
-        if truncated_message:
-            final_content += truncated_message
-
-        # Log how much was read
-        console.print(f"[dim info]Read {lines_actually_read} lines ({chars_read} chars) from '{filepath_str}'. Max lines requested/default: {max_lines_to_read}. Char limit: {AGI_READ_FILE_MAX_CHARS}.[/dim info]")
-
-        return final_content, None
-
-    except UnicodeDecodeError:
-        return None, f"Could not decode file '{filepath_str}' as UTF-8. It might be binary or use a different encoding."
-    except IOError as e:
-        return None, f"IOError reading file '{filepath_str}': {e}"
-    except Exception as e: # Catch-all for unexpected errors during file handling
-        console.print(f"[bold red]Unexpected error in handle_read_file_request for '{filepath_str}': {type(e).__name__} - {e}[/bold red]")
-        return None, f"An unexpected error occurred while trying to read file: {type(e).__name__}"
-
-import difflib # For generating diffs in handle_write_file_request
-
-def handle_write_file_request(filepath_str: str, content_to_write: str) -> tuple[Optional[str], Optional[str]]:
-    """
-    Handles an AGI's request to write content to a file, subject to path validation and user confirmation.
-
-    If the file exists, a diff of changes is shown to the user for confirmation.
-    If the file is new, its full proposed content is shown for confirmation.
-    Ensures the path is relative, within the project root, and the parent directory exists.
-    Standardizes newlines to '\n' and ensures non-empty files end with a newline.
-
-    Args:
-        filepath_str: The relative path to the file (within project root) where content should be written.
-        content_to_write: The full string content intended for the file.
-
-    Returns:
-        A tuple `(success_message, None)` if the file is written successfully or if the operation
-        is cancelled by the user (message will indicate cancellation).
-        A tuple `(None, error_message_string)` if a validation error, I/O error, or other
-        exception occurs during the process.
-    """
-    try:
-        if PROJECT_ROOT_PATH is None: # Should have been initialized in main()
-            console.print("[bold red]CRITICAL: PROJECT_ROOT_PATH is not set. File write access denied for safety.[/bold red]")
-            return None, "Project scope (PROJECT_ROOT_PATH) is not defined. Cannot write file."
-
-        requested_path = Path(filepath_str)
-        if requested_path.is_absolute():
-            return None, f"File path must be relative, but got absolute path: {filepath_str}"
-
-        # Resolve path relative to project root
-        abs_path = (PROJECT_ROOT_PATH / requested_path).resolve()
-
-        # Security Check: Ensure abs_path is within PROJECT_ROOT_PATH
-        if not (abs_path == PROJECT_ROOT_PATH.resolve() or str(abs_path).startswith(str(PROJECT_ROOT_PATH.resolve()) + os.sep)):
-            return None, f"Access denied: File path '{filepath_str}' resolves to '{abs_path}', which is outside the defined project root '{PROJECT_ROOT_PATH.resolve()}'."
-
-        if abs_path.is_dir():
-            return None, f"Path '{filepath_str}' points to an existing directory. Cannot write file content to a directory."
-
-        parent_dir = abs_path.parent
-        if not parent_dir.exists():
-            return None, f"Parent directory '{parent_dir}' for file '{filepath_str}' does not exist. Please create it first."
-        if not parent_dir.is_dir():
-            return None, f"The parent path '{parent_dir}' for file '{filepath_str}' is not a directory."
-
-        user_confirmed = False
-        final_content_for_file = content_to_write
-        # Standardize newlines for diffing and writing: use '\n'
-        if "\r\n" in final_content_for_file:
-            final_content_for_file = final_content_for_file.replace("\r\n", "\n")
-        if "\r" in final_content_for_file:
-            final_content_for_file = final_content_for_file.replace("\r", "\n")
-
-        # Ensure content ends with a newline if it's not empty, for cleaner diffs and typical file formats.
-        if final_content_for_file and not final_content_for_file.endswith('\n'):
-            content_for_display_and_diff = final_content_for_file + '\n'
-        elif not final_content_for_file: # Empty content
-            content_for_display_and_diff = "" # An empty file is just empty
-        else: # Already ends with newline
-            content_for_display_and_diff = final_content_for_file
-
-
-        if abs_path.exists() and abs_path.is_file():
-            try:
-                existing_content = abs_path.read_text(encoding='utf-8')
-                # Standardize newlines for existing content for diffing
-                if "\r\n" in existing_content: existing_content = existing_content.replace("\r\n", "\n")
-                if "\r" in existing_content: existing_content = existing_content.replace("\r", "\n")
-
-                existing_content_lines = existing_content.splitlines(keepends=True)
-                content_to_write_lines = content_for_display_and_diff.splitlines(keepends=True)
-
-                if existing_content == content_for_display_and_diff: # Check after newline standardization
-                     return f"No changes detected for '{filepath_str}'. Content is identical.", None
-
-                diff = difflib.unified_diff(
-                    existing_content_lines,
-                    content_to_write_lines,
-                    fromfile=f"a/{filepath_str}",
-                    tofile=f"b/{filepath_str}",
-                    lineterm='\n' # Important for difflib
-                )
-                diff_output = "".join(diff)
-
-                if not diff_output: # Should be caught by direct content comparison above, but as fallback:
-                    diff_output = f"--- a/{filepath_str}\n+++ b/{filepath_str}\n@@ -1 +1 @@\n-{existing_content.strip()}\n+{content_for_display_and_diff.strip()}"
-
-
-                console.print(Panel(Syntax(diff_output, "diff", theme=APP_CONFIG.get("display",{}).get("syntax_theme","monokai"), line_numbers=False, word_wrap=True),
-                                    title=f"[bold yellow]Suggested changes for {filepath_str}[/bold yellow]", border_style="yellow"))
-                if RICH_AVAILABLE:
-                    from rich.prompt import Confirm
-                    user_confirmed = Confirm.ask(f"Apply these changes to '{filepath_str}'?", default=False, console=console)
-                else:
-                    user_confirmed = input(f"Apply these changes to '{filepath_str}'? (yes/NO): ").lower() == "yes"
-
-            except Exception as e_read_diff:
-                return None, f"Error reading existing file for diff '{filepath_str}': {e_read_diff}"
-        else: # New file
-            lexer = get_lexer_for_filename(filepath_str)
-            console.print(Panel(Syntax(content_for_display_and_diff, lexer, theme=APP_CONFIG.get("display",{}).get("syntax_theme","monokai"), line_numbers=True, word_wrap=True),
-                                title=f"[bold green]Content for new file: {filepath_str}[/bold green]", border_style="green"))
-            if RICH_AVAILABLE:
-                from rich.prompt import Confirm
-                user_confirmed = Confirm.ask(f"Create new file '{filepath_str}' with this content?", default=False, console=console)
-            else:
-                user_confirmed = input(f"Create new file '{filepath_str}'? (yes/NO): ").lower() == "yes"
-
-        if user_confirmed:
-            try:
-                # Write the version that has standardized newlines and a trailing newline if content exists
-                with open(abs_path, 'w', encoding='utf-8', newline='\n') as f: # newline='\n' ensures only \n is written
-                    f.write(content_for_display_and_diff)
-
-                return f"File '{filepath_str}' written successfully.", None
-            except IOError as e:
-                return None, f"IOError writing to file '{filepath_str}': {e}"
-            except Exception as e_write:
-                return None, f"Unexpected error writing to file '{filepath_str}': {e_write}"
-        else:
-            return "Write operation cancelled by user.", None
-
-    except Exception as e:
-        console.print(f"[bold red]Unexpected error in handle_write_file_request for '{filepath_str}': {type(e).__name__} - {e}[/bold red]")
-        return None, f"An unexpected error occurred processing the write request: {type(e).__name__}"
-
-# --- Model & Adapter Listing ---
-DEFAULT_ADAPTERS_DIR = Path("./merged_model_adapters") # Consistent with adaptive_train.py default output
-
-def display_list_models_command():
-    """Displays available local models and adapter sets."""
-    table = Table(title="[bold blue]Local Model and Adapter Status[/bold blue]", show_lines=True)
-    table.add_column("Type", style="cyan", no_wrap=True)
-    table.add_column("Path / Name", style="white")
-    table.add_column("Status", style="green")
-
-    # 1. Main Merged Model
-    configured_model_path_str = APP_CONFIG.get("model", {}).get("merged_model_path", "./merged_model")
-    main_model_path = Path(configured_model_path_str).resolve()
-
-    model_status = ""
-    if main_model_path.exists() and main_model_path.is_dir():
-        if (main_model_path / "config.json").is_file() or \
-           (main_model_path / "model.safetensors").is_file() or \
-           (main_model_path / "pytorch_model.bin").is_file():
-            model_status = "[green]Found, Appears Valid[/green]"
-        else:
-            model_status = "[yellow]Found, but may not be a valid model (missing key files)[/yellow]"
-    else:
-        model_status = "[red]Not Found[/red]"
-    table.add_row("Base Model Path (configured)", str(main_model_path), Text.from_markup(model_status))
-
-    # 2. PEFT Adapters
-    adapters_dir_to_check = DEFAULT_ADAPTERS_DIR.resolve()
-    if adapters_dir_to_check.exists() and adapters_dir_to_check.is_dir():
-        found_adapters = False
-        for item in sorted(adapters_dir_to_check.iterdir()):
-            if item.is_dir(): # Each subdirectory is potentially an adapter set
-                # Check for common adapter files
-                if (item / "adapter_config.json").is_file() and \
-                   ((item / "adapter_model.bin").is_file() or (item / "adapter_model.safetensors").is_file()):
-                    adapter_status = "[green]Found, Appears Valid[/green]"
-                else:
-                    adapter_status = "[yellow]Found, but may not be a valid adapter set (missing key files)[/yellow]"
-                table.add_row("Adapter Set", str(item.relative_to(Path.cwd())), Text.from_markup(adapter_status)) # Show relative path for brevity
-                found_adapters = True
-        if not found_adapters:
-            table.add_row("Adapter Sets", str(adapters_dir_to_check), "[yellow]Directory exists, but no adapter subdirectories found/valid.[/yellow]")
-    else:
-        table.add_row("Adapter Sets Path", str(adapters_dir_to_check), "[dim]Default adapter directory not found.[/dim]")
-
-    console.print(table)
-
-
-def handle_git_branch_create_request(branch_name: str, base_branch: Optional[str]) -> tuple[Optional[str], Optional[str]]:
-    """
-    Handles an AGI's request to create a new Git branch, after user confirmation.
-
-    Validates the proposed branch name for common invalid patterns.
-    Constructs and executes the `git branch` command. Interprets Git's output
-    to determine success, including cases where the branch might already exist
-    (which Git sometimes reports via stderr with a zero exit code).
-
-    Args:
-        branch_name: The name for the new branch.
-        base_branch: Optional name of an existing branch from which to start the new branch.
-                     If None or empty, the new branch starts from the current HEAD.
-
-    Returns:
-        A tuple `(success_message, None)` on successful operation (including messages
-        from Git like "Branch 'X' set up to track 'Y'.") or if the operation was
-        cancelled by the user.
-        A tuple `(None, error_message_string)` if validation fails, Git command fails,
-        or an unexpected error occurs.
-    """
-    if not branch_name:
-        return None, "Branch name cannot be empty."
-
-    # Basic validation for branch name (simplified)
-    # Git has more complex rules, but this catches common issues.
-    # Ref: man git-check-ref-format
-    if re.search(r"[\s~^:*?\[\]\\]|@{|\.\.", branch_name) or \
-       branch_name.startswith('/') or branch_name.endswith('/') or \
-       branch_name.endswith(".lock"):
-        return None, f"Invalid branch name: '{branch_name}'. Contains invalid characters or patterns."
-
-    git_command_list = ["git", "branch", branch_name]
-    confirm_message = f"Create new branch '{branch_name}'"
-    if base_branch and base_branch.strip():
-        # Further validation for base_branch could be added if needed
-        git_command_list.append(base_branch.strip())
-        confirm_message += f" from base branch '{base_branch.strip()}'"
-    confirm_message += "?"
-
-    if RICH_AVAILABLE:
-        from rich.prompt import Confirm
-        confirmed = Confirm.ask(confirm_message, default=False, console=console)
-    else:
-        confirmed = input(f"{confirm_message} (yes/NO): ").lower() == "yes"
-
-    if not confirmed:
-        return "Branch creation cancelled by user.", None
-
-    try:
-        process = subprocess.run(git_command_list, shell=False, capture_output=True, text=True, check=False)
-        if process.returncode == 0:
-            # Check stderr for common "warning: " or if branch already exists type messages from git.
-            # Git branch might return 0 even if branch already exists but just prints to stderr.
-            # "git branch <name>" successfully creates or does nothing if exists (stderr: "fatal: A branch named '...' already exists.")
-            # Let's check stderr for "fatal" or "error"
-            if "fatal:" in process.stderr.lower() or "error:" in process.stderr.lower():
-                 return None, f"Git error: {process.stderr.strip()}"
-            success_msg = f"Branch '{branch_name}' operation processed."
-            if process.stdout: success_msg += f"\nGit stdout: {process.stdout.strip()}"
-            if process.stderr: success_msg += f"\nGit stderr (warnings): {process.stderr.strip()}" # e.g. if it already existed and command did nothing.
-            return success_msg.strip(), None
-        else:
-            # Return code is non-zero, this is definitely an error.
-            return None, f"Git command failed with return code {process.returncode}. Error: {process.stderr.strip() if process.stderr else process.stdout.strip()}"
-    except FileNotFoundError:
-        return None, "Git command not found. Is Git installed and in PATH?"
-    except Exception as e:
-        console.print(f"[bold red]Unexpected error in handle_git_branch_create_request: {type(e).__name__} - {e}[/bold red]")
-        return None, f"An unexpected error occurred: {type(e).__name__}"
-
-def handle_git_checkout_request(branch_name: str, create_new: bool) -> tuple[Optional[str], Optional[str]]:
-    """
-    Handles an AGI's request to checkout a Git branch, potentially creating it if specified.
-
-    Validates the branch name if `create_new` is true.
-    Constructs and executes `git checkout <branch>` or `git checkout -b <branch>`
-    after user confirmation. Interprets Git's output for success or failure.
-    Git often prints informational messages (e.g., "Switched to branch '...'") to
-    stderr on success, so stderr is checked.
-
-    Args:
-        branch_name: The name of the branch to checkout or create.
-        create_new: If True, attempts to create the branch and check it out (`-b` flag).
-                    If False, attempts to checkout an existing branch.
-
-    Returns:
-        A tuple `(success_message, None)` on successful operation (often Git's output)
-        or if the operation was cancelled by the user.
-        A tuple `(None, error_message_string)` if validation fails, Git command fails,
-        or an unexpected error occurs.
-    """
-    if not branch_name:
-        return None, "Branch name cannot be empty for checkout."
-
-    # Validate branch_name, especially if creating new
-    if create_new:
-        if re.search(r"[\s~^:*?\[\]\\]|@{|\.\.", branch_name) or \
-           branch_name.startswith('/') or branch_name.endswith('/') or \
-           branch_name.endswith(".lock"):
-            return None, f"Invalid new branch name: '{branch_name}'. Contains invalid characters or patterns."
-
-    git_command_list = ["git", "checkout"]
-    action_desc = "Checkout branch"
-    if create_new:
-        git_command_list.append("-b")
-        action_desc = "Create and checkout new branch"
-    git_command_list.append(branch_name)
-
-    confirm_message = f"{action_desc} '{branch_name}'?"
-
-    if RICH_AVAILABLE:
-        from rich.prompt import Confirm
-        confirmed = Confirm.ask(confirm_message, default=False, console=console)
-    else:
-        confirmed = input(f"{confirm_message} (yes/NO): ").lower() == "yes"
-
-    if not confirmed:
-        return f"{action_desc} operation cancelled by user.", None
-
-    try:
-        process = subprocess.run(git_command_list, shell=False, capture_output=True, text=True, check=False)
-        # Git checkout often prints to stderr even on success (e.g., "Switched to a new branch '...'")
-        # So, check returncode first.
-        if process.returncode == 0:
-            success_msg = process.stderr.strip() if process.stderr.strip() else process.stdout.strip() # Prefer stderr for messages like "Switched to..."
-            if not success_msg : success_msg = f"Successfully performed: {' '.join(git_command_list)}"
-            return success_msg, None
-        else:
-            # Error occurred
-            error_msg = process.stderr.strip() if process.stderr else process.stdout.strip()
-            if not error_msg: error_msg = f"Git command failed with return code {process.returncode} but no specific error message."
-            return None, f"Git error: {error_msg}"
-
-    except FileNotFoundError:
-        return None, "Git command not found. Is Git installed and in PATH?"
-    except Exception as e:
-        console.print(f"[bold red]Unexpected error in handle_git_checkout_request: {type(e).__name__} - {e}[/bold red]")
-        return None, f"An unexpected error occurred during git checkout: {type(e).__name__}"
-
-def handle_git_commit_request(commit_message: str, stage_all: bool) -> tuple[Optional[str], Optional[str]]:
-    """
-    Handles an AGI's request to make a Git commit, after user confirmation.
-
-    Validates that the commit message is not empty.
-    Constructs `git commit -m "<message>"` or `git commit -a -m "<message>"`
-    based on the `stage_all` flag. Displays the command and full message for confirmation.
-    Interprets Git's output, including handling the "nothing to commit" case as
-    an informational success rather than an error.
-
-    Args:
-        commit_message: The commit message string.
-        stage_all: If True, stages all tracked and modified files before committing (`-a` flag).
-
-    Returns:
-        A tuple `(success_message, None)` on successful commit (including "nothing to commit")
-        or if the operation was cancelled by the user.
-        A tuple `(None, error_message_string)` if validation fails, Git command execution
-        results in an error (other than "nothing to commit"), or an unexpected error occurs.
-    """
-    if not commit_message or not commit_message.strip():
-        return None, "Commit message cannot be empty."
-
-    git_command_list = ["git", "commit"]
-    if stage_all:
-        git_command_list.append("-a")
-    git_command_list.extend(["-m", commit_message])
-
-    command_str_display = " ".join(git_command_list) # For display only, not for execution
-
-    # Display the proposed command and message clearly to the user
-    commit_panel_content = Text.assemble(
-        "AGI suggests the following Git commit:\n\n",
-        (f"{command_str_display}", "bold cyan"),
-        "\n\nCommit Message:\n",
-        (f"{commit_message}", "italic")
-    )
-    console.print(Panel(commit_panel_content,
-                        title="[bold blue]Git Commit Request[/bold blue]", border_style="blue", expand=False))
-
-    if RICH_AVAILABLE:
-        from rich.prompt import Confirm
-        confirmed = Confirm.ask("Proceed with this commit?", default=False, console=console)
-    else:
-        confirmed = input(f"Proceed with commit: (yes/NO): ").lower() == "yes" # Simplified prompt for non-rich
-
-    if not confirmed:
-        return "Commit operation cancelled by user.", None
-
-    try:
-        process = subprocess.run(git_command_list, shell=False, capture_output=True, text=True, check=False)
-
-        if process.returncode == 0:
-            output = process.stdout.strip() if process.stdout.strip() else "Commit successful (no detailed output from git)."
-            if process.stderr.strip():
-                output += f"\nGit Stderr (info/warnings): {process.stderr.strip()}"
-            return output, None
-        else:
-            error_msg = process.stderr.strip() if process.stderr.strip() else process.stdout.strip()
-            if not error_msg: error_msg = f"Git commit command failed with return code {process.returncode} but no specific error message."
-            # Common case: nothing to commit
-            if "nothing to commit" in error_msg.lower() or "no changes added to commit" in error_msg.lower():
-                return f"Nothing to commit. {error_msg}", None # Return as success message with Git's info
-            return None, f"Git commit error: {error_msg}"
-
-    except FileNotFoundError:
-        return None, "Git command not found. Is Git installed and in PATH?"
-    except Exception as e:
-        console.print(f"[bold red]Unexpected error in handle_git_commit_request: {type(e).__name__} - {e}[/bold red]")
-        return None, f"An unexpected error occurred during git commit: {type(e).__name__}"
-
-def handle_git_push_request(remote_name: Optional[str], branch_name_to_push: Optional[str]) -> tuple[Optional[str], Optional[str]]:
-    """
-    Handles an AGI's request to push a Git branch to a remote repository, after user confirmation.
-
-    Determines the effective remote (defaults to 'origin') and branch (defaults to current
-    checked-out branch if not specified). Constructs and executes the `git push` command.
-    Interprets Git's output (often from stderr) for success or failure, as push
-    operations can have various outcomes (success, auth failure, remote errors, etc.).
-    Force pushing is not permitted by this handler.
-
-    Args:
-        remote_name: Optional name of the remote repository (e.g., 'origin').
-        branch_name_to_push: Optional name of the branch to push.
-
-    Returns:
-        A tuple `(success_message, None)` on successful push (including messages like
-        "Everything up-to-date") or if the operation was cancelled by the user.
-        A tuple `(None, error_message_string)` if determining defaults fails, the Git command
-        execution results in an error, or an unexpected error occurs (e.g., timeout).
-    """
-
-    effective_remote = remote_name.strip() if remote_name and remote_name.strip() else "origin"
-    effective_branch = branch_name_to_push.strip() if branch_name_to_push and branch_name_to_push.strip() else None
-
-    if not effective_branch:
-        try:
-            # Get current branch if not specified
-            proc = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True, check=True)
-            effective_branch = proc.stdout.strip()
-            if not effective_branch or effective_branch == "HEAD": # Detached HEAD or other issue
-                return None, "Could not determine current branch, or in detached HEAD state. Please specify branch to push."
-        except FileNotFoundError:
-            return None, "Git command not found. Is Git installed and in PATH?"
-        except subprocess.CalledProcessError as e:
-            return None, f"Failed to determine current branch: {e.stderr.strip()}"
-        except Exception as e:
-            return None, f"Unexpected error determining current branch: {e}"
-
-    git_command_list = ["git", "push", effective_remote, effective_branch]
-    command_str_display = " ".join(git_command_list)
-
-    console.print(Panel(Text(f"AGI suggests the following Git push command:\n\n[bold cyan]{command_str_display}[/bold cyan]", justify="left"),
-                        title="[bold blue]Git Push Request[/bold blue]", border_style="blue"))
-
-    if RICH_AVAILABLE:
-        from rich.prompt import Confirm
-        confirmed = Confirm.ask(f"Proceed with push: {command_str_display}?", default=False, console=console)
-    else:
-        confirmed = input(f"Proceed with push: {command_str_display}? (yes/NO): ").lower() == "yes"
-
-    if not confirmed:
-        return "Push operation cancelled by user.", None
-
-    try:
-        # Git push often requires credentials; this subprocess call won't handle interactive prompts for them.
-        # It assumes credentials are cached or handled by a credential helper.
-        # Output often goes to stderr, even for success.
-        console.print(f"[info]Attempting to execute: {command_str_display} (This might take a moment...)[/info]")
-        process = subprocess.run(git_command_list, shell=False, capture_output=True, text=True, check=False, timeout=60) # Increased timeout for network op
-
-        # Success/failure for push is complex. Return code 0 is good, but stderr can still have info.
-        # Non-zero often means clear failure.
-        if process.returncode == 0:
-            output = process.stderr.strip() if process.stderr.strip() else process.stdout.strip() # Prefer stderr for push status messages
-            if not output: output = "Push command executed, no detailed output from git."
-            # Check for common success phrases if output is ambiguous
-            if "everything up-to-date" in output.lower() or "->" in output or "branch" in output.lower() and "pushed" in output.lower():
-                 return f"Push successful: {output}", None
-            # If return code 0 but output looks like an error, treat as error
-            elif "error:" in output.lower() or "fatal:" in output.lower() or "rejected" in output.lower():
-                 return None, f"Git push error (despite return code 0): {output}"
-            return f"Push command processed: {output}", None # General success
-        else:
-            error_msg = process.stderr.strip() if process.stderr.strip() else process.stdout.strip()
-            if not error_msg: error_msg = f"Git push command failed with return code {process.returncode} but no specific error message."
-            return None, f"Git push error: {error_msg}"
-
-    except FileNotFoundError:
-        return None, "Git command not found. Is Git installed and in PATH?"
-    except subprocess.TimeoutExpired:
-        return None, "Git push command timed out after 60 seconds."
-    except Exception as e:
-        console.print(f"[bold red]Unexpected error in handle_git_push_request: {type(e).__name__} - {e}[/bold red]")
-        return None, f"An unexpected error occurred during git push: {type(e).__name__}"
-
-import io # For capturing stdout/stderr from exec
-import contextlib # For redirect_stdout/stderr
-import traceback # For formatting exceptions
-
-def handle_execute_python_code_request(code_snippet: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
-    """
-    Handles an AGI's request to execute a Python code snippet in a restricted environment.
-
-    IMPORTANT SECURITY CONSIDERATIONS:
-    This function uses `exec()` which is inherently risky if not handled carefully.
-    It attempts to mitigate risks by:
-    1.  **Mandatory User Confirmation:** The exact code is shown, and the user must explicitly approve.
-    2.  **Pre-execution Static Analysis:** Basic regex checks for obviously dangerous patterns
-        (e.g., `import os`, `open(`). If found, execution is rejected before user confirmation.
-    3.  **Restricted Builtins:** A whitelist of `__builtins__` is provided to `exec()`,
-        excluding functions like `open`, `eval`, `exec`, `__import__`, `getattr`, `setattr`.
-    4.  **No Direct Module Imports:** The restricted environment aims to prevent arbitrary `import` statements.
-        Safe modules (like `math`, `json`) would need to be explicitly added to globals if desired.
-
-    This is NOT a foolproof sandbox. It aims to prevent common accidental or naive malicious attempts.
-    Resource limits (CPU, memory, timeout) are not strictly enforced by this basic implementation.
-
-    Args:
-        code_snippet: The Python code string provided by the AGI.
-
-    Returns:
-        A tuple `(stdout_str, stderr_str, exception_str_or_none)`:
-        - `stdout_str`: Captured standard output from the executed code. Contains a
-                        cancellation message if the user denied execution.
-        - `stderr_str`: Captured standard error output from the executed code.
-        - `exception_str`: A string representation of any Python exception that occurred
-                           during `exec()`, or the special marker "StaticAnalysisReject"
-                           if pre-execution checks failed. None if no exception.
-    """
-    # --- Pre-execution Static Analysis (Basic Heuristic Checks) ---
-    # AGI should be prompted NOT to use these. This is a fallback check.
-    dangerous_patterns = [
-        r"import\s+(os|sys|subprocess|shutil|socket|requests|pathlib|ctypes|pty|fcntl|resource|select|signal|termios|tty|asyncio|multiprocessing|threading)", # Common dangerous imports
-        r"from\s+(os|sys|subprocess|shutil|socket|requests|pathlib|ctypes|pty|fcntl|resource|select|signal|termios|tty|asyncio|multiprocessing|threading)\s+import",
-        r"open\s*\(",      # File system access
-        r"eval\s*\(",      # Dynamic execution
-        r"exec\s*\(",      # Dynamic execution (exec within exec)
-        r"getattr\s*\(",   # Potential attribute snooping/calling
-        r"setattr\s*\(",   # Potential attribute modification
-        r"delattr\s*\(",   # Potential attribute deletion
-        r"__\w+__",      # Access to dunder methods/attributes (broad, might have false positives but good for caution)
-        r"socket\s*\(",   # Network access
-        r"subprocess\s*\.", # Subprocess module usage
-        r"ctypes\s*\."      # CTypes usage
-    ]
-    for pattern in dangerous_patterns:
-        if re.search(pattern, code_snippet, re.IGNORECASE):
-            error_msg = f"Execution rejected by system: Code snippet contains potentially unsafe pattern: '{pattern}'. Please use provided tools for I/O, system, or network operations, or simplify the code."
-            console.print(f"[bold red]{error_msg}[/bold red]")
-            return error_msg, None, "StaticAnalysisReject" # Special marker for exception type
-
-    # If static analysis passes, then proceed to user confirmation
-    console.print(Panel(Syntax(code_snippet, "python", theme=APP_CONFIG.get("display",{}).get("syntax_theme","monokai"), line_numbers=True, word_wrap=True),
-                        title="[bold yellow]AGI suggests executing this Python code snippet:[/bold yellow]", border_style="yellow"))
-
-    warning_text = Text.assemble(
-        ("WARNING:", "bold red"),
-        " Executing code suggested by an AGI carries risks. ",
-        ("Although efforts are made to restrict its capabilities, review the code carefully.\n", "yellow"),
-        "Ensure it does not perform unintended actions, access sensitive data, or harm your system.\n",
-        ("Do you want to execute this code?", "bold white")
-    )
-    console.print(Panel(warning_text, title="[bold red]Security Warning[/bold red]", border_style="red", expand=False))
-
-    if RICH_AVAILABLE:
-        from rich.prompt import Confirm
-        confirmed = Confirm.ask("Execute this Python code snippet?", default=False, console=console)
-    else:
-        confirmed = input("Execute this Python code snippet? (yes/NO): ").lower() == "yes"
-
-    if not confirmed:
-        return "Code execution cancelled by user.", None, None
-
-    # --- Prepare Restricted Execution Environment ---
-    # Whitelist of safe built-ins
-    # (Based on https://docs.python.org/3/library/builtins.html and general safety)
-    # Default-deny approach: only allow what's explicitly listed.
-    # Keep this list as minimal as possible for safety.
-    # AGI should be prompted that only these are available.
-    _ALLOWED_BUILTINS_DICT = {
-        # Safe data types & constructors
-        'str': str, 'int': int, 'float': float, 'bool': bool,
-        'list': list, 'dict': dict, 'set': set, 'tuple': tuple,
-        'bytes': bytes, 'bytearray': bytearray, 'complex': complex,
-        'frozenset': frozenset, 'memoryview': memoryview,
-        'object': object, 'slice': slice, 'type': type, # type() is powerful but hard to exploit without more.
-        # Safe functions for data manipulation & iteration
-        'print': print, 'len': len, 'sum': sum, 'min': min, 'max': max, 'abs': abs, 'round': round,
-        'range': range, 'zip': zip, 'enumerate': enumerate,
-        'map': map, 'filter': filter, 'sorted': sorted, 'reversed': reversed,
-        'all': all, 'any': any, 'isinstance': isinstance, 'issubclass': issubclass,
-        # Common, relatively safe Exception types (primarily for `isinstance` or `except` clauses)
-        'Exception': Exception, 'ValueError': ValueError, 'TypeError': TypeError,
-        'AttributeError': AttributeError, 'NameError': NameError, 'IndexError': IndexError,
-        'KeyError': KeyError, 'ZeroDivisionError': ZeroDivisionError, 'StopIteration': StopIteration,
-        'ArithmeticError': ArithmeticError, 'AssertionError': AssertionError,
-        'NotImplementedError': NotImplementedError,
-        # Constants (already part of Python syntax, but explicitly listing for clarity of intent)
-        'True': True, 'False': False, 'None': None,
-    }
-    # Explicitly disallowed (even if some are not in __builtins__ by default, good to document intent)
-    # 'open', 'file', 'eval', 'exec', 'compile', '__import__', 'globals', 'locals', 'vars',
-    # 'getattr', 'setattr', 'delattr', 'dir', 'input', 'help', 'breakpoint', 'memoryview.tobytes' (example)
-    # 'classmethod', 'staticmethod', 'property', 'super' (less risky, but for simple snippets, likely not needed)
-
-    # --- Pre-execution Static Analysis (Basic Heuristic Checks) ---
-    # AGI should be prompted NOT to use these. This is a fallback check.
-    dangerous_patterns = [
-        r"import\s+(os|sys|subprocess|shutil|socket|requests|pathlib|ctypes|pty|fcntl|resource|select|signal|termios|tty|asyncio|multiprocessing|threading)", # Common dangerous imports
-        r"from\s+(os|sys|subprocess|shutil|socket|requests|pathlib|ctypes|pty|fcntl|resource|select|signal|termios|tty|asyncio|multiprocessing|threading)\s+import",
-        r"open\s*\(",      # File system access
-        r"eval\s*\(",      # Dynamic execution
-        r"exec\s*\(",      # Dynamic execution (exec within exec)
-        r"getattr\s*\(",   # Potential attribute snooping/calling
-        r"setattr\s*\(",   # Potential attribute modification
-        r"delattr\s*\(",   # Potential attribute deletion
-        r"__\w+__",      # Access to dunder methods/attributes (broad, might have false positives but good for caution)
-        r"socket\s*\(",   # Network access
-        r"subprocess\s*\.", # Subprocess module usage
-        r"ctypes\s*\."      # CTypes usage
-    ]
-    for pattern in dangerous_patterns:
-        if re.search(pattern, code_snippet, re.IGNORECASE):
-            error_msg = f"Execution rejected: Code snippet contains potentially unsafe pattern: '{pattern}'. Please use provided tools for I/O, system, or network operations."
-            console.print(f"[bold red]{error_msg}[/bold red]")
-            return error_msg, None, "StaticAnalysisReject" # Special marker for exception type
-
-    # User has already confirmed, proceed with restricted execution
-    restricted_globals = {"__builtins__": _ALLOWED_BUILTINS_DICT.copy()} # Use a copy
-    # Example of adding safe modules (if decided later):
-    # import math
-    # restricted_globals['math'] = math
-    restricted_locals = {}
-
-    stdout_buffer = io.StringIO()
-    stderr_buffer = io.StringIO()
-    exception_str = None
-
-    console.print("[info]Executing code snippet...[/info]")
-    try:
-        with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(stderr_buffer):
-            exec(code_snippet, restricted_globals, restricted_locals)
-    except Exception:
-        exception_str = traceback.format_exc()
-
-    stdout_val = stdout_buffer.getvalue()
-    stderr_val = stderr_buffer.getvalue()
-
-    # Log captured output for debugging/visibility by the system admin (not AGI directly yet)
-    if stdout_val: console.print(Panel(stdout_val, title="[dim]Captured stdout from snippet[/dim]", border_style="dim cyan", expand=False))
-    if stderr_val: console.print(Panel(stderr_val, title="[dim]Captured stderr from snippet[/dim]", border_style="dim yellow", expand=False))
-    if exception_str: console.print(Panel(exception_str, title="[dim]Captured exception from snippet[/dim]", border_style="dim red", expand=False))
-
-    return stdout_val, stderr_val, exception_str
-
-
-# --- Conceptual Design for Secure Code Execution Environment ---
-#
-# GOAL: Allow the AGI to request the execution of Python code snippets in a way that
-# minimizes risk to the underlying system. True sandboxing is complex and
-# often OS-dependent. For this project, we will implement a basic restricted
-# execution environment, heavily relying on user confirmation and strict limitations
-# on what the code can do.
-#
-# PRINCIPLES & CONSTRAINTS:
-#
-# 1.  USER CONFIRMATION IS MANDATORY:
-#     -   The exact code snippet proposed by the AGI MUST be displayed to the user.
-#     -   Explicit user confirmation (e.g., "yes/no") MUST be obtained before any
-#         execution attempt.
-#     -   The user should be warned about the potential risks of running code, even
-#         if it appears simple.
-#
-# 2.  SUPPORTED LANGUAGES:
-#     -   Initially, only Python 3 snippets will be supported.
-#     -   The Python interpreter will be the one running this `interactive_agi.py` script.
-#
-# 3.  EXECUTION MECHANISM (Basic Restriction):
-#     -   The primary mechanism will be Python's `exec()` function.
-#     -   A heavily restricted `globals` and `locals` dictionary will be provided to `exec()`.
-#         -   `globals['__builtins__']` will be a carefully curated dictionary containing
-#             only safe built-in functions and types.
-#         -   Disallowed builtins: `open`, `eval`, `exec`, `compile`, `getattr`, `setattr`,
-#           `delattr`, `importlib`, `__import__` (direct use).
-#         -   Allowed builtins (example list, needs careful review): `print`, `len`, `sum`,
-#           `min`, `max`, `abs`, `round`, `range`, `zip`, `enumerate`, `map`, `filter`,
-#           `sorted`, `reversed`, `all`, `any`, `isinstance`, `issubclass`,
-#           `str`, `int`, `float`, `bool`, `list`, `dict`, `set`, `tuple`, `bytes`,
-#           `bytearray`, `complex`, `frozenset`, `memoryview`, `object`, `slice`, `type`,
-#           `Exception`, `ValueError`, `TypeError`, `AttributeError`, `NameError`, etc.
-#           (standard error types are generally safe to allow to be raised).
-#         -   No access to modules like `os`, `sys`, `subprocess`, `socket`, `requests`,
-#           `pathlib` (for direct manipulation), `shutil`, `ctypes`, etc., unless a
-#           specific, safe subset is explicitly exposed via the globals. For now, assume none.
-#
-# 4.  NO DIRECT FILESYSTEM ACCESS:
-#     -   Code snippets executed via this tool SHOULD NOT attempt to read or write files directly.
-#     -   If file content is needed as input, the AGI should use the `read_file` tool first.
-#     -   If output needs to be saved, the AGI should generate the content and then use
-#         the `write_file` tool.
-#
-# 5.  NO DIRECT NETWORK ACCESS:
-#     -   Code snippets SHOULD NOT attempt to make network requests.
-#     -   If web content is needed, the AGI should use the `web_search` tool.
-#
-# 6.  RESOURCE LIMITS (Conceptual - Not Implemented in Basic Version):
-#     -   Timeout: Execution should be time-limited (e.g., a few seconds). This is hard
-#       to enforce reliably with `exec()` alone in a single thread without more complex
-#       subprocess/threading logic, which is out of scope for the basic version.
-#       *Initial implementation might not have a strict timeout for simplicity, relying on user to kill if hangs.*
-#     -   Memory/CPU: True limits require OS-level sandboxing (e.g., containers), which
-#       is out of scope. Code should be assumed to be small and efficient.
-#
-# 7.  STDOUT/STDERR CAPTURING:
-#     -   `sys.stdout` and `sys.stderr` will be redirected during the `exec()` call to
-#         capture any output or error messages generated by the snippet.
-#     -   This captured output will be returned to the AGI.
-#
-# 8.  EXCEPTION HANDLING:
-#     -   Any Python exceptions raised by the snippet during `exec()` will be caught.
-#     -   A string representation of the exception will be returned to the AGI.
-#
-# 9.  IMPORTS:
-#     -   `import` statements within the executed code will be subject to the restricted
-#         environment. If `__import__` is removed from builtins and no import-related
-#         modules are in globals, imports will fail or be severely limited.
-#     -   A small, safe list of standard library modules could potentially be whitelisted
-#         and pre-imported into the globals (e.g., `math`, `json`, `datetime`, `random`, `re`).
-#         *Initial decision: No `import` statements allowed in the snippet for simplicity and max safety.
-#          If specific modules are needed, they must be pre-approved and added to the restricted globals.*
-#
-# This design prioritizes user awareness and control, and basic restriction of capabilities,
-# over foolproof sandboxing, acknowledging the limitations of implementing a true sandbox
-# within this project's current scope and architecture. The risk is mitigated by the
-# AGI's nature (not inherently malicious) and mandatory user confirmation for all executions.
-#
-
-# --- Help Command ---
-def display_help_command():
-    """Displays a list of available slash commands and their descriptions."""
-    intro_text = Text.assemble(
-        "Type a command directly, or chat with the AGI. Most other input is sent to the AGI.\n",
-        "AGI has access to tools (file ops, Git, web search, code execution) and will ask for confirmation for sensitive actions.\n"
-        "Use ", ("'/set parameter'", "bold yellow"), " and ", ("'/show parameters'", "bold yellow"), " to manage AGI's response generation."
-    )
-    console.print(Panel(intro_text, title="[bold green]AGI Terminal Usage[/bold green]", border_style="green", expand=False))
-
-    help_table = Table(title="[bold blue]Available User Slash Commands[/bold blue]", show_lines=True, expand=False)
-    help_table.add_column("Command", style="bold cyan", min_width=25)
-    help_table.add_column("Parameters", style="yellow", min_width=30)
-    help_table.add_column("Description", style="white", min_width=50, max_width=70)
-
-    commands = [
-        ("/help", "", "Displays this help message listing available user commands."),
-        ("/ls", "[path]", "Lists directory contents. Defaults to current directory."),
-        ("/cd", "<path>", "Changes the current working directory."),
-        ("/cwd", "", "Shows the current working directory."),
-        ("/mkdir", "<directory_name>", "Creates a new directory."),
-        ("/rm", "<path>", "Removes a file or directory (confirms before deleting)."),
-        ("/cp", "<source> <destination>", "Copies a file or directory."),
-        ("/mv", "<source> <destination>", "Moves or renames a file or directory."),
-        ("/cat", "<file_path>", "Displays file content with syntax highlighting. Offers AGI summary for large files."),
-        ("/edit", "<file_path>", "Opens a file with the system's default editor (or $EDITOR)."),
-        ("/read_script", "<script_filename>", "Displays content of whitelisted project scripts (e.g., interactive_agi.py)."),
-        ("/config", "show | get <key> | set <key> <value>", "Manages application configuration. Shows current, gets a key, or sets a key's value."),
-        ("/git", "status | diff [file] | log [-n count]", "Executes git commands: status, diff (optionally for a file or staged), or log (optionally with count)."),
-        ("/search", "<query>", "Performs an internet search using DuckDuckGo (HTML version)."),
-        ("/history", "", "Displays the conversation history for the current session."),
-        ("/clear", "", "Clears the terminal screen and re-displays the startup banner."),
-        ("/sysinfo", "", "Displays system information (OS, Python, CPU, Memory, Disk)."),
-        ("/set parameter", "<NAME> <VALUE>", "Sets an AGI generation parameter (e.g., MAX_TOKENS, TEMPERATURE)."),
-        ("/show parameters", "", "Shows current AGI generation parameters."),
-        ("/analyze_dir", "[path]", "Asks AGI to analyze directory structure and provide a JSON summary. Defaults to current directory."),
-        ("/suggest_code_change", "<file_path>", "Asks AGI to suggest code changes for a whitelisted file based on user description."),
-        ("/list_models", "", "Lists the configured base model path and found local adapter sets."),
-        ("---", "---", "---"), # Separator for non-command info
-        ("Training", "", "Use `python adaptive_train.py --help` in your system terminal to see options for fine-tuning the AGI model on interaction logs. Supports selective training on tool/plan success/failure."),
-        ("exit / quit", "", "Exits the AGI terminal session.")
-    ]
-
-    for cmd, params, desc in commands:
-        if cmd == "---": # Handle separator
-            help_table.add_row(Text("─"*20, style="dim"), Text("─"*25, style="dim"), Text("─"*45, style="dim"))
-        else:
-            help_table.add_row(cmd, params, desc)
-
-    console.print(help_table)
-
-# --- File Content Interaction Commands ---
-MAX_CAT_LINES = 200 # Lines to display for large files before asking to summarize
-MAX_CAT_CHARS_FOR_SUMMARY = 5000 # Max chars to send for summary
-    except subprocess.CalledProcessError as e:
         console.print(f"[red]Error running git status: {e.stderr}[/red]")
+    except ValueError:
+        console.print("[red]Invalid value encountered during git status processing.[/red]")
     except Exception as e:
         console.print(f"[red]An unexpected error occurred with /git status: {type(e).__name__} - {e}[/red]")
 
@@ -3903,7 +3186,7 @@ def save_history():
 
 
 if __name__ == "__main__":
-    load_history() # Load history at startup
+    # load_history() # Moved into main()
     try:
         main()
     except SystemExit: # Catch sys.exit for graceful termination without re-printing message
@@ -4114,3 +3397,4 @@ def handle_web_search_request(query: str) -> tuple[Optional[str], Optional[str]]
 
 # --- Command Implementations ---
 def list_directory_contents(path_str: str):
+    pass

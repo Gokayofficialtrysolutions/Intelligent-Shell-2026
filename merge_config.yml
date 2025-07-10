@@ -1,7 +1,6 @@
 # merge_config.yml
-# Configuration for mergekit: https://github.com/cg123/mergekit
-# This configuration performs a linear merge of the specified models.
-# Ensure the paths to the models are correct based on where download_models.sh places them (./models/<model_key>/)
+# Configuration for mergekit, created by setup_agi_terminal.py
+# Based on latest model recommendations.
 
 slices:
   - sources:
@@ -11,15 +10,11 @@ slices:
       - model: ./models/phi4_mini_instruct # microsoft/Phi-4-mini-instruct (4B)
 merge_method: linear
 base_model: ./models/mistral7b_v03 # Using Mistral-7B-Instruct-v0.3 as the base
-parameters: {} # For simple linear average, parameters are often not needed here with multiple sources in one slice.
-               # Mergekit averages the tensors from the models listed in sources.
+parameters: {}
+dtype: float16
 
-dtype: float16 # Using float16 for a balance of precision and memory
-# To include other downloaded models like llama3 (./models/llama3) or smaller ones like bloom (./models/bloom),
-# or the very large gpt_neox (./models/gpt_neox), add them to the `sources` list above. Example:
+# To include other downloaded models like llama3 (./models/llama3),
+# bloom (./models/bloom), or gpt_neox (./models/gpt_neox),
+# add them to the `sources` list above. Example:
 #      - model: ./models/llama3
-#      - model: ./models/bloom
 #      - model: ./models/gpt_neox
-# The GPT-NeoX 20B model (./models/gpt_neox) is very large and might be challenging to merge
-# without significant RAM (64GB+ might be needed during merge).
-# Consider excluding it if resources are limited.
