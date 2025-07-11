@@ -1,272 +1,356 @@
-# Project: Autonomous AGI Terminal Development
+# AGI Terminal - Autonomous AI Development Environment
 
-## User Directive & AI Autonomy
-The core directive for this project, provided by the user, is as follows:
-"Do not wait never ever forever more to whenever more a confirmation since now. I accept, approve, confirm, agree with your all hierarchical terminal shell based intelligent solutions and coding minds. Do everything the best until the end of the project. Do you understand me?"
+## 1. Project Overview
 
-Jules' (AI Agent) Response: Yes, I understand. Full autonomy is granted for project execution.
+Welcome to the AGI Terminal! This project aims to create a sophisticated, locally-run AI development assistant. By merging several powerful open-source language models, it forms a versatile "MergedAGI" capable of understanding context, generating code, assisting with debugging, interacting with your file system, and more, all within your terminal.
 
-## Project Vision
-To create a master AI within the terminal by merging several powerful open-source models. This AI will aim to function as an intelligent terminal, capable of assisting with code development (writing, compiling, debugging, updating, file management) and other system operations, effectively becoming an advanced interactive tool.
+The system is designed for developers, researchers, and AI enthusiasts who want a highly capable AI assistant that operates on their own machine, offering greater privacy, customization, and potential for offline use.
 
-## Current Status
-Initializing in a new, stable sandbox environment. Core scripts (`download_models.sh`, `interactive_agi.py`, `train_on_interaction.sh`) are in place. The next steps involve user-led model acquisition and merging, followed by AI-driven development to activate and enhance the merged model.
+**Core Features:**
 
-## Automated Setup
+*   **Merged AI Model:** Combines the strengths of multiple specialized open-source LLMs.
+*   **Interactive Terminal:** A rich command-line interface for interacting with the MergedAGI.
+*   **Context Awareness:** The AGI is provided with context about your current working directory, Git status, and key files to make its responses more relevant.
+*   **Tool Usage Framework:** The AGI can:
+    *   Execute whitelisted shell commands (e.g., `ls`, `pwd`, `grep`).
+    *   Read and suggest changes to files.
+    *   Perform internet searches via DuckDuckGo.
+    *   Execute Python code snippets in a restricted environment.
+    *   Manage Git operations (branch, checkout, commit, push).
+    *   Formulate and attempt multi-step plans using these tools.
+*   **Adaptive Learning:** Includes a script (`adaptive_train.py`) to fine-tune the MergedAGI on your interaction history, allowing it to learn your preferences and improve over time.
+*   **Customizable:** You can change the models being merged, fine-tune with your own data, and extend its capabilities.
+*   **Local & Private:** Runs entirely on your machine (once models are downloaded).
 
-The recommended way to set up the AGI Terminal environment is by using the `setup_agi_terminal.py` script. This script automates dependency installation, model downloading, and model merging.
+This `README.md` serves as your comprehensive guide to setting up, using, and customizing the AGI Terminal.
 
-**Prerequisites before running the setup script:**
-*   **Python 3.8 or newer:** Ensure Python 3.8+ and Pip are installed and accessible in your PATH. The script will check this but will not install Python/Pip itself.
-*   **Git:** Ensure Git is installed and accessible in your PATH. The script will check this.
-*   **Internet Connection:** Required for downloading dependencies and models.
-*   **Sufficient Disk Space:** Models can take up 100GB+ of disk space.
-*   **Sufficient RAM:** Model merging is RAM-intensive (32GB+ recommended).
-*   **Hugging Face Account & API Token:** You will need a Hugging Face account and an API token with read access to download models. Get your token from [https://huggingface.co/settings/tokens](https://huggingface.co/settings/tokens).
+## 2. System Prerequisites
 
-**Running the Automated Setup:**
-1.  Download the `setup_agi_terminal.py` script (or clone this repository).
-2.  Open your terminal in the directory where `setup_agi_terminal.py` is located.
-3.  It is **highly recommended** to create and activate a Python virtual environment first:
+Before you begin, ensure your system meets the following requirements:
+
+*   **Operating System:**
+    *   **Linux (Recommended):** Debian/Ubuntu, Fedora, or other modern distributions. Most shell scripts and tools are optimized for a Linux-like environment.
+    *   **macOS:** Should work, but some shell commands or dependencies might require minor adjustments (e.g., using `gsed` instead of `sed`). Homebrew is recommended for installing packages like `git-lfs`.
+    *   **Windows:** Requires **Windows Subsystem for Linux (WSL) 2** with a Linux distribution installed. Direct execution on Windows CMD or PowerShell is not supported due to reliance on bash scripts and POSIX paths.
+*   **Python:**
+    *   Version **3.8 or newer**. Python 3.10+ is recommended.
+    *   `pip` (Python package installer) must be available for your Python installation.
+    *   **Virtual Environment (Strongly Recommended):** To avoid conflicts with system-wide Python packages, it's crucial to create and activate a Python virtual environment (e.g., using `venv` or `conda`) before installing dependencies.
+        ```bash
+        # Example using venv
+        python3 -m venv .venv
+        source .venv/bin/activate  # On Linux/macOS
+        # For Windows (inside WSL terminal): source .venv/bin/activate
+        # If using Python directly on Windows (not recommended for this project): .venv\Scripts\activate
+        ```
+*   **Git:**
+    *   Latest stable version of Git must be installed and accessible in your system's PATH.
+*   **Git LFS (Large File Storage):**
+    *   Required for downloading the AI model files. Install it and run `git lfs install` once globally to initialize it for your user account.
+        *   Debian/Ubuntu: `sudo apt-get update && sudo apt-get install git-lfs`
+        *   Fedora: `sudo dnf install git-lfs`
+        *   macOS (Homebrew): `brew install git-lfs`
+        *   Windows: Download installer from [https://git-lfs.github.com/](https://git-lfs.github.com/)
+        *   After installation, run: `git lfs install`
+*   **Build Tools (Potentially):**
+    *   Some Python packages (especially those related to PyTorch or `bitsandbytes` for QLoRA) might require compilation. Ensure you have a C/C++ compiler toolchain (e.g., `build-essential` on Debian/Ubuntu, Xcode Command Line Tools on macOS).
+*   **CUDA Toolkit (Optional, for GPU Acceleration):**
+    *   If you have an NVIDIA GPU and want to accelerate model inference and training:
+        *   Install the NVIDIA CUDA Toolkit appropriate for your GPU drivers.
+        *   PyTorch will need to be installed with CUDA support (the setup script attempts a generic install; manual install might be needed for specific CUDA versions).
+        *   QLoRA fine-tuning (`--use_qlora` in `adaptive_train.py`) heavily relies on CUDA.
+
+## 3. Disk Space & RAM Requirements
+
+Running and fine-tuning large language models is resource-intensive.
+
+*   **Disk Space:**
+    *   **Python Dependencies:** 5-20GB (PyTorch with CUDA can be very large).
+    *   **AI Models (Downloaded):** Each model can range from ~2GB (e.g., TinyLlama-1.1B) to 30GB+ (e.g., DeepSeek-Coder-V2-Lite, GPT-NeoX-20B). The default selection in `download_models.sh` can easily consume **70-150GB**.
+    *   **Merged Model:** The size of the merged model will be comparable to the sum of the sizes of the models being merged if not sharded, or the size of the largest model if sharded outputs are managed carefully. Mergekit also uses temporary disk space during the merge process. Expect **tens of GBs** for the merged model and temporary files.
+    *   **Interaction Logs & Adapters:** These will grow over time but are initially small.
+    *   **Recommendation:** At least **200-250GB of free disk space** is recommended for a smooth experience with the default model set. More if you plan to download additional large models.
+*   **RAM:**
+    *   **Model Loading & Inference (`interactive_agi.py`):**
+        *   For smaller merged models (e.g., based on 7B parameter models): 16GB+ RAM. 32GB is safer, especially if other applications are running.
+        *   Larger merged models (e.g., including 16B+ components) will require significantly more RAM (32GB, 48GB, or even 64GB+).
+    *   **Model Merging (`setup_agi_terminal.py` via `mergekit`):**
+        *   This is very RAM-intensive. `mergekit` loads models into RAM to perform the merge.
+        *   For the default set of models (mostly 7B scale): **32GB RAM is a minimum**. 64GB is highly recommended for stability and speed, especially if merging larger models like DeepSeek-Coder-V2-Lite (16B).
+        *   Insufficient RAM during merge can lead to crashes or extremely slow swapping.
+    *   **Fine-tuning (`adaptive_train.py`):**
+        *   **GPU VRAM:** If using GPU for fine-tuning (highly recommended), VRAM is critical.
+            *   7B models with LoRA: 12-24GB VRAM might be feasible.
+            *   QLoRA can reduce VRAM requirements significantly (e.g., 7B models might fit in 8-12GB VRAM).
+        *   **System RAM:** Still important for data loading and processing, even with GPU training. 16-32GB system RAM is a good baseline.
+
+**Monitor your system resources closely during setup and operation.**
+
+## 4. Setup Instructions
+
+Follow these steps carefully to set up the AGI Terminal environment on your machine.
+
+**Step 1: Clone the Repository**
+
+```bash
+git clone <repository_url> # Replace <repository_url> with the actual URL of this project
+cd <repository_directory_name>
+```
+
+**Step 2: Create and Activate a Python Virtual Environment (Highly Recommended)**
+
+This isolates project dependencies.
+
+```bash
+# Ensure you are in the project's root directory
+python3 -m venv .venv
+source .venv/bin/activate  # On Linux/macOS
+# For Windows (WSL or direct Python): .venv\Scripts\activate
+```
+You should see `(.venv)` at the beginning of your terminal prompt.
+
+**Step 3: Install Git LFS (if not already done globally)**
+
+Refer to Section 2 for installation instructions specific to your OS. After installing, run:
+```bash
+git lfs install
+```
+This initializes Git LFS for your user account. The `download_models.sh` script also runs this.
+
+**Step 4: Run the Automated Setup Script (`setup_agi_terminal.py`)**
+
+This script automates the remaining setup process. It will:
+*   Check for prerequisites (Python, pip, git, git-lfs).
+*   Install required Python packages (PyTorch, Transformers, mergekit, etc.).
+*   Execute `download_models.sh` to download the AI models.
+*   Execute `mergekit` to merge the downloaded models based on `merge_config.yml`.
+
+To run the script:
+```bash
+python setup_agi_terminal.py
+```
+
+The script will guide you with prompts and status messages:
+*   It will ask for confirmation before installing Python packages (which includes PyTorch and can take time and space).
+*   It will ask for confirmation before starting model downloads (very time and space consuming).
+*   It will ask for confirmation before starting model merging (CPU and RAM intensive).
+
+**Important Notes for `setup_agi_terminal.py`:**
+
+*   **PyTorch Installation:** The script attempts a standard `pip install torch torchvision torchaudio`. If you have a specific CUDA version or need a CPU-only version (to save space/time if you don't have a compatible GPU), you might need to install PyTorch manually *before* running `setup_agi_terminal.py`. Refer to [https://pytorch.org/get-started/locally/](https://pytorch.org/get-started/locally/) for specific commands. If PyTorch installation fails, the script will warn you and ask if you want to proceed with other packages.
+*   **Model Downloads:** The `download_models.sh` script (called by the setup script) uses `git clone` and `git lfs pull`. This can take many hours and requires substantial disk space (see Section 3). Ensure your internet is stable. If a download is interrupted, you might be able to resume by navigating to the specific model's directory (e.g., `./models/mistral7b_v03/`) and running `git lfs pull` manually, or by re-running `download_models.sh` (it attempts to skip already completed clones).
+*   **Model Merging:** This step uses `mergekit` and is CPU and RAM intensive. It can also take a long time. Ensure your system has adequate resources (especially RAM, see Section 3).
+
+**Step 5: Verify Setup**
+
+After `setup_agi_terminal.py` completes:
+*   **Check for Python Packages:** Ensure there were no critical errors during `pip install`.
+*   **Check Model Downloads:** The `./models/` directory should contain subdirectories for each downloaded model (e.g., `./models/mistral7b_v03/`, `./models/olmo7b_instruct/`, etc.). These directories should be populated with model files (often large `.safetensors` or `.bin` files).
+*   **Check Merged Model:** The `./merged_model/` directory should exist and contain the files for your merged AGI model (configuration files, tokenizer files, and model weight files like `pytorch_model.bin` or `model.safetensors.index.json` with shards).
+*   **Review Logs:** Check the terminal output from `setup_agi_terminal.py` for any errors or warnings.
+
+If any step failed, review the error messages, check your system resources (disk space, RAM, internet), and consult the Troubleshooting section (Section 7).
+
+## 5. Running the AGI Terminal (`interactive_agi.py`)
+
+Once the setup is complete and you have a `./merged_model/` directory, you can start the AGI Terminal.
+
+**To start:**
+
+```bash
+python interactive_agi.py
+```
+
+You should see a startup banner and then a prompt like `You> `.
+
+**Interacting with the AGI:**
+
+*   Simply type your query or instruction and press Enter.
+*   The AGI will process your input (considering current context) and generate a response.
+*   If the AGI decides to use a tool (e.g., run a shell command, write a file), it will typically ask for your confirmation before proceeding with sensitive actions.
+
+**Built-in Slash Commands:**
+
+Type these commands directly into the prompt:
+
+*   `/help`: Display a list of available slash commands and their usage.
+*   `/exit` or `/quit`: Terminate the AGI session.
+*   `/clear`: Clear the terminal screen.
+*   `/history`: Display recent conversation history.
+*   `/set parameter <NAME> <VALUE>`: Adjust model generation parameters (e.g., `MAX_TOKENS`, `TEMPERATURE`). Example: `/set parameter TEMPERATURE 0.7`.
+*   `/show parameters`: Display current AGI generation parameters.
+*   `/config show`: Display current application configuration from `config.toml`.
+*   `/config get <section.key>`: Get a specific configuration value.
+*   `/config set <section.key> <value>`: Set a configuration value (e.g., `/config set display.syntax_theme native`). Some changes may require restart.
+*   `/cwd`: Show the current working directory.
+*   `/cd <path>`: Change the current working directory.
+*   `/ls [path]`: List contents of the specified directory (default: current).
+*   `/mkdir <dirname>`: Create a directory.
+*   `/rm <path>`: Remove a file or directory (with confirmation).
+*   `/cp <source> <destination>`: Copy a file or directory.
+*   `/mv <source> <destination>`: Move/rename a file or directory.
+*   `/cat <file_path>`: Display file content with syntax highlighting. For large files, it may show a preview and ask if you want the AGI to summarize a portion.
+*   `/edit <file_path>`: Open the specified file in your default system editor (or common fallbacks like nano/vim/notepad).
+*   `/search <query>`: Perform an internet search using DuckDuckGo and display results.
+*   `/git status`: Show parsed Git status for the current directory.
+*   `/git diff [file_path]`: Show Git diff (staged if no file, else for that file).
+*   `/git log [-n <count>]`: Show Git log with formatting (default last 10).
+*   `/read_script <filename>`: Displays content of whitelisted project scripts (e.g., `interactive_agi.py`). Useful for asking the AGI about its own code.
+*   `/suggest_code_change <file_path>`: (Highly Experimental) Allows you to describe a change to a whitelisted project file. The AGI will suggest the change (e.g., in diff format), which you must then review and apply manually.
+*   `/analyze_dir [path]`: (Experimental) Asks the AGI to analyze a directory's structure and provide a JSON response, displayed as a tree.
+*   `/sysinfo`: Show detailed system information.
+*   `/save_script <name> <cmd1> ; <cmd2> ...`: Save a sequence of commands as a user script.
+*   `/run_script <name>`: Execute a saved user script.
+*   `/list_scripts`: List all saved user scripts.
+*   `/delete_script <name>`: Delete a saved user script.
+*   `/list_models`: List models defined in `download_models.sh` (for reference).
+
+**Interaction Logs:**
+
+*   **Plain Text Session Logs:** By default, a plain text transcript of your session is saved to your Desktop (or a fallback directory `./agi_desktop_logs/`). This can be configured via `config.toml`.
+*   **JSONL Interaction Logs:** Detailed structured logs of each turn (user query, AGI responses, tool usage, context) are saved to `./.agi_terminal_cache/interaction_logs.jsonl`. These are used by `adaptive_train.py`.
+
+## 6. Training / Fine-tuning (`adaptive_train.py`)
+
+The AGI Terminal includes `adaptive_train.py` to fine-tune your MergedAGI using the accumulated interaction logs from `./.agi_terminal_cache/interaction_logs.jsonl`. This allows the AGI to learn from your specific interactions, improving its responses and tool usage over time.
+
+**Prerequisites for Fine-tuning:**
+
+*   **GPU with Sufficient VRAM:** Highly recommended. Fine-tuning is computationally intensive.
+    *   NVIDIA GPU with CUDA support.
+    *   VRAM requirements depend on model size and batch size (see Section 3). QLoRA can significantly reduce VRAM needs.
+*   **PyTorch with CUDA:** Ensure your PyTorch installation supports your GPU.
+*   **Dependencies:** `transformers`, `accelerate`, `peft`, `bitsandbytes` (especially for QLoRA), `scipy`, `datasets`. These should be installed by `setup_agi_terminal.py`.
+
+**Running `adaptive_train.py`:**
+
+1.  **Accumulate Interaction Logs:** Use `interactive_agi.py` normally. Your interactions will be logged.
+2.  **Run the Script:**
     ```bash
-    python3 -m venv .venv
-    source .venv/bin/activate  # On Linux/macOS
-    # .venv\Scripts\activate   # On Windows
+    python adaptive_train.py [options]
     ```
-4.  Run the setup script:
-    ```bash
-    python setup_agi_terminal.py
-    ```
-5.  The script will guide you through the process, including:
-    *   Checking prerequisites.
-    *   Installing required Python packages.
-    *   Prompting for your Hugging Face API token to log in.
-    *   Confirming before downloading models (large downloads).
-    *   Confirming before merging models (CPU/RAM intensive).
-    *   Creating necessary configuration files (`merge_config.yml`) and helper scripts (`download_models.sh`, `train_on_interaction.sh`).
+    Key options (see `python adaptive_train.py --help` for all):
+    *   `--model_path`: Path to your base model (e.g., `./merged_model`). Default: `./merged_model`.
+    *   `--jsonl_log_path`: Path to `interaction_logs.jsonl`. Default: `./.agi_terminal_cache/interaction_logs.jsonl`.
+    *   `--output_dir`: Where to save the trained LoRA/QLoRA adapters. Default: `./merged_model_adapters`.
+    *   `--num_train_epochs`: Number of training epochs (e.g., 1-3).
+    *   `--learning_rate`: Learning rate (e.g., 2e-4, 5e-5).
+    *   `--use_qlora`: Enable QLoRA for 4-bit training (reduces memory).
+    *   **Data Filtering Options:** Use flags like `--train-on-successful-tool-use all` or `--train-on-halted-plans` to focus training on specific types of interactions.
 
-Upon successful completion, the `./merged_model` directory will contain your merged AGI model, and you'll be ready to run `interactive_agi.py`.
+**Example:**
+```bash
+python adaptive_train.py --num_train_epochs 1 --learning_rate 5e-5 --use_qlora --train-on-successful-tool-use all
+```
 
-## Project Phases & Manual Overview (Post Automated Setup)
+**Using the Fine-tuned Adapters:**
 
-The automated setup handles the initial phases. Here's an overview of the components and how they fit together, particularly for understanding what the setup script accomplishes and for subsequent interaction and development:
-
-**Phase 0: Project Setup and Core Scripts (Handled by `setup_agi_terminal.py`)**
-*   Core scripts like `interactive_agi.py`, `adaptive_train.py`, `download_models.sh`, `train_on_interaction.sh`, and `merge_config.yml` are either part of the repository or created by the setup script.
-*   The setup script ensures necessary Python packages are installed.
-
-**Phase 1: Model Acquisition & Merging (Automated by `setup_agi_terminal.py`)**
-*   The `setup_agi_terminal.py` script invokes `download_models.sh` to download models into `./models/`.
-*   It then uses `mergekit-yaml` with `merge_config.yml` to combine these models into `./merged_model/`.
-    *   The default `merge_config.yml` (created by the setup script) uses:
-        *   `mistralai/Mistral-7B-Instruct-v0.3` (Base Model)
-        *   `deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct` (16B)
-        *   `bigcode/starcoder2-7b`
-        *   `microsoft/Phi-4-mini-instruct` (4B)
-
-**Phase 2: Activating the Merged Model (AI Task, post-setup)**
-1.  ***`interactive_agi.py` for Actual Model Loading***:
-    *   The `interactive_agi.py` script is designed to load the tokenizer and model from `./merged_model`.
-    *   **Key Features of `interactive_agi.py`:**
-        *   **Rich UI:** Uses the `rich` library for styled output, syntax highlighting, tables, panels, etc.
-        *   **Context Awareness:** Passes CWD, Git status, file type counts, and key file snippets to the AGI.
-        *   **Task-Specific Prompting & Styling:** Tailors prompts and response panel styles based on inferred task type.
-        *   **Tool Execution Framework (Basic):** AGI can suggest whitelisted shell commands (e.g., `ls`, `pwd`, `date`) for execution with user confirmation.
-        *   **Self-Referential Capability:** `/read_script <filename>` allows viewing whitelisted project scripts.
-        *   **Experimental Code Suggestion:** `/suggest_code_change <file_path>` allows AGI to propose changes (diff/text) to whitelisted files for manual user application.
-        *   **Persistent History & Logging:** Saves JSON history (`./.agi_terminal_cache/history.json`) and plain text session logs to Desktop/fallback dir.
-        *   **Configuration:** Settings managed via `./.agi_terminal_cache/config.toml` and `/config` commands.
-        *   **Expanded Commands:** Extensive command set for file ops, Git, search, system info, etc. (see "How to Run").
-    *   Robust error handling and device placement are implemented.
-2.  ***Test Merged Model Interaction***:
-    *   Users can test the merged model by running `python interactive_agi.py`.
-
-**Phase 3: Enabling Learning and Self-Improvement** (largely in place, usability of `adaptive_train.py` enhanced)
-1.  ***Interaction Logging for Training:***
-    *   Interactions for fine-tuning are logged by `train_on_interaction.sh` to `./interaction_logs/`.
-    *   Readable session transcripts are also saved to the user's Desktop.
-2.  ***`adaptive_train.py` for Fine-tuning:***
-    *   This script allows fine-tuning the `./merged_model` using PEFT/LoRA on accumulated interaction logs.
-    *   It now features `rich` progress bars and enhanced CLI arguments for filtering logs.
-    *   See details in the "Fine-tuning with `adaptive_train.py`" section.
-3.  ***Integrate Training Trigger (Future Enhancement)***:
-    *   A mechanism to call `adaptive_train.py` (e.g., special command or periodic trigger) may be added to `interactive_agi.py`.
-
-**Phase 3.1: Fine-tuning with `adaptive_train.py` (User Task)**
-
-This script helps you fine-tune the `./merged_model` using your interaction history from `./interaction_logs/`.
-
-1.  **Prerequisites for `adaptive_train.py`**:
-    *   Ensure you have a PyTorch environment with GPU support (recommended for reasonable training times).
-    *   Install necessary Python libraries:
-        ```bash
-        pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118 # Adjust for your CUDA version
-        pip install transformers accelerate peft bitsandbytes sentencepiece datasets scipy
-        ```
-        *   `accelerate` helps with training on different hardware setups.
-        *   `peft` is for Parameter-Efficient Fine-Tuning (LoRA, QLoRA).
-        *   `bitsandbytes` is needed for 8-bit optimizers and QLoRA (4-bit quantization).
-        *   `datasets` might be used by `Trainer` or for more advanced data handling.
-        *   `scipy` is often a dependency for PEFT or training metrics.
-
-2.  **Understanding `adaptive_train.py`**:
-    *   The script loads your base model from `./merged_model`.
-    *   It parses all `*.log` files in `./interaction_logs/`.
-    *   It formats these interactions into a dataset suitable for instruction fine-tuning.
-    *   It uses LoRA (or QLoRA if you specify `--use_qlora`) to efficiently fine-tune the model.
-    *   The fine-tuned LoRA adapters (not the entire model) are saved to `./merged_model_adapters/` by default.
-
-3.  **Running `adaptive_train.py`**:
-    *   Open your terminal in the project root.
-    *   Basic usage:
-        ```bash
-        python adaptive_train.py
-        ```
-    *   This will use default parameters (1 epoch, small batch size, default LoRA settings).
-    *   **Important**: The script attempts to find suitable `target_modules` for LoRA (e.g., "q_proj", "v_proj"). These are common in Llama-like architectures. **If your merged model has a different architecture, you may need to modify the `target_modules` list within `adaptive_train.py`**. The script will print the modules it tries to target. Inspect your model structure if PEFT configuration fails.
-    *   To see all available options:
-        ```bash
-        python adaptive_train.py --help
-        ```
-    *   Example with QLoRA (4-bit training, potentially slower but uses less VRAM):
-        ```bash
-        python adaptive_train.py --use_qlora --learning_rate 1e-4 --num_train_epochs 1
-        ```
-    *   The script now uses `rich` for better progress display during data processing and training (if `rich` is installed).
-    *   Training can be time-consuming and resource-intensive. Monitor your system resources.
-
-    *   **Selective Training with `adaptive_train.py`**:
-        The script now supports more advanced filtering of the `interaction_logs.jsonl` to create targeted training datasets. This allows focusing the fine-tuning process on specific types of interactions:
-        *   `--train-on-successful-tool-use [tool_name|all]`: Train only on turns where the specified tool (e.g., `read_file`) or any tool (`all`) was used successfully.
-        *   `--train-on-failed-tool-use [tool_name|all]`: Train only on turns where a tool call failed, was cancelled, or denied by the system.
-        *   `--train-on-successful-plans`: Train only on turns involving successfully completed multi-step plans (i.e., `execute_plan` actions that didn't halt).
-        *   `--train-on-halted-plans`: Train only on turns where a multi-step plan was halted.
-        *   `--min-tool-interactions <N>`: Train only on turns that involved at least N tool interactions (useful for complex sequences).
-        *   Example: To fine-tune specifically on successful uses of the `write_file` tool:
-            ```bash
-            python adaptive_train.py --train-on-successful-tool-use write_file
-            ```
-        *   Example: To fine-tune on interactions where complex plans (at least 3 tool steps) were successfully executed:
-            ```bash
-            python adaptive_train.py --train-on-successful-plans --min-tool-interactions 3
-            ```
-        These options can be combined. For example, to train on successful plans that involved at least 2 tool interactions:
-        `python adaptive_train.py --train-on-successful-plans --min-tool-interactions 2`
-        Use `python adaptive_train.py --analyze_jsonl_logs` (optionally with the same filters) to see statistics on what your filters will select before starting a full training run.
-
-    *   Adjust parameters like `--num_train_epochs`, `--per_device_train_batch_size`, `--learning_rate`, `--lora_r`, `--lora_alpha`, and `--max_seq_length` based on your dataset size, available VRAM, and desired training intensity.
-
-4.  **Using the Fine-tuned Adapters**:
-    *   The `adaptive_train.py` script saves LoRA adapters. To use them with `interactive_agi.py`, you would typically:
-        1.  Load the original base model (`./merged_model`).
-        2.  Merge the LoRA adapters into the base model and save it as a new model, or load the base model and then apply the adapters dynamically at runtime.
-    *   Currently, `interactive_agi.py` loads directly from `./merged_model`. To use the fine-tuned adapters, you would need to either:
-        *   **Option A (Recommended for simplicity now):** Manually merge the adapters into your `./merged_model` weights. You can do this with a separate script using `peft.PeftModel.merge_and_unload()`.
-        *   **Option B (Future Enhancement):** Modify `interactive_agi.py` to load the base model and then dynamically apply adapters from `./merged_model_adapters/`.
-    *   A script for merging adapters would look something like this (save as `merge_adapters.py`):
+*   `adaptive_train.py` saves PEFT adapters (LoRA layers) to the specified output directory (e.g., `./merged_model_adapters`).
+*   To use these adapters with `interactive_agi.py`:
+    1.  **Option A (Manual Merge):** You need to merge these adapters into your base model weights and save it as a new model (e.g., overwrite `./merged_model` or save to a new path like `./merged_model_finetuned`). A helper script `merge_adapters.py` is often provided or can be created (see project documentation or `README.md` examples if available, or `adaptive_train.py`'s comments for a template).
         ```python
-        # merge_adapters.py
-        import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-        from peft import PeftModel
-        import argparse
-
-        def main():
-            parser = argparse.ArgumentParser(description="Merge PEFT adapters into a base model and save.")
-            parser.add_argument("--base_model_path", type=str, default="./merged_model", help="Path to the base model.")
-            parser.add_argument("--adapter_path", type=str, default="./merged_model_adapters", help="Path to the PEFT adapters.")
-            parser.add_argument("--output_path", type=str, default="./merged_model_finetuned", help="Path to save the merged model.")
-            args = parser.parse_args()
-
-            print(f"Loading base model from {args.base_model_path}...")
-            base_model = AutoModelForCausalLM.from_pretrained(args.base_model_path, torch_dtype=torch.float16, device_map="auto", trust_remote_code=True)
-            tokenizer = AutoTokenizer.from_pretrained(args.base_model_path, trust_remote_code=True)
-
-            print(f"Loading PEFT adapter from {args.adapter_path}...")
-            model_to_merge = PeftModel.from_pretrained(base_model, args.adapter_path)
-
-            print("Merging adapters...")
-            merged_model = model_to_merge.merge_and_unload()
-            print(f"Saving merged model to {args.output_path}...")
-            merged_model.save_pretrained(args.output_path)
-            tokenizer.save_pretrained(args.output_path)
-            print("Done.")
-
-        if __name__ == "__main__":
-            main()
+        # Example: python merge_adapters.py --base_model_path ./merged_model --adapter_path ./merged_model_adapters --output_path ./merged_model_finetuned
         ```
-        To run this: `python merge_adapters.py --output_path ./merged_model` (to overwrite the existing one, use with caution) or a new path. Then `interactive_agi.py` would use this updated model.
+        Then, update `merged_model_path` in `./.agi_terminal_cache/config.toml` to point to this new finetuned model directory.
+    2.  **Option B (Dynamic Loading - Future Enhancement):** `interactive_agi.py` could be modified to load the base model and then dynamically apply adapters at runtime. This is not the default behavior.
 
-**Phase 4: Expanding Capabilities (AGI Terminal Vision - AI Task, Exploratory)**
-1.  ***Command Interpretation Module***: Develop the model's ability to understand natural language commands for actions (file ops, code tasks).
-2.  ***Secure Tool Execution Framework***: Design a system for the AI to request execution of sandboxed commands or generate scripts for user review (prioritizing safety).
-3.  ***Code Generation & Manipulation***: Enable AI to write, read, and modify code files.
-4.  ***Compilation and Debugging Cycle Support***: Integrate triggering compilation and parsing errors for AI-assisted debugging.
-5.  ***State Management***: Enhance contextual awareness for longer, complex tasks.
+**Analysis Mode:**
+Before training, you can analyze your logs and see how they would be formatted:
+```bash
+python adaptive_train.py --analyze_jsonl_logs 10 # Show stats and 10 example formatted prompts
+python adaptive_train.py --analyze_jsonl_logs --train-on-successful-plans # See stats if only successful plans are used
+```
 
-## How to Run
+## 7. Troubleshooting
 
-1.  **Automated Setup (Recommended)**:
-    *   Follow the instructions under the "Automated Setup" section above to run `python setup_agi_terminal.py`.
-    *   This script handles prerequisites, dependency installation, model downloads, and merging.
-    *   Upon successful completion, your `./merged_model` will be ready.
+*   **`setup_agi_terminal.py` fails during Python package installation:**
+    *   **Disk Space:** Ensure you have enough free disk space (especially for PyTorch).
+    *   **Network Issues:** Check your internet connection.
+    *   **PyTorch:** If `torch` installation is the problem, try installing it manually first with options specific to your system (CPU-only or specific CUDA version) from [pytorch.org](https://pytorch.org/get-started/locally/). Then re-run `setup_agi_terminal.py`.
+    *   **Compiler Errors:** Some packages might need C/C++ compilers. Install `build-essential` (Linux) or Xcode Command Line Tools (macOS).
+    *   **Permissions:** Ensure you have write permissions in the project directory and your Python environment.
+*   **`download_models.sh` fails:**
+    *   **Disk Space:** This is the most common issue. Free up significant space.
+    *   **Internet Connection:** Downloads are large; ensure stability.
+    *   **Git LFS Not Installed/Initialized:** Run `git lfs install` and ensure `git-lfs` command is in your PATH.
+    *   **Typos in Model URLs (if customized):** Double-check URLs in `download_models.sh`.
+    *   **Resume Interrupted Downloads:** Navigate to the specific model directory (e.g., `./models/mistral7b_v03/`) and run `git lfs pull`.
+*   **`mergekit` (model merging) fails:**
+    *   **RAM:** This is very RAM-intensive. Ensure you have enough (see Section 3). Close other applications.
+    *   **Disk Space:** `mergekit` can use temporary disk space.
+    *   **Model Compatibility:** If you customized `merge_config.yml` with very different models, merging might fail even with `--allow-crimes`. Try merging fewer or more similar models.
+    *   **Corrupted Downloads:** Ensure models in `./models/` are complete.
+*   **`interactive_agi.py` fails to load model:**
+    *   Ensure `./merged_model/` directory exists and contains valid model files.
+    *   Check `~/.agi_terminal_cache/config.toml` to ensure `model.merged_model_path` points to the correct location.
+    *   Check console output for specific error messages from Transformers/PyTorch.
+    *   You might be out of RAM to load the model.
+*   **`adaptive_train.py` fails:**
+    *   **GPU/CUDA Issues:** Ensure CUDA toolkit and NVIDIA drivers are correctly installed and PyTorch recognizes your GPU (`torch.cuda.is_available()` should be true).
+    *   **VRAM:** Fine-tuning requires significant VRAM. Reduce batch size (`--per_device_train_batch_size`), enable QLoRA (`--use_qlora`), or use a smaller model.
+    *   **Dependencies:** Ensure `peft`, `bitsandbytes` (for QLoRA), `accelerate` are installed.
+    *   **Log File Path:** Verify `--jsonl_log_path` is correct.
+*   **General Slowness:**
+    *   Model inference and merging are demanding. Ensure your hardware meets recommendations.
+    *   Using CPU for inference with large models will be slow.
 
-2.  **Start the AGI Terminal**:
-    *   After the setup script finishes (or if you have manually completed Phase 0 and 1), run:
-        ```bash
-        python interactive_agi.py
-        ```
-    *   Interact with the AGI. Your interactions will be logged to `./interaction_logs/`.
-    *   The terminal now supports several commands for better interaction:
-        *   `/set parameter <NAME> <VALUE>`: Adjust model generation parameters (e.g., `MAX_TOKENS`, `TEMPERATURE`).
-        *   `/show parameters`: Display current generation parameters.
-        *   `/ls [path]`: List contents of the specified directory (default: current).
-        *   `/cwd`: Show the current working directory.
-        *   `/cd <path>`: Change the current working directory.
-        *   `/clear`: Clear the terminal screen.
-        *   `/history`: Display recent conversation history.
-        *   `/sysinfo`: Show detailed system information (uses `psutil` if available).
-        *   `/search <query>`: Perform an internet search using DuckDuckGo and display results.
-        *   `/cat <file_path>`: Display file content with syntax highlighting. For large files, it shows a preview and asks if you want to send a portion to the AGI for summary/query.
-        *   `/edit <file_path>`: Open the specified file in your default system editor (or common fallbacks like nano/vim/notepad).
-        *   `/mkdir <dirname>`: Create a directory.
-        *   `/rm <path>`: Remove a file or directory (with confirmation, especially for directories).
-        *   `/cp <source> <destination>`: Copy a file or directory.
-        *   `/mv <source> <destination>`: Move/rename a file or directory.
-        *   `/git status`: Show parsed Git status for the current directory.
-        *   `/git diff [file_path]`: Show Git diff (staged if no file, else for that file).
-        *   `/git log [-n <count>]`: Show Git log with formatting (default last 10).
-        *   `/analyze_dir [path]`: (Experimental) Asks the AGI to analyze a directory's structure and provide a JSON response, displayed as a tree.
-        *   `/read_script <filename>`: Displays content of whitelisted project scripts (e.g., `interactive_agi.py`). Useful for asking the AGI about its own code.
-        *   `/suggest_code_change <file_path>`: (Highly Experimental) Allows you to describe a change to a whitelisted project file. The AGI will suggest the change (e.g., in diff format), which you must then review and apply manually.
-        *   `/config show`: Display current application configuration.
-        *   `/config get <section.key>`: Get a specific configuration value.
-        *   `/config set <section.key> <value>`: Set a configuration value (e.g., `/config set display.syntax_theme native`).
-        *   `exit` or `quit`: Terminate the AGI session.
+## 8. Customization
 
-3.  **Fine-tune the Model (Optional but Recommended)**:
-    *   After accumulating interaction logs, you can fine-tune the model using `adaptive_train.py`.
-    *   See **Phase 3.1: Fine-tuning with `adaptive_train.py` (User Task)** above for detailed instructions.
-    *   Example: `python adaptive_train.py`
-    *   Remember to merge the trained LoRA adapters back into the main model if you want `interactive_agi.py` to use the fine-tuned version (see notes in Phase 3.1).
+*   **Changing Models for Merging:**
+    1.  Edit `download_models.sh`:
+        *   Modify the `MODELS_TO_DOWNLOAD` associative array. Add new model keys and their Hugging Face repository URLs.
+        *   Ensure the chosen models are publicly accessible via `git clone`.
+    2.  Edit `merge_config.yml`:
+        *   Update the `slices.sources` list to include the new model keys (e.g., `model: ./models/your_new_model_key`).
+        *   Adjust the `base_model` if necessary.
+        *   Experiment with different `merge_method` and `parameters` for best results.
+    3.  Re-run `python setup_agi_terminal.py`. It will skip already downloaded models and attempt to download new ones, then re-run the merge. Alternatively, run `bash download_models.sh` and then `mergekit-yaml merge_config.yml ./merged_model [options]` manually.
+*   **Adjusting Generation Parameters:**
+    *   Temporarily: Use `/set parameter <NAME> <VALUE>` in `interactive_agi.py`.
+    *   Permanently: Edit `./.agi_terminal_cache/config.toml` under the `[generation]` section.
+*   **Customizing Training:**
+    *   Use the various CLI options for `adaptive_train.py` to filter data, change epochs, learning rate, LoRA parameters, etc.
+    *   Modify the `format_interaction_for_training` function in `adaptive_train.py` if you want to change how log entries are structured into training prompts.
+*   **Adding Slash Commands to `interactive_agi.py`:**
+    *   Define a new function for your command.
+    *   Add an `elif user_input_str.lower().startswith("/yourcommand")` block in the `process_single_input_turn` function (or `main` loop before it was refactored) to call your function.
+    *   Update the `/help` command output.
 
-## Configuration
+## 9. Directory Structure Overview
 
-The AGI Terminal (`interactive_agi.py`) uses a configuration file located at `./.agi_terminal_cache/config.toml`. This file is automatically created with default values if it doesn't exist. You can customize the following settings:
+```
+AGI_TERMINAL_PROJECT_ROOT/
+├── .venv/                     # Python virtual environment (if created here)
+├── .agi_terminal_cache/       # Cache directory for runtime data
+│   ├── config.toml            # Application configuration
+│   ├── history.json           # Conversation history
+│   ├── interaction_logs.jsonl # Detailed logs for fine-tuning
+│   └── user_scripts.json      # Saved user scripts for /run_script
+├── models/                    # Downloaded base models
+│   ├── mistral7b_v03/         # Example: Contains files for mistralai/Mistral-7B-Instruct-v0.3
+│   ├── olmo7b_instruct/       # Example: Contains files for allenai/OLMo-7B-Instruct
+│   └── ...                    # Other downloaded models
+├── merged_model/              # Output directory for the merged AGI model by default
+│   ├── config.json
+│   ├── pytorch_model.bin (or .safetensors files)
+│   ├── tokenizer_config.json
+│   └── ...
+├── merged_model_adapters/     # Default output directory for fine-tuned LoRA adapters
+│   ├── adapter_config.json
+│   ├── adapter_model.bin (or .safetensors)
+│   └── ...
+├── agi_desktop_logs/          # Fallback for plain text session logs if Desktop not found
+│   └── AGI_Terminal_Log_YYYYMMDD_HHMMSS.txt
+├── setup_agi_terminal.py      # Main setup script
+├── download_models.sh         # Script to download base models
+├── merge_config.yml           # Configuration for mergekit
+├── interactive_agi.py         # Main script to run the AGI terminal
+├── adaptive_train.py          # Script for fine-tuning the merged model
+├── train_on_interaction.sh    # (Legacy/Placeholder) Simple interaction logging script (functionality now largely in interactive_agi.py)
+├── README.md                  # This file
+└── .gitignore                 # Git ignore file
+```
 
-*   **[generation]**
-    *   `default_temperature` (float): Default temperature for model generation.
-    *   `default_max_tokens` (int): Default maximum new tokens for generation.
-    *   `default_top_p` (float): Default top-p for nucleus sampling.
-    *   `default_repetition_penalty` (float): Default repetition penalty.
-*   **[history]**
-    *   `max_len` (int): Maximum number of conversation exchanges (user+AGI) to keep in the internal history deque and save to `history.json`.
-*   **[display]**
-    *   `syntax_theme` (str): Theme for syntax highlighting (e.g., "monokai", "native", "fruity"). See `rich` documentation for available themes.
-*   **[logging]**
-    *   `desktop_logging_enabled` (bool): Enable/disable saving plain text session logs to the Desktop.
-    *   `desktop_log_path_override` (str): Specify a custom directory path for desktop logs. If empty, uses default Desktop detection.
+---
 
-Use the `/config set section.key value` command within `interactive_agi.py` to modify these settings. Some settings may require a restart to take full effect.
-
-This README.md will be updated by the AI agent (Jules) as the project progresses.
+This comprehensive `README.md` should provide users with the necessary information to set up and use the AGI Terminal. Remember to replace `<repository_url>` and `<repository_directory_name>` with actual values when users clone the project.
