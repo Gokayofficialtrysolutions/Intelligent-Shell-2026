@@ -1,4 +1,8 @@
-# AGI Terminal - Autonomous AI Development Environment
+# Project: Autonomous AGI Terminal Development
+
+**Creator: Gökay Yaşar Üzümcü**
+
+---
 
 ## 1. Project Overview
 
@@ -39,9 +43,8 @@ Before you begin, ensure your system meets the following requirements:
         ```bash
         # Example using venv
         python3 -m venv .venv
-        source .venv/bin/activate  # On Linux/macOS
-        # For Windows (inside WSL terminal): source .venv/bin/activate
-        # If using Python directly on Windows (not recommended for this project): .venv\Scripts\activate
+        source .venv/bin/activate  # For Linux/macOS/WSL
+        # If using plain Windows Python (not recommended for this project): .venv\Scripts\activate
         ```
 *   **Git:**
     *   Latest stable version of Git must be installed and accessible in your system's PATH.
@@ -104,8 +107,8 @@ This isolates project dependencies.
 ```bash
 # Ensure you are in the project's root directory
 python3 -m venv .venv
-source .venv/bin/activate  # On Linux/macOS
-# For Windows (WSL or direct Python): .venv\Scripts\activate
+source .venv/bin/activate  # For Linux/macOS/WSL
+# If using plain Windows Python (not recommended for this project): .venv\Scripts\activate
 ```
 You should see `(.venv)` at the beginning of your terminal prompt.
 
@@ -208,7 +211,7 @@ Type these commands directly into the prompt:
 **Interaction Logs:**
 
 *   **Plain Text Session Logs:** By default, a plain text transcript of your session is saved to your Desktop (or a fallback directory `./agi_desktop_logs/`). This can be configured via `config.toml`.
-*   **JSONL Interaction Logs:** Detailed structured logs of each turn (user query, AGI responses, tool usage, context) are saved to `./.agi_terminal_cache/interaction_logs.jsonl`. These are used by `adaptive_train.py`.
+*   **JSONL Interaction Logs (for Training):** Detailed structured logs of each turn (user query, AGI responses, tool usage, context) are saved to `./.agi_terminal_cache/interaction_logs.jsonl`. These are the primary data source used by `adaptive_train.py`.
 
 ## 6. Training / Fine-tuning (`adaptive_train.py`)
 
@@ -247,8 +250,8 @@ python adaptive_train.py --num_train_epochs 1 --learning_rate 5e-5 --use_qlora -
 
 *   `adaptive_train.py` saves PEFT adapters (LoRA layers) to the specified output directory (e.g., `./merged_model_adapters`).
 *   To use these adapters with `interactive_agi.py`:
-    1.  **Option A (Manual Merge):** You need to merge these adapters into your base model weights and save it as a new model (e.g., overwrite `./merged_model` or save to a new path like `./merged_model_finetuned`). A helper script `merge_adapters.py` is often provided or can be created (see project documentation or `README.md` examples if available, or `adaptive_train.py`'s comments for a template).
-        ```python
+    1.  **Option A (Manual Merge):** You need to merge these adapters into your base model weights and save it as a new model (e.g., overwrite `./merged_model` or save to a new path like `./merged_model_finetuned`). A template for a helper script (`merge_adapters.py`) can be found in the comments of `adaptive_train.py`.
+        ```bash
         # Example: python merge_adapters.py --base_model_path ./merged_model --adapter_path ./merged_model_adapters --output_path ./merged_model_finetuned
         ```
         Then, update `merged_model_path` in `./.agi_terminal_cache/config.toml` to point to this new finetuned model directory.
@@ -313,7 +316,7 @@ python adaptive_train.py --analyze_jsonl_logs --train-on-successful-plans # See 
     *   Modify the `format_interaction_for_training` function in `adaptive_train.py` if you want to change how log entries are structured into training prompts.
 *   **Adding Slash Commands to `interactive_agi.py`:**
     *   Define a new function for your command.
-    *   Add an `elif user_input_str.lower().startswith("/yourcommand")` block in the `process_single_input_turn` function (or `main` loop before it was refactored) to call your function.
+    *   Add an `elif user_input_str.lower().startswith("/yourcommand")` block in the `process_single_input_turn` function to call your function.
     *   Update the `/help` command output.
 
 ## 9. Directory Structure Overview
@@ -324,8 +327,7 @@ AGI_TERMINAL_PROJECT_ROOT/
 ├── .agi_terminal_cache/       # Cache directory for runtime data
 │   ├── config.toml            # Application configuration
 │   ├── history.json           # Conversation history
-│   ├── interaction_logs.jsonl # Detailed logs for fine-tuning
-│   └── user_scripts.json      # Saved user scripts for /run_script
+│   └── interaction_logs.jsonl # Detailed logs for fine-tuning
 ├── models/                    # Downloaded base models
 │   ├── mistral7b_v03/         # Example: Contains files for mistralai/Mistral-7B-Instruct-v0.3
 │   ├── olmo7b_instruct/       # Example: Contains files for allenai/OLMo-7B-Instruct
@@ -346,7 +348,6 @@ AGI_TERMINAL_PROJECT_ROOT/
 ├── merge_config.yml           # Configuration for mergekit
 ├── interactive_agi.py         # Main script to run the AGI terminal
 ├── adaptive_train.py          # Script for fine-tuning the merged model
-├── train_on_interaction.sh    # (Legacy/Placeholder) Simple interaction logging script (functionality now largely in interactive_agi.py)
 ├── README.md                  # This file
 └── .gitignore                 # Git ignore file
 ```

@@ -1,99 +1,20 @@
 # merge_config.yml
-# Configuration file for the 'mergekit' library, used by 'setup_agi_terminal.py'
-# to combine multiple Hugging Face Transformer models into a single, merged model.
-#
-# How it works:
-# - Models listed under `sources` will be merged.
-# - The `model` path for each source should point to a directory containing a downloaded
-#   Hugging Face model. The `download_models.sh` script saves models to
-#   `./models/<model_key>/`, so paths here should reflect that structure.
-#   For example, if `download_models.sh` downloads "mistralai/Mistral-7B-Instruct-v0.3"
-#   into the directory `./models/mistral7b_v03/`, then the entry here should be
-#   `model: ./models/mistral7b_v03`.
-#
-# For detailed documentation on mergekit and its capabilities, visit:
-# https://github.com/arcee-ai/mergekit
+# Configuration for mergekit, created by setup_agi_terminal.py
+# Based on latest model recommendations.
 
-# Default Slices Configuration:
-# Defines groups of models to be merged. Typically, one slice is used for a straightforward merge.
 slices:
   - sources:
-      # --- Primary Models for the AGI Terminal Merge ---
-      # These models are selected for a balance of instruction following, coding, and general capabilities.
-      # The 'mistral7b_v03' model is often a good choice for the `base_model` due to its strong foundation.
-      - model: ./models/mistral7b_v03        # (Mistral-7B-Instruct-v0.3) - Strong instruction-following base.
-      - model: ./models/olmo7b_instruct       # (allenai/OLMo-7B-Instruct) - Open alternative to Llama3, good for general tasks.
-      - model: ./models/deepseek_coder_v2_lite # (deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct) - Strong coding model.
-      - model: ./models/starcoder2_7b         # (bigcode/starcoder2-7b) - Another capable coding model.
-      - model: ./models/phi3_mini_instruct    # (microsoft/Phi-3-mini-4k-instruct) - Highly capable small model.
-
-# Merge Method:
-# Specifies the algorithm used to combine the models.
-# 'linear': Averages the weights of the models. Simple and often effective.
-# Other methods include: 'slerp', 'passthrough', 'task_arithmetic', 'ties', 'dare_ties', 'dare_linear'.
-# Each method may have different strengths and require different parameters.
-# Consult mergekit documentation for details on each method.
+      - model: ./models/mistral7b_v03 # mistralai/Mistral-7B-Instruct-v0.3
+      - model: ./models/deepseek_coder_v2_lite # deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct (16B)
+      - model: ./models/starcoder2_7b # bigcode/starcoder2-7b
+      - model: ./models/phi4_mini_instruct # microsoft/Phi-4-mini-instruct (4B)
 merge_method: linear
-
-# Base Model:
-# For some merge methods (like 'linear' or 'slerp' when interpolating towards a base),
-# this specifies which model's configuration (e.g., vocabulary, architecture details)
-# should be primarily used for the merged model. It's often good to choose a
-# well-rounded instruction-tuned model as the base.
-# The path should match one of the models listed in `sources`.
-base_model: ./models/mistral7b_v03
-
-# Parameters for Merge Method:
-# Some merge methods accept additional parameters. For 'linear', none are typically needed.
-# Example for 'ties' (Thresholding Interpolation and Averaging of Sparse Ensembles):
-# parameters:
-#   density: 0.5  # Proportion of weights to keep from each non-base model.
-#   normalize: true # Normalizes weights before merging.
-parameters: {} # No parameters needed for basic 'linear' merge.
-
-# Data Type (dtype):
-# Specifies the precision for the merged model's weights.
-# 'float16': Good balance of precision and memory usage (requires ~2x model size in RAM during merge).
-# 'bfloat16': Alternative 16-bit format, may offer better training stability on compatible hardware (e.g., Ampere GPUs).
-# 'float32': Full precision, uses more memory (requires ~4x model size in RAM during merge).
+base_model: ./models/mistral7b_v03 # Using Mistral-7B-Instruct-v0.3 as the base
+parameters: {}
 dtype: float16
 
-# --- Optional Models & Customization ---
-# To include other models downloaded by `download_models.sh`, add them to the `sources` list above.
-# Ensure they are compatible (e.g., all Hugging Face Transformer format).
-# While mergekit's '--allow-crimes' flag (used by setup_agi_terminal.py) can sometimes
-# merge models with slight architectural differences or vocabulary mismatches, results can be unpredictable.
-# For best results, try to merge models with similar tokenizers and architectures if possible.
-#
-# Example of adding other downloaded models:
-#
-#      - model: ./models/tinyllama_chat # (TinyLlama/TinyLlama-1.1B-Chat-v1.0) - Small, capable chat model.
-#      - model: ./models/bloom          # (bigscience/bloom-1b7) - Older multilingual model.
-#      - model: ./models/gpt_neox       # (EleutherAI/gpt-neox-20b) - Very large model, ensure sufficient resources.
-#
-# If adding many models or diverse types, you might want to experiment with different
-# `merge_method` settings and their specific `parameters`.
-#
-# Example of a more complex merge using TIES with specific weights per model:
-#
-# merge_method: ties
-# base_model: ./models/mistral7b_v03
-# parameters:
-#   normalize: true
-#   weights: # Assign weights to each model in the slice
-#     - model: ./models/mistral7b_v03
-#       value: 0.4
-#     - model: ./models/olmo7b_instruct
-#       value: 0.2
-#     - model: ./models/deepseek_coder_v2_lite
-#       value: 0.2
-#     - model: ./models/starcoder2_7b
-#       value: 0.1
-#     - model: ./models/phi3_mini_instruct
-#       value: 0.1
-#   density: 0.6 # Overall density for TIES merging
-# dtype: float16
-#
-# Remember to consult the official mergekit documentation for the most up-to-date
-# information on methods, parameters, and best practices.
-# Link: https://github.com/arcee-ai/mergekit
+# To include other downloaded models like llama3 (./models/llama3),
+# bloom (./models/bloom), or gpt_neox (./models/gpt_neox),
+# add them to the `sources` list above. Example:
+#      - model: ./models/llama3
+#      - model: ./models/gpt_neox

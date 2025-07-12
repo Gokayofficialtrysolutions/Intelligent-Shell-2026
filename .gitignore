@@ -10,112 +10,50 @@ venv/
 ENV/
 env/
 *.env
-env.bak/
-venv.bak/
 
 # IDE and editor specific files
 .vscode/
 .idea/
-*.project
-*.classpath
-*.cproject
-*.launch
-*.settings
 *.sublime-workspace
 *.sublime-project
-nbproject/
 
 # OS generated files
 .DS_Store
 Thumbs.db
-Desktop.ini
 
-# Distribution / packaging
-dist/
-build/
-develop-eggs/
-eggs/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
-
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
-
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-.hypothesis/
-.pytest_cache/
+# AGI Terminal specific cache and logs
+models/
+# Keep merge_config.yml, download_models.sh, train_on_interaction.sh
+# as they are templates/managed by setup_agi_terminal.py or user might want to inspect.
+# merged_model/ # This is user-generated and can be large, user might want to decide.
+# For now, let's explicitly ignore the cache for history and potentially other temp files.
+.agi_terminal_cache/
+interaction_logs/ # User might want to commit these for training, but often can be large/many.
 
 # Jupyter Notebook checkpoints
 .ipynb_checkpoints
 
-# AGI Terminal specific generated content, logs, and large data
-# These directories are created at runtime and can become very large.
-# Users should not commit them to the repository.
-models/                   # Downloaded base models
-merged_model/             # Output of model merging
-merged_model_adapters/    # Output of fine-tuning (LoRA adapters)
+# Build artifacts
+dist/
+build/
+*.egg-info/
 
-.agi_terminal_cache/      # Runtime cache for history, configs, JSONL logs
-interaction_logs/         # Old plain-text interaction logs (from train_on_interaction.sh)
-agi_desktop_logs/         # Fallback directory for plain-text session logs
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+nosetests.xml
+coverage.xml
+*.cover
 
-# Secrets - ensure these are not committed. Add any project-specific secret file patterns.
+# Secrets - ensure these are not committed
 *.secrets
 secrets.json
 secrets.yaml
-secrets.toml
 .env.*local
-*.pem
-*.key
 
-# Large data files (if your project uses other specific large file types, add them)
+# Large data files (if any, add specific patterns)
 # *.data
 # *.dat
 # *.pkl
 # *.h5
-# *.zip
-# *.tar.gz
-# *.bin # Be careful with generic .bin if some config .bin files are needed
-
-# PyInstaller
-# ------------
-# *.manifest
-# *.spec
-
-# Environments
-# ------------
-# .env
-# .direnv/
-# local_settings.py
-# config.local.py
-# settings.local.py
-# !.env.example # Often an example env file is committed
-
-# Flycheck
-# ------------
-# flycheck_*.el
-
-# Debugging logs
-# ------------
-# *.log # Be specific if some .log files ARE versioned.
-# For this project, train_on_interaction.sh creates .log files in interaction_logs/
-# which is already ignored. If other .log files are generated, consider more specific ignores.
-# Example: app_debug.log
-# Example: profile_results.log
-# If using `AIDE_SANDBOX_README.md` for local dev notes not for distribution
-AIDE_SANDBOX_README.md

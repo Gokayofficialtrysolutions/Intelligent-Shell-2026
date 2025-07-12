@@ -10,7 +10,6 @@ from pathlib import Path
 # --- Script Configuration ---
 MIN_PYTHON_VERSION = (3, 8)
 # List of Python packages required by the AGI Terminal and its setup.
-# Torch is installed separately due to its complex installation options.
 REQUIRED_PYTHON_PACKAGES = [
     # "huggingface_hub", # No longer directly needed for login by this script
     "mergekit",
@@ -47,16 +46,6 @@ def print_error(message):
 def run_command(command, capture_output=False, text=True, check=True, shell=False, sensitive_output=False):
     """
     Helper to run shell commands.
-
-    Args:
-        command (list or str): The command to run.
-        capture_output (bool): If True, captures stdout and stderr.
-        text (bool): If True, decodes stdout/stderr as text.
-        check (bool): If True, raises CalledProcessError on non-zero exit.
-        shell (bool): If True, runs command through the shell.
-        sensitive_output (bool): If True, does not print stdout/stderr on error.
-    Returns:
-        subprocess.CompletedProcess: The result of the command execution.
     """
     cmd_str = ' '.join(command) if isinstance(command, list) else command
     print(f"Executing: {cmd_str}")
@@ -71,11 +60,6 @@ def run_command(command, capture_output=False, text=True, check=True, shell=Fals
             if e.stderr:
                 err_msg += f"\nStderr:\n{e.stderr.strip()}"
         print_error(err_msg)
-        if e.stdout:
-            print(f"Stdout:\n{e.stdout}")
-        if e.stderr:
-            print(f"Stderr:\n{e.stderr}")
-        raise
     except FileNotFoundError:
         print_error(f"Command not found: {command[0]}. Please ensure it's installed and in your PATH.")
         raise
@@ -101,7 +85,6 @@ def check_pip():
         print_error("pip is not available or not runnable. Please ensure pip is installed and configured for your Python environment.")
     except FileNotFoundError:
         print_error("Python executable not found to run pip. Please check your Python installation.")
-
 
 def check_git_and_lfs():
     """Checks for git and git-lfs installations."""
@@ -133,11 +116,9 @@ def check_git_and_lfs():
     except (subprocess.CalledProcessError, FileNotFoundError):
         print_error("git-lfs is installed but not runnable or found in PATH. Please ensure git-lfs is correctly installed and configured.")
 
-
 def check_virtual_environment():
     """Checks if the script is running in a Python virtual environment and warns if not."""
     print_notice("Checking for Python virtual environment...")
-    # Heuristic checks for virtual environments
     in_virtual_env = hasattr(sys, 'real_prefix') or \
                      (hasattr(sys, 'base_prefix') and sys.base_prefix != sys.prefix) or \
                      (os.environ.get("VIRTUAL_ENV") is not None)
@@ -148,11 +129,8 @@ def check_virtual_environment():
             "It is STRONGLY recommended to use a virtual environment to manage dependencies\n"
             "and avoid conflicts with other Python projects or system packages."
         )
-        # In non-interactive mode (e.g. CI/CD), we might not prompt, or default to yes.
-        # For user-run script, prompting is good.
-        if not sys.stdin.isatty(): # Non-interactive session
+        if not sys.stdin.isatty():
             print_warning("Non-interactive session detected. Assuming you want to proceed without a virtual environment if this warning appears.")
-            # Or, one might choose to print_error here in strict CI.
         elif input("Do you want to continue setup without a virtual environment? (yes/NO): ").lower() != "yes":
             print_error(
                 "Setup aborted by user. Please create and activate a Python virtual environment, "
@@ -166,7 +144,6 @@ def check_virtual_environment():
 def get_user_confirmation(prompt_message, default_to_yes_in_non_interactive=True):
     """
     Handles user confirmation prompts.
-    In non-interactive sessions (e.g., CI/CD), can default to 'yes'.
     """
     if not sys.stdin.isatty() and default_to_yes_in_non_interactive:
         print_warning(f"Non-interactive session: Defaulting to YES for: '{prompt_message}'")
@@ -176,11 +153,10 @@ def get_user_confirmation(prompt_message, default_to_yes_in_non_interactive=True
         response = input(f"{prompt_message} (yes/NO): ").strip().lower()
         if response in ["yes", "y"]:
             return True
-        elif response in ["no", "n", ""]: # Default to No if empty
+        elif response in ["no", "n", ""]:
             return False
         else:
             print("Invalid input. Please answer 'yes' or 'no'.")
-
 
 # --- Dependency Installation ---
 def install_python_packages():
@@ -199,34 +175,30 @@ def install_python_packages():
     )
 
     if not get_user_confirmation(
-        f"Proceed with installing PyTorch and other packages ({len(REQUIRED_PYTHON_PACKAGES) + 2} total including torch extras)?", # +2 for torchvision, torchaudio
-        default_to_yes_in_non_interactive=True # Auto-yes in CI for this part
+        f"Proceed with installing PyTorch and other packages ({len(REQUIRED_PYTHON_PACKAGES) + 2} total including torch extras)?",
+        default_to_yes_in_non_interactive=True
     ):
         print_error("Package installation aborted by user.")
 
-    # Attempt to install PyTorch, torchvision, torchaudio first
     pytorch_packages = ["torch", "torchvision", "torchaudio"]
     try:
         print_notice(f"Attempting to install {', '.join(pytorch_packages)}...")
         run_command([sys.executable, "-m", "pip", "install"] + pytorch_packages)
         print_success(f"{', '.join(pytorch_packages)} installation command executed.")
         print_warning("Please check the output above for actual success or failure of PyTorch installation.")
-    except Exception as e: # Includes CalledProcessError from run_command
+    except Exception as e:
         print_warning(
             f"Installation of {', '.join(pytorch_packages)} failed or had issues: {e}\n"
             "This might be due to disk space, network issues, or system compatibility.\n"
-            "It's often better to install PyTorch manually if you encounter problems (see https://pytorch.org/).\n"
             "You can try installing a CPU-only version if you don't need GPU support, e.g.:\n"
             f"'{sys.executable} -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu'"
         )
         if not get_user_confirmation(
             "Attempt to continue installing other packages despite potential PyTorch issues?",
-            default_to_yes_in_non_interactive=False # Default to NO in CI if torch fails
+            default_to_yes_in_non_interactive=False
         ):
             print_error("Setup aborted due to PyTorch installation issues.")
 
-    # Install remaining packages from REQUIRED_PYTHON_PACKAGES
-    # Filter out 'torch' as it (and its companions) were handled.
     remaining_packages = [pkg for pkg in REQUIRED_PYTHON_PACKAGES if pkg.lower() != "torch"]
     if remaining_packages:
         print_notice(f"Attempting to install remaining packages: {', '.join(remaining_packages)}...")
@@ -234,7 +206,7 @@ def install_python_packages():
             run_command([sys.executable, "-m", "pip", "install"] + remaining_packages)
             print_success(f"Installation command for remaining packages executed.")
             print_warning("Please check the output above for actual success or failure of these packages.")
-        except Exception as e: # Includes CalledProcessError
+        except Exception as e:
             print_error(
                 f"Failed to install some of the remaining Python packages: {', '.join(remaining_packages)}.\n"
                 f"Error: {e}\n"
@@ -244,16 +216,9 @@ def install_python_packages():
     print_success("Python package installation phase complete (commands executed).")
     print_warning("It is crucial to verify the output above to ensure all packages installed correctly, especially PyTorch.")
 
-# Hugging Face Login is no longer needed as downloads are done via git LFS
-# def huggingface_login(): ... (entire function removed)
-
 def main():
     """
     Main function to orchestrate the setup process.
-    The setup is divided into phases:
-    A: Prerequisite checks and initial Python package installations.
-    B: Generation of auxiliary scripts/configs, model downloading, and model merging.
-    C: Final verification and instructions.
     """
     print_notice("AGI Terminal Setup Script - Automated Environment Configuration")
     print("This script will guide you through setting up the AGI Terminal environment.")
@@ -270,7 +235,7 @@ def main():
     print_notice("Phase A: Verifying Prerequisites and Core Python Environment")
     check_python_version()
     check_pip()
-    check_git_and_lfs() # Combined check for git and git-lfs
+    check_git_and_lfs()
     check_virtual_environment()
 
     if not get_user_confirmation(
@@ -284,7 +249,6 @@ def main():
     if not get_user_confirmation("Continue to Phase B (Script Generation, Model Download & Merge)?", default_to_yes_in_non_interactive=True):
         print_error("Setup aborted by user before Phase B.")
 
-
     # --- Phase B: Script/Config Generation & Model Operations ---
     print_notice("Phase B: Generating Auxiliary Scripts, Downloading & Merging Models")
     create_auxiliary_scripts_and_configs()
@@ -296,7 +260,7 @@ def main():
     )
     if not get_user_confirmation("Proceed with downloading models?", default_to_yes_in_non_interactive=True):
         print_error("Model download aborted by user.")
-    run_model_download() # This function now calls the external download_models.sh
+    run_model_download()
 
     print_warning(
         "Model merging is CPU and RAM intensive. It can also take a long time.\n"
@@ -304,7 +268,7 @@ def main():
     )
     if not get_user_confirmation("Proceed with merging models?", default_to_yes_in_non_interactive=True):
         print_error("Model merging aborted by user.")
-    run_model_merge() # This function calls mergekit-yaml
+    run_model_merge()
 
     print_success("Phase B: Auxiliary Scripts, Model Download & Merge commands executed.")
     print_warning("Review output above to ensure models downloaded and merged correctly.")
@@ -313,8 +277,6 @@ def main():
 
     # --- Phase C: Final Steps & Verification ---
     print_notice("Phase C: Final Setup Verification & Next Steps")
-
-    # Create .agi_terminal_cache directory for history, logs, etc.
     cache_dir = Path("./.agi_terminal_cache")
     try:
         cache_dir.mkdir(parents=True, exist_ok=True)
@@ -322,15 +284,10 @@ def main():
     except OSError as e:
         print_warning(f"Could not create AGI Terminal cache directory {cache_dir.resolve()}: {e}")
 
-    # Ensure main project scripts are present and executable (if applicable)
-    # download_models.sh is already made executable in create_auxiliary_scripts_and_configs
-    scripts_to_verify = ["interactive_agi.py", "adaptive_train.py", "train_on_interaction.sh"]
+    scripts_to_verify = ["interactive_agi.py", "adaptive_train.py"]
     for script_name in scripts_to_verify:
         if not os.path.exists(script_name):
             print_warning(f"Main script '{script_name}' not found in the current directory. It is expected to be part of the repository.")
-        elif script_name.endswith(".sh"): # Make shell scripts executable
-             make_executable(script_name)
-
 
     print_notice("AGI Terminal Setup Script Finished!")
     print_success("All planned setup commands have been executed.")
@@ -351,9 +308,6 @@ def main():
     print("-" * 70)
 
 # --- Auxiliary Script and Config Content ---
-
-# DOWNLOAD_MODELS_SH_CONTENT is no longer used as download_models.sh is a standalone, modified file.
-
 MERGE_CONFIG_YML_CONTENT = """# merge_config.yml
 # Configuration for mergekit
 # Models are expected to be in ./models/<model_key>/
@@ -365,75 +319,14 @@ slices:
       - model: ./models/deepseek_coder_v2_lite # deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct
       - model: ./models/starcoder2_7b # bigcode/starcoder2-7b
       - model: ./models/phi3_mini_instruct # microsoft/Phi-3-mini-4k-instruct
-merge_method: linear # Can also try: slerp, passthrough, task_arithmetic, ties, dare_ties, dare_linear, etc.
+merge_method: linear
 base_model: ./models/mistral7b_v03
-parameters: {} # Parameters for the merge method, e.g. for task_arithmetic, ties
-dtype: float16 # or bfloat16 if models support it and hardware is available
-
-# To include other downloaded models, add them to the `sources` list above.
-# Ensure they are compatible (e.g., all Hugging Face Transformer format, similar vocabulary if possible).
-# Example of adding other models downloaded by download_models.sh:
-#
-#      - model: ./models/tinyllama_chat # TinyLlama/TinyLlama-1.1B-Chat-v1.0 (Replaced gpt4all-j)
-#      - model: ./models/bloom # bigscience/bloom-1b7
-#      - model: ./models/gpt_neox # EleutherAI/gpt-neox-20b (Very large, ensure sufficient resources)
-#
-# If adding more models, you might want to adjust the merge_method or its parameters.
-# For example, with many models, 'ties' merging with a specific density might be effective.
-#
-# Example using TIES merging:
-# merge_method: ties
-# base_model: ./models/mistral7b_v03
-# parameters:
-#   density: 0.5 # Proportion of weights to keep from each model
-#   normalize: true
-# dtype: float16
-
-# Consult mergekit documentation for advanced configurations:
-# https://github.com/arcee-ai/mergekit
-"""
-
-TRAIN_ON_INTERACTION_SH_CONTENT = """#!/bin/bash
-# train_on_interaction.sh
-#
-# This script provides a basic mechanism for logging user inputs and model outputs
-# to plain text files in the './interaction_logs/' directory.
-# It is called by 'interactive_agi.py' after each interaction if enabled there.
-#
-# Note: The primary data source for adaptive fine-tuning with 'adaptive_train.py'
-# is the JSONL file located in '.agi_terminal_cache/interaction_logs.jsonl',
-# which contains more structured and detailed interaction data. This script serves
-# as a simpler, human-readable logger or for alternative/legacy training workflows.
-
-# Exit on error
-set -e
-
-USER_INPUT="${1}"   # First argument: User's input query
-MODEL_OUTPUT="${2}" # Second argument: AGI's final response
-
-LOG_DIR="./interaction_logs"
-mkdir -p "${LOG_DIR}" # Ensure the log directory exists
-
-TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-# Use a more descriptive log filename, perhaps including a random suffix if high frequency expected
-LOG_FILE="${LOG_DIR}/interaction_log_${TIMESTAMP}_${RANDOM}.txt"
-
-# Append interaction data to the log file
-{
-    echo "Timestamp: ${TIMESTAMP}"
-    echo "--- User Input ---"
-    echo "${USER_INPUT}"
-    echo "--- Model Output ---"
-    echo "${MODEL_OUTPUT}"
-    echo "----------------------------------------"
-} >> "${LOG_FILE}"
-
-echo "[train_on_interaction.sh] Interaction logged to: ${LOG_FILE}"
-
-exit 0
+parameters: {}
+dtype: float16
 """
 
 def write_file(filepath, content):
+    """Writes content to a file, overwriting it if it exists."""
     print(f"Creating/overwriting file: {filepath}")
     try:
         with open(filepath, 'w') as f:
@@ -444,6 +337,7 @@ def write_file(filepath, content):
         raise
 
 def make_executable(filepath):
+    """Makes a file executable (adds +x permission)."""
     print(f"Making file executable: {filepath}")
     try:
         os.chmod(filepath, 0o755)
@@ -453,42 +347,33 @@ def make_executable(filepath):
         raise
 
 def create_auxiliary_scripts_and_configs():
+    """Creates/updates helper scripts and configuration files."""
     print_notice("Creating auxiliary scripts and configuration files...")
-    # write_file("download_models.sh", DOWNLOAD_MODELS_SH_CONTENT) # download_models.sh is no longer generated
     if os.path.exists("download_models.sh"):
         make_executable("download_models.sh")
     else:
         print_warning("download_models.sh not found. This script is expected to exist in the repository.")
 
     write_file("merge_config.yml", MERGE_CONFIG_YML_CONTENT)
-
-    write_file("train_on_interaction.sh", TRAIN_ON_INTERACTION_SH_CONTENT)
-    make_executable("train_on_interaction.sh")
+    # The `train_on_interaction.sh` script is deprecated and its generation is removed.
     print_success("Auxiliary scripts and configuration files generated/updated successfully.")
 
 def run_model_download():
     """
     Executes the 'download_models.sh' script to download AI models.
-    This script uses 'git clone' and 'git lfs' and can be very resource-intensive.
     """
     script_path = "./download_models.sh"
     print_notice(f"Executing model download script: {script_path}")
 
     if not os.path.exists(script_path):
         print_error(f"Model download script '{script_path}' not found. Please ensure it's in the project root.")
-        return # Should be caught by print_error, but as a safeguard
+        return
 
-    # The download_models.sh script itself should contain user warnings.
-    # This Python script is merely invoking it.
     try:
-        # Using shell=True can be a security risk if script_path is from untrusted input,
-        # but here it's a fixed path. Using a list is generally safer.
-        # Ensure download_models.sh is executable. This is done in create_auxiliary_scripts_and_configs.
-        run_command(["bash", script_path], capture_output=False) # Stream output directly
+        run_command(["bash", script_path], capture_output=False)
         print_success(f"Model download script '{script_path}' finished execution.")
         print_warning("Please review the output from the download script carefully for any errors or incomplete downloads.")
     except subprocess.CalledProcessError as e:
-        # run_command already prints detailed errors from CalledProcessError
         print_error(
             f"The model download script '{script_path}' failed.\n"
             "Common reasons include: \n"
@@ -498,22 +383,18 @@ def run_model_download():
             "  - Incorrect model repository URLs or permissions (though these are public).\n"
             "Please check the script's output above for specific error messages from git/git-lfs."
         )
-        # No raise here, print_error in run_command would have exited.
     except FileNotFoundError:
-        # This would be if 'bash' itself is not found, highly unlikely on typical systems.
         print_error(f"'bash' command not found. Cannot execute '{script_path}'. Please ensure bash is installed and in PATH.")
-
 
 def run_model_merge():
     """
-    Executes the 'mergekit-yaml' command to merge downloaded models
-    based on 'merge_config.yml'. This is CPU and RAM intensive.
+    Executes the 'mergekit-yaml' command to merge downloaded models.
     """
     print_notice("Attempting to merge downloaded models using mergekit...")
 
     mergekit_executable = "mergekit-yaml"
     config_file = "merge_config.yml"
-    output_directory = "./merged_model" # Standard output directory for merged models
+    output_directory = "./merged_model"
 
     if not shutil.which(mergekit_executable):
         print_error(
@@ -527,28 +408,22 @@ def run_model_merge():
         print_error(f"Merge configuration file '{config_file}' not found. This file should be created by this setup script.")
         return
 
-    # Advise user about potential for large temporary file creation by mergekit
     print_warning(
         "Mergekit may create temporary files that also consume significant disk space during the merge process.\n"
         "Ensure you have ample free space beyond the storage for the models themselves."
     )
 
-    # Define the merge command arguments
-    # These were from the original README, good defaults to keep.
     merge_command_args = [
         mergekit_executable,
         config_file,
         output_directory,
-        "--out-shard-size", "2B",   # Controls the size of output model shards
-        "--allow-crimes",           # Allows merging models with slightly different architectures (use with understanding)
-        "--lazy-unpickle",          # Can speed up loading some models
-        # Consider adding "--cuda" if a GPU is available and desired for merging (can speed up some operations)
-        # However, CPU merging is more universally compatible. User can add this manually if needed.
-        # "--trust-remote-code" # May be needed if custom model code is used by any of the models.
+        "--out-shard-size", "2B",
+        "--allow-crimes",
+        "--lazy-unpickle",
     ]
 
     try:
-        run_command(merge_command_args, capture_output=False) # Stream output
+        run_command(merge_command_args, capture_output=False)
         print_success(f"Model merge process finished. If successful, the merged model is in '{output_directory}'.")
         print_warning("Review the output from mergekit carefully for any errors or warnings.")
     except subprocess.CalledProcessError as e:
@@ -563,16 +438,13 @@ def run_model_merge():
             "Please check the detailed error messages from mergekit in the output above."
         )
     except FileNotFoundError:
-         # This would be if mergekit_executable was found by shutil.which but then couldn't be run by subprocess.
-         # Highly unlikely if shutil.which passed.
         print_error(f"'{mergekit_executable}' was not found by subprocess despite initial check. Ensure it's executable and in PATH.")
-
 
 if __name__ == "__main__":
     try:
         main()
     except SystemExit as e:
-        if e.code != 0: # Non-zero exit code indicates an error message was already printed
+        if e.code != 0:
             print("\nSetup process terminated.")
         else:
             print("\nSetup process finished or exited gracefully.")
