@@ -133,7 +133,10 @@ To run the script:
 python setup_agi_terminal.py
 ```
 
-The script will guide you with prompts and status messages:
+The script will guide you with prompts and status messages. For a fully non-interactive setup (e.g., in an automated script), you can use the `--force-yes` flag to bypass all confirmations:
+```bash
+python setup_agi_terminal.py --force-yes
+```
 *   It will ask for confirmation before installing Python packages (which includes PyTorch and can take time and space).
 *   It will ask for confirmation before starting model downloads (very time and space consuming).
 *   It will ask for confirmation before starting model merging (CPU and RAM intensive).
@@ -248,14 +251,43 @@ python adaptive_train.py --num_train_epochs 1 --learning_rate 5e-5 --use_qlora -
 
 **Using the Fine-tuned Adapters:**
 
-*   `adaptive_train.py` saves PEFT adapters (LoRA layers) to the specified output directory (e.g., `./merged_model_adapters`).
-*   To use these adapters with `interactive_agi.py`:
-    1.  **Option A (Manual Merge):** You need to merge these adapters into your base model weights and save it as a new model (e.g., overwrite `./merged_model` or save to a new path like `./merged_model_finetuned`). A template for a helper script (`merge_adapters.py`) can be found in the comments of `adaptive_train.py`.
-        ```bash
-        # Example: python merge_adapters.py --base_model_path ./merged_model --adapter_path ./merged_model_adapters --output_path ./merged_model_finetuned
-        ```
-        Then, update `merged_model_path` in `./.agi_terminal_cache/config.toml` to point to this new finetuned model directory.
-    2.  **Option B (Dynamic Loading - Future Enhancement):** `interactive_agi.py` could be modified to load the base model and then dynamically apply adapters at runtime. This is not the default behavior.
+*   `adaptive_train.py` saves PEFT adapters (LoRA layers) to the specified output directory (e.g., `./merged_model_adapters`). These adapters are small and contain only the *changes* to the model.
+*   To use these changes, you must merge them with the original base model to create a new, fully fine-tuned model.
+
+**Step 1: Merge the Adapters**
+
+This project includes a `merge_adapters.py` script to handle this process.
+
+```bash
+# Basic usage, with default paths:
+python merge_adapters.py
+
+# You can also specify paths. The defaults are read from your config.toml.
+python merge_adapters.py \\
+  --base_model_path ./merged_model \\
+  --adapter_path ./merged_model_adapters \\
+  --output_path ./merged_model_finetuned
+```
+This will create a new directory (e.g., `./merged_model_finetuned`) containing the complete, fine-tuned model.
+
+**Step 2: Use the Merged Model**
+
+To make `interactive_agi.py` use your newly fine-tuned model, you need to update its configuration.
+
+1.  Open the configuration file at `./.agi_terminal_cache/config.toml`.
+2.  Find the `[model]` section and change the `merged_model_path` to point to your new directory.
+    ```toml
+    [model]
+    # Old path:
+    # merged_model_path = "./merged_model"
+    # New path:
+    merged_model_path = "./merged_model_finetuned"
+    ```
+3.  Alternatively, you can use the `/config` command within the terminal:
+    ```
+    /config set model.merged_model_path ./merged_model_finetuned
+    ```
+4.  Restart `interactive_agi.py`. It will now load and use your improved model.
 
 **Analysis Mode:**
 Before training, you can analyze your logs and see how they would be formatted:

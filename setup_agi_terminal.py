@@ -5,11 +5,11 @@ import subprocess
 import platform
 import getpass
 import shutil
+import argparse
 from pathlib import Path
 
 # --- Script Configuration ---
 MIN_PYTHON_VERSION = (3, 8)
-# List of Python packages required by the AGI Terminal and its setup.
 REQUIRED_PYTHON_PACKAGES = [
     # "huggingface_hub", # No longer directly needed for login by this script
     "mergekit",
@@ -89,7 +89,6 @@ def check_pip():
 def check_git_and_lfs():
     """Checks for git and git-lfs installations."""
     print_notice("Checking for git and git-lfs...")
-    # Check for git
     if not shutil.which("git"):
         print_error("git is not found. Please install git and ensure it's in your system's PATH.")
     try:
@@ -98,7 +97,6 @@ def check_git_and_lfs():
     except (subprocess.CalledProcessError, FileNotFoundError):
         print_error("git is not found or not executable. Please install git and ensure it's in your system's PATH.")
 
-    # Check for git-lfs
     if not shutil.which("git-lfs"):
         print_error(
             "git-lfs is not found. This is required for downloading large model files.\n"
@@ -141,11 +139,15 @@ def check_virtual_environment():
     else:
         print_success("Running in a Python virtual environment.")
 
-def get_user_confirmation(prompt_message, default_to_yes_in_non_interactive=True):
+def get_user_confirmation(prompt_message, force_yes=False):
     """
-    Handles user confirmation prompts.
+    Handles user confirmation prompts, with an option to force non-interactive 'yes'.
     """
-    if not sys.stdin.isatty() and default_to_yes_in_non_interactive:
+    if force_yes:
+        print_warning(f"Forcing YES for: '{prompt_message}' (due to --force-yes flag)")
+        return True
+
+    if not sys.stdin.isatty():
         print_warning(f"Non-interactive session: Defaulting to YES for: '{prompt_message}'")
         return True
 
@@ -176,7 +178,7 @@ def install_python_packages():
 
     if not get_user_confirmation(
         f"Proceed with installing PyTorch and other packages ({len(REQUIRED_PYTHON_PACKAGES) + 2} total including torch extras)?",
-        default_to_yes_in_non_interactive=True
+        force_yes=False # This is the main confirmation, let's not force it by default
     ):
         print_error("Package installation aborted by user.")
 
@@ -195,7 +197,7 @@ def install_python_packages():
         )
         if not get_user_confirmation(
             "Attempt to continue installing other packages despite potential PyTorch issues?",
-            default_to_yes_in_non_interactive=False
+            force_yes=False # Let user decide if torch fails
         ):
             print_error("Setup aborted due to PyTorch installation issues.")
 
@@ -220,6 +222,14 @@ def main():
     """
     Main function to orchestrate the setup process.
     """
+    parser = argparse.ArgumentParser(description="AGI Terminal Setup Script")
+    parser.add_argument(
+        "-y", "--force-yes",
+        action="store_true",
+        help="Bypass all user confirmation prompts for a fully non-interactive setup."
+    )
+    args = parser.parse_args()
+
     print_notice("AGI Terminal Setup Script - Automated Environment Configuration")
     print("This script will guide you through setting up the AGI Terminal environment.")
     print("It will perform the following main steps:")
@@ -229,6 +239,8 @@ def main():
     print("  4. Download selected open-source AI models using 'git lfs'.")
     print("  5. Merge these models using 'mergekit'.")
     print("Please ensure you have a stable internet connection and sufficient disk space (100GB+ recommended for models).")
+    if args.force_yes:
+        print_warning("Running in non-interactive mode with --force-yes. All confirmations will be skipped.")
     print("-" * 70)
 
     # --- Phase A: Prerequisite Checks & Initial Setup ---
@@ -240,13 +252,13 @@ def main():
 
     if not get_user_confirmation(
         "Proceed with Python package installations (this includes PyTorch and can take significant time and disk space)?",
-        default_to_yes_in_non_interactive=True
+        force_yes=args.force_yes
     ):
         print_error("Setup aborted by user before Python package installation.")
     install_python_packages()
     print_success("Phase A: Prerequisites and Core Python Environment setup commands executed.")
     print_warning("Review output above to ensure packages like PyTorch installed correctly before proceeding.")
-    if not get_user_confirmation("Continue to Phase B (Script Generation, Model Download & Merge)?", default_to_yes_in_non_interactive=True):
+    if not get_user_confirmation("Continue to Phase B (Script Generation, Model Download & Merge)?", force_yes=args.force_yes):
         print_error("Setup aborted by user before Phase B.")
 
     # --- Phase B: Script/Config Generation & Model Operations ---
@@ -258,7 +270,7 @@ def main():
         "Models can range from a few GBs to tens of GBs EACH. Total space can easily exceed 100GB.\n"
         "Ensure your internet connection is stable and you have monitored your disk space."
     )
-    if not get_user_confirmation("Proceed with downloading models?", default_to_yes_in_non_interactive=True):
+    if not get_user_confirmation("Proceed with downloading models?", force_yes=args.force_yes):
         print_error("Model download aborted by user.")
     run_model_download()
 
@@ -266,13 +278,13 @@ def main():
         "Model merging is CPU and RAM intensive. It can also take a long time.\n"
         "Ensure your system has adequate resources (32GB+ RAM highly recommended, more for larger merges)."
     )
-    if not get_user_confirmation("Proceed with merging models?", default_to_yes_in_non_interactive=True):
+    if not get_user_confirmation("Proceed with merging models?", force_yes=args.force_yes):
         print_error("Model merging aborted by user.")
     run_model_merge()
 
     print_success("Phase B: Auxiliary Scripts, Model Download & Merge commands executed.")
     print_warning("Review output above to ensure models downloaded and merged correctly.")
-    if not get_user_confirmation("Continue to Phase C (Final Verification)?", default_to_yes_in_non_interactive=True):
+    if not get_user_confirmation("Continue to Phase C (Final Verification)?", force_yes=args.force_yes):
         print_error("Setup aborted by user before Phase C.")
 
     # --- Phase C: Final Steps & Verification ---
@@ -298,12 +310,12 @@ def main():
     print("1. Merged Model: If successful, your merged model is located in the './merged_model/' directory.")
     print("2. Run AGI Terminal: To start interacting with your AGI, run:")
     print("   python interactive_agi.py")
-    print("3. Interaction Logs: Your interactions will be logged in the './interaction_logs/' directory.")
+    print("3. Interaction Logs: Your interactions will be logged in the './.agi_terminal_cache/interaction_logs.jsonl' file.")
     print("4. Fine-tuning: To fine-tune the model on these interactions (requires GPU and further setup):")
     print("   python adaptive_train.py --help (to see options)")
     print("\nIf you encountered errors not automatically handled:")
     print("  - Check your internet connection, disk space, and system resources (RAM).")
-    print("  - Consult the project's README.md for troubleshooting tips (once created).")
+    print("  - Consult the project's README.md for troubleshooting tips.")
     print("  - You may need to perform some steps manually or re-run this script after resolving issues.")
     print("-" * 70)
 
